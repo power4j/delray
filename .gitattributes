@@ -1,0 +1,44 @@
+# 设置换行符规则
+# Unix/Linux 脚本使用 LF 换行符
+*.sh text eol=lf
+*.service text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 构建脚本和配置
+Makefile text eol=lf
+*.mk text eol=lf
+
+# 包管理配置
+spec text eol=lf
+*.spec text eol=lf
+debian/** text eol=lf
+
+# 规则文件
+*.rules text eol=lf
+
+# 文本文件默认使用 LF
+*.md text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# 配置文件保持原有换行符
+*.properties text eol=lf
+
+# IDE 文件
+.editorconfig text eol=lf
+
+# CI/CD 配置
+*.yml text eol=lf
+.gitlab-ci.yml text eol=lf
+
+# 二进制文件
+*.doc filter=lfs diff=lfs merge=lfs -text
+*.docx filter=lfs diff=lfs merge=lfs -text
+*.pdf filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.exe filter=lfs diff=lfs merge=lfs -text
+*.msi filter=lfs diff=lfs merge=lfs -text

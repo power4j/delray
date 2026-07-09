@@ -1,0 +1,28 @@
+/target
+!/Cargo.lock
+/logs
+*.log
+*.log.*
+.idea
+
+# ci dist
+/dist
+# any temp dir
+tmp/
+temp/
+.playwright-cli/
+
+# local config
+*.local.ini
+
+# local doc
+docs/local/
+
+# AI
+.claude/
+.codex/
+openspec/
+.mcp.json
+#AGENTS.md
+#CLAUDE.md
+verification.md
