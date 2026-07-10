@@ -2,7 +2,8 @@ use std::net::IpAddr;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::stats::Stats;
+use crate::proc_table::ProcTable;
+use crate::stats::{ProcTraffic, Stats};
 
 /// 清屏并输出当前统计快照。
 pub fn render(
@@ -10,6 +11,7 @@ pub fn render(
     started_wall: &chrono::DateTime<chrono::Local>,
     started_at: Instant,
     stats: &Stats,
+    proc_table: &ProcTable,
     top_n: usize,
 ) {
     print!("\x1b[2J\x1b[H");
@@ -30,11 +32,29 @@ pub fn render(
         human_bytes(stats.out_bytes)
     );
     println!();
+    println!("进程流量（top {top_n}）");
+    print_proc_list(&stats.top_procs(top_n), proc_table);
+    println!();
     println!("入站 IP（top {top_n}）");
     print_ip_list(&stats.top_in(top_n));
     println!();
     println!("出站 IP（top {top_n}）");
     print_ip_list(&stats.top_out(top_n));
+}
+
+fn print_proc_list(list: &[(u32, ProcTraffic)], proc_table: &ProcTable) {
+    if list.is_empty() {
+        println!("  （暂无数据）");
+        return;
+    }
+    for (pid, t) in list {
+        let name = proc_table.names.get(pid).map(|s| s.as_str()).unwrap_or("?");
+        println!(
+            "  {name:<16} pid {pid:<7} 收 {} 发 {}",
+            human_bytes(t.recv),
+            human_bytes(t.sent)
+        );
+    }
 }
 
 fn print_ip_list(list: &[(IpAddr, u64)]) {

@@ -2,8 +2,10 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 
 use anyhow::{Result, anyhow};
-use etherparse::{NetHeaders, PacketHeaders};
+use etherparse::{NetHeaders, PacketHeaders, TransportHeader};
 use pcap::{Capture, Device};
+
+use crate::stats::Direction;
 
 /// 指定网卡的抓包源。
 pub struct CaptureSource {
@@ -11,17 +13,14 @@ pub struct CaptureSource {
     local_ips: HashSet<IpAddr>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    Inbound,
-    Outbound,
-}
-
 /// 解析后的单向流量记录。
 pub struct Flow {
     pub direction: Direction,
+    /// 远端 IP（用于 IP 维度统计）。
     pub peer: IpAddr,
     pub bytes: u64,
+    /// 本机 (IP, 端口)，仅 TCP/UDP 有；用于进程关联。
+    pub local_socket: Option<(IpAddr, u16)>,
 }
 
 /// 打印可用网卡列表。
@@ -35,7 +34,7 @@ pub fn list_interfaces() {
                     None => println!("  {}", d.name),
                 }
             }
-            println!("\n用法：delray <网卡名>");
+            println!("\n用法：delray <网卡名> [--proc-refresh <秒>]");
         }
         Err(e) => eprintln!("无法枚举网卡：{e}"),
     }
@@ -92,19 +91,36 @@ fn parse(data: &[u8], local_ips: &HashSet<IpAddr>) -> Option<Flow> {
 
     let bytes = data.len() as u64;
 
-    if local_ips.contains(&src) {
-        Some(Flow {
-            direction: Direction::Outbound,
-            peer: dst,
-            bytes,
-        })
+    let (direction, local_ip, peer) = if local_ips.contains(&src) {
+        (Direction::Outbound, src, dst)
     } else if local_ips.contains(&dst) {
-        Some(Flow {
-            direction: Direction::Inbound,
-            peer: src,
-            bytes,
-        })
+        (Direction::Inbound, dst, src)
     } else {
-        None
-    }
+        return None;
+    };
+
+    let local_port = match &headers.transport {
+        Some(TransportHeader::Tcp(tcp)) => {
+            if direction == Direction::Outbound {
+                Some(tcp.source_port)
+            } else {
+                Some(tcp.destination_port)
+            }
+        }
+        Some(TransportHeader::Udp(udp)) => {
+            if direction == Direction::Outbound {
+                Some(udp.source_port)
+            } else {
+                Some(udp.destination_port)
+            }
+        }
+        _ => None,
+    };
+
+    Some(Flow {
+        direction,
+        peer,
+        bytes,
+        local_socket: local_port.map(|p| (local_ip, p)),
+    })
 }
