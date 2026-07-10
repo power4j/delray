@@ -152,4 +152,16 @@ mod cli_tests {
         let cli = Cli::try_parse_from(["delray"]).unwrap();
         assert!(cli.interface.is_none());
     }
+
+    #[test]
+    fn proc_refresh_non_numeric_rejected() {
+        let result = Cli::try_parse_from(["delray", "eth0", "--proc-refresh", "abc"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn proc_refresh_negative_rejected() {
+        let result = Cli::try_parse_from(["delray", "eth0", "--proc-refresh", "-5"]);
+        assert!(result.is_err());
+    }
 }
