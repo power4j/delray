@@ -3,9 +3,10 @@ mod proc_table;
 mod report;
 mod stats;
 
-use std::env;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
+
+use clap::Parser;
 
 use capture::CaptureSource;
 use stats::Direction;
@@ -15,12 +16,11 @@ const TOP_N: usize = 10;
 const DEFAULT_PROC_REFRESH: u64 = 2;
 
 fn main() -> ExitCode {
-    let (interface, proc_refresh, output_file) = match parse_args() {
-        Ok(v) => v,
-        Err(()) => {
-            capture::list_interfaces();
-            return ExitCode::FAILURE;
-        }
+    let cli = Cli::parse();
+
+    let Some(interface) = cli.interface else {
+        capture::list_interfaces();
+        return ExitCode::FAILURE;
     };
 
     let started_wall = chrono::Local::now();
@@ -33,9 +33,9 @@ fn main() -> ExitCode {
         }
     };
 
-    let proc_table = proc_table::spawn(Duration::from_secs(proc_refresh));
+    let proc_table = proc_table::spawn(Duration::from_secs(cli.proc_refresh));
 
-    if let Some(path) = &output_file {
+    if let Some(path) = &cli.output {
         eprintln!(
             "后台运行：每 {} 秒刷新统计到 {path}",
             REFRESH_INTERVAL.as_secs()
@@ -65,7 +65,7 @@ fn main() -> ExitCode {
         }
 
         if Instant::now() >= next_refresh {
-            match &output_file {
+            match &cli.output {
                 Some(path) => {
                     if let Err(e) = report::render_file(
                         path,
@@ -87,23 +87,69 @@ fn main() -> ExitCode {
     }
 }
 
-/// 解析命令行：delray <网卡> [--proc-refresh <秒>] [--output <文件>]
-fn parse_args() -> Result<(String, u64, Option<String>), ()> {
-    let mut interface: Option<String> = None;
-    let mut proc_refresh = DEFAULT_PROC_REFRESH;
-    let mut output: Option<String> = None;
-    let mut args = env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--proc-refresh" {
-            proc_refresh = args
-                .next()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(DEFAULT_PROC_REFRESH);
-        } else if arg == "--output" {
-            output = args.next();
-        } else if interface.is_none() {
-            interface = Some(arg);
-        }
+/// 命令行参数。
+#[derive(Parser)]
+#[command(
+    name = "delray",
+    version,
+    about = "面向资源受限 Linux 服务器的网络流量分析工具"
+)]
+struct Cli {
+    /// 监听网卡名
+    interface: Option<String>,
+    /// 进程 inode 表重建间隔（秒）
+    #[arg(long, default_value_t = DEFAULT_PROC_REFRESH, value_parser = positive_u64)]
+    proc_refresh: u64,
+    /// 后台模式输出文件（不指定则前台输出终端）
+    #[arg(long)]
+    output: Option<String>,
+}
+
+/// 校验 `--proc-refresh` 为大于 0 的整数。
+fn positive_u64(s: &str) -> Result<u64, String> {
+    match s.parse::<u64>() {
+        Ok(v) if v > 0 => Ok(v),
+        Ok(_) => Err(String::from("--proc-refresh 必须大于 0")),
+        Err(_) => Err(String::from("--proc-refresh 需要正整数")),
     }
-    interface.map(|i| (i, proc_refresh, output)).ok_or(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn parses_all_args() {
+        let cli = Cli::try_parse_from([
+            "delray",
+            "eth0",
+            "--proc-refresh",
+            "5",
+            "--output",
+            "out.txt",
+        ])
+        .unwrap();
+        assert_eq!(cli.interface.as_deref(), Some("eth0"));
+        assert_eq!(cli.proc_refresh, 5);
+        assert_eq!(cli.output.as_deref(), Some("out.txt"));
+    }
+
+    #[test]
+    fn proc_refresh_defaults_to_two() {
+        let cli = Cli::try_parse_from(["delray", "eth0"]).unwrap();
+        assert_eq!(cli.proc_refresh, DEFAULT_PROC_REFRESH);
+        assert!(cli.output.is_none());
+    }
+
+    #[test]
+    fn proc_refresh_zero_rejected() {
+        let result = Cli::try_parse_from(["delray", "eth0", "--proc-refresh", "0"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn interface_optional() {
+        let cli = Cli::try_parse_from(["delray"]).unwrap();
+        assert!(cli.interface.is_none());
+    }
 }
