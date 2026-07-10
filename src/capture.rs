@@ -34,7 +34,7 @@ pub fn list_interfaces() {
                     None => println!("  {}", d.name),
                 }
             }
-            println!("\n用法：delray <网卡名> [--proc-refresh <秒>]");
+            println!("\n用法：delray <网卡名> [--proc-refresh <秒>] [--output <文件>]");
         }
         Err(e) => eprintln!("无法枚举网卡：{e}"),
     }

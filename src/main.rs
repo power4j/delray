@@ -15,7 +15,7 @@ const TOP_N: usize = 10;
 const DEFAULT_PROC_REFRESH: u64 = 2;
 
 fn main() -> ExitCode {
-    let (interface, proc_refresh) = match parse_args() {
+    let (interface, proc_refresh, output_file) = match parse_args() {
         Ok(v) => v,
         Err(()) => {
             capture::list_interfaces();
@@ -34,6 +34,13 @@ fn main() -> ExitCode {
     };
 
     let proc_table = proc_table::spawn(Duration::from_secs(proc_refresh));
+
+    if let Some(path) = &output_file {
+        eprintln!(
+            "后台运行：每 {} 秒刷新统计到 {path}",
+            REFRESH_INTERVAL.as_secs()
+        );
+    }
 
     let mut stats = stats::Stats::default();
     let mut next_refresh = Instant::now() + REFRESH_INTERVAL;
@@ -58,16 +65,33 @@ fn main() -> ExitCode {
         }
 
         if Instant::now() >= next_refresh {
-            report::render(&interface, &started_wall, started_at, &stats, TOP_N);
+            match &output_file {
+                Some(path) => {
+                    if let Err(e) = report::render_file(
+                        path,
+                        &interface,
+                        &started_wall,
+                        started_at,
+                        &stats,
+                        TOP_N,
+                    ) {
+                        eprintln!("写入输出文件失败：{e}");
+                    }
+                }
+                None => {
+                    report::render_terminal(&interface, &started_wall, started_at, &stats, TOP_N);
+                }
+            }
             next_refresh = Instant::now() + REFRESH_INTERVAL;
         }
     }
 }
 
-/// 解析命令行：delray <网卡> [--proc-refresh <秒>]
-fn parse_args() -> Result<(String, u64), ()> {
+/// 解析命令行：delray <网卡> [--proc-refresh <秒>] [--output <文件>]
+fn parse_args() -> Result<(String, u64, Option<String>), ()> {
     let mut interface: Option<String> = None;
     let mut proc_refresh = DEFAULT_PROC_REFRESH;
+    let mut output: Option<String> = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--proc-refresh" {
@@ -75,9 +99,11 @@ fn parse_args() -> Result<(String, u64), ()> {
                 .next()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_PROC_REFRESH);
+        } else if arg == "--output" {
+            output = args.next();
         } else if interface.is_none() {
             interface = Some(arg);
         }
     }
-    interface.map(|i| (i, proc_refresh)).ok_or(())
+    interface.map(|i| (i, proc_refresh, output)).ok_or(())
 }
