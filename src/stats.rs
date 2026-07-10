@@ -17,6 +17,8 @@ pub struct Stats {
     in_by_ip: HashMap<IpAddr, u64>,
     out_by_ip: HashMap<IpAddr, u64>,
     by_proc: HashMap<u32, ProcTraffic>,
+    /// pid -> 进程展示名缓存，避免进程退出后名字丢失为 "?"。
+    pid_names: HashMap<u32, String>,
 }
 
 /// 单个进程的收发流量。
@@ -39,11 +41,14 @@ impl Stats {
         *self.out_by_ip.entry(destination).or_default() += bytes;
     }
 
-    pub fn add_proc(&mut self, pid: u32, direction: Direction, bytes: u64) {
+    pub fn add_proc(&mut self, pid: u32, name: Option<&str>, direction: Direction, bytes: u64) {
         let entry = self.by_proc.entry(pid).or_default();
         match direction {
             Direction::Inbound => entry.recv += bytes,
             Direction::Outbound => entry.sent += bytes,
+        }
+        if let Some(n) = name {
+            self.pid_names.entry(pid).or_insert_with(|| n.to_string());
         }
     }
 
@@ -61,6 +66,10 @@ impl Stats {
         entries.sort_unstable_by_key(|(_, t)| std::cmp::Reverse(t.recv + t.sent));
         entries.truncate(n);
         entries
+    }
+
+    pub fn proc_name(&self, pid: u32) -> Option<&str> {
+        self.pid_names.get(&pid).map(|s| s.as_str())
     }
 }
 

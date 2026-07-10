@@ -2,7 +2,6 @@ use std::net::IpAddr;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::proc_table::ProcTable;
 use crate::stats::{ProcTraffic, Stats};
 
 /// 清屏并输出当前统计快照。
@@ -11,7 +10,6 @@ pub fn render(
     started_wall: &chrono::DateTime<chrono::Local>,
     started_at: Instant,
     stats: &Stats,
-    proc_table: &ProcTable,
     top_n: usize,
 ) {
     print!("\x1b[2J\x1b[H");
@@ -33,7 +31,7 @@ pub fn render(
     );
     println!();
     println!("进程流量（top {top_n}）");
-    print_proc_list(&stats.top_procs(top_n), proc_table);
+    print_proc_list(&stats.top_procs(top_n), stats);
     println!();
     println!("入站 IP（top {top_n}）");
     print_ip_list(&stats.top_in(top_n));
@@ -42,19 +40,29 @@ pub fn render(
     print_ip_list(&stats.top_out(top_n));
 }
 
-fn print_proc_list(list: &[(u32, ProcTraffic)], proc_table: &ProcTable) {
+fn print_proc_list(list: &[(u32, ProcTraffic)], stats: &Stats) {
     if list.is_empty() {
         println!("  （暂无数据）");
         return;
     }
     for (pid, t) in list {
-        let name = proc_table.names.get(pid).map(|s| s.as_str()).unwrap_or("?");
+        let raw = stats.proc_name(*pid).unwrap_or("?");
+        let name = truncate(raw, 42);
         println!(
-            "  {name:<16} pid {pid:<7} 收 {} 发 {}",
+            "  {name:<44} pid {pid:<7} 收 {} 发 {}",
             human_bytes(t.recv),
             human_bytes(t.sent)
         );
     }
+}
+
+/// 超过 max_chars 个字符时截断并加省略号。
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max_chars).collect();
+    format!("{head}…")
 }
 
 fn print_ip_list(list: &[(IpAddr, u64)]) {

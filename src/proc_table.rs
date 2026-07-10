@@ -10,7 +10,7 @@ use std::time::Duration;
 pub struct ProcTable {
     /// (本机 IP, 本机端口) -> 进程信息。
     entries: HashMap<(IpAddr, u16), ProcInfo>,
-    /// pid -> 进程名（用于展示）。
+    /// pid -> 进程展示名（cmdline 优先）。
     pub names: HashMap<u32, String>,
 }
 
@@ -85,7 +85,7 @@ fn build() -> ProcTable {
                 continue;
             }
             // 仅对命中 socket 的进程读取进程名，控制开销
-            let name = read_comm(pid).unwrap_or_else(|| pid.to_string());
+            let name = read_name(pid).unwrap_or_else(|| pid.to_string());
             names.insert(pid, name);
             for (ip, port) in hits {
                 entries.insert((ip, port), ProcInfo { pid });
@@ -163,6 +163,43 @@ fn parse_socket_inode(s: &str) -> Option<u64> {
     s.parse().ok()
 }
 
+/// 读取进程展示名：优先 cmdline，其次 exe 基名，最后 comm。
+/// comm 可被程序用 prctl 改名（如代理软件改成协议名），定位价值低，
+/// 故优先用能反映真实程序的 cmdline / exe 路径。
+fn read_name(pid: u32) -> Option<String> {
+    if let Some(cmd) = read_cmdline(pid) {
+        return Some(cmd);
+    }
+    if let Some(exe) = read_exe_basename(pid) {
+        return Some(exe);
+    }
+    read_comm(pid)
+}
+
+fn read_cmdline(pid: u32) -> Option<String> {
+    let data = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    parse_cmdline_bytes(&data)
+}
+
+/// 解析 /proc/<pid>/cmdline 原始字节（NUL 分隔参数）为空格连接的命令行。
+fn parse_cmdline_bytes(data: &[u8]) -> Option<String> {
+    let parts: Vec<&str> = data
+        .split(|&b| b == 0)
+        .filter_map(|s| std::str::from_utf8(s).ok())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+fn read_exe_basename(pid: u32) -> Option<String> {
+    let path = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    path.file_name()?.to_str().map(|s| s.to_string())
+}
+
 fn read_comm(pid: u32) -> Option<String> {
     let s = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
     Some(s.trim_end_matches('\n').to_string())
@@ -204,5 +241,29 @@ mod tests {
     fn parse_socket_inode_rejects_non_socket() {
         assert_eq!(parse_socket_inode("/dev/null"), None);
         assert_eq!(parse_socket_inode("socket:[abc]"), None);
+    }
+
+    #[test]
+    fn parse_cmdline_basic() {
+        // NUL 分隔的多个参数 -> 空格连接
+        assert_eq!(
+            parse_cmdline_bytes(b"/usr/bin/curl\0http://x\0"),
+            Some("/usr/bin/curl http://x".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_cmdline_single_arg() {
+        assert_eq!(
+            parse_cmdline_bytes(b"/usr/sbin/nginx\0"),
+            Some("/usr/sbin/nginx".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_cmdline_empty() {
+        // 内核线程无 cmdline，应返回 None 以触发 exe/comm 兜底
+        assert_eq!(parse_cmdline_bytes(b"\0\0"), None);
+        assert_eq!(parse_cmdline_bytes(b""), None);
     }
 }

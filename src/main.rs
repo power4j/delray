@@ -49,7 +49,8 @@ fn main() -> ExitCode {
                     && let Ok(table) = proc_table.read()
                     && let Some(pid) = table.lookup(ip, port)
                 {
-                    stats.add_proc(pid, flow.direction, flow.bytes);
+                    let name = table.names.get(&pid).cloned();
+                    stats.add_proc(pid, name.as_deref(), flow.direction, flow.bytes);
                 }
             }
             Ok(None) => {}
@@ -57,9 +58,7 @@ fn main() -> ExitCode {
         }
 
         if Instant::now() >= next_refresh {
-            if let Ok(table) = proc_table.read() {
-                report::render(&interface, &started_wall, started_at, &stats, &table, TOP_N);
-            }
+            report::render(&interface, &started_wall, started_at, &stats, TOP_N);
             next_refresh = Instant::now() + REFRESH_INTERVAL;
         }
     }
