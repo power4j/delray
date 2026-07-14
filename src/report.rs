@@ -339,3 +339,66 @@ pub fn render_file_json(
     let json = serde_json::to_string_pretty(&frame).map_err(std::io::Error::other)?;
     std::fs::write(path, json)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_empty_stats_does_not_panic() {
+        let stats = Stats::default();
+        let now = chrono::Local::now();
+        let out = render_plain("eth0", &now, Instant::now(), &stats, 10, false);
+        assert!(out.contains("delray"));
+        assert!(out.contains("eth0"));
+        assert!(out.contains("Interface Traffic"));
+        assert!(out.contains("Inbound"));
+        assert!(out.contains("Outbound"));
+        assert!(out.contains("Top Processes"));
+        assert!(out.contains("Top Inbound IPs"));
+        assert!(out.contains("Top Outbound IPs"));
+    }
+
+    #[test]
+    fn json_empty_stats_is_valid() {
+        let stats = Stats::default();
+        let now = chrono::Local::now();
+        let frame = build_json_frame("eth0", &now, Instant::now(), &stats, 10);
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("\"interface\":\"eth0\""));
+        assert!(json.contains("\"in_bytes\":0"));
+        assert!(json.contains("\"out_bytes\":0"));
+        assert!(json.contains("\"top_processes\":["));
+        assert!(json.contains("\"top_inbound_ips\":["));
+        assert!(json.contains("\"top_outbound_ips\":["));
+    }
+
+    #[test]
+    fn json_top_n_truncates() {
+        let stats = Stats::default();
+        let now = chrono::Local::now();
+        let frame = build_json_frame("eth0", &now, Instant::now(), &stats, 3);
+        let json = serde_json::to_string(&frame).unwrap();
+        // Should be valid JSON with expected keys, even empty.
+        assert!(json.contains("\"uptime_secs\":"));
+        assert!(json.contains("\"started_at\":"));
+        assert!(json.contains("\"now\":"));
+    }
+
+    #[test]
+    fn styled_plain_contains_ansi_for_title() {
+        let stats = Stats::default();
+        let now = chrono::Local::now();
+        let out = render_plain("eth0", &now, Instant::now(), &stats, 10, true);
+        // Title line should carry the cyan+bold ANSI escape.
+        assert!(out.contains("\x1b[1;36mdelray\x1b[0m"));
+    }
+
+    #[test]
+    fn unstyled_plain_has_no_ansi() {
+        let stats = Stats::default();
+        let now = chrono::Local::now();
+        let out = render_plain("eth0", &now, Instant::now(), &stats, 10, false);
+        assert!(!out.contains("\x1b["));
+    }
+}
