@@ -25,7 +25,7 @@ use crate::report::{fmt_elapsed, hostname, human_bytes, truncate};
 use crate::stats::{Direction, Stats};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-const OVERVIEW_PREVIEW_ROWS: usize = 5;
+const DRAIN_MAX_PER_TICK: usize = 256;
 
 /// Which page is active.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -136,27 +136,36 @@ fn tui_loop(
     next_refresh: &mut Instant,
 ) -> io::Result<()> {
     loop {
-        // Drain capture packets since last frame.
-        drain_capture(source, proc_table, stats);
+        // Drain at most N packets per tick so the event loop stays responsive.
+        drain_capture(source, proc_table, stats, DRAIN_MAX_PER_TICK);
 
         // Redraw.
         terminal.draw(|f| draw(f, state, stats, interface, started_at, top_n))?;
 
         // Wait for either a key event or the refresh tick.
         while Instant::now() < *next_refresh {
-            if event::poll(Duration::from_millis(200))?
+            if event::poll(Duration::from_millis(50))?
                 && let Event::Key(key) = event::read()?
-                && handle_key(state, key, stats, top_n)
             {
-                return Ok(());
+                if handle_key(state, key, stats, top_n) {
+                    return Ok(());
+                }
+                // Any key: redraw immediately so the user sees the change.
+                drain_capture(source, proc_table, stats, DRAIN_MAX_PER_TICK);
+                terminal.draw(|f| draw(f, state, stats, interface, started_at, top_n))?;
             }
         }
         *next_refresh = Instant::now() + REFRESH_INTERVAL;
     }
 }
 
-fn drain_capture(source: &mut CaptureSource, proc_table: &SharedProcTable, stats: &mut Stats) {
-    loop {
+fn drain_capture(
+    source: &mut CaptureSource,
+    proc_table: &SharedProcTable,
+    stats: &mut Stats,
+    max: usize,
+) {
+    for _ in 0..max {
         match source.next() {
             Ok(Some(flow)) => {
                 match flow.direction {
@@ -420,7 +429,7 @@ fn draw_overview(f: &mut ratatui::Frame, area: Rect, stats: &Stats, top_n: usize
     let procs = stats.top_procs(top_n);
     let proc_items: Vec<ListItem> = procs
         .iter()
-        .take(OVERVIEW_PREVIEW_ROWS)
+        .take(5)
         .map(|(pid, t)| {
             let name = stats.proc_name(*pid).unwrap_or("?");
             ListItem::new(format!(
@@ -430,25 +439,25 @@ fn draw_overview(f: &mut ratatui::Frame, area: Rect, stats: &Stats, top_n: usize
             ))
         })
         .collect();
-    let proc_block = preview_block("Top Processes", procs.len(), OVERVIEW_PREVIEW_ROWS, 2);
+    let proc_block = preview_block("Top Processes", procs.len(), 5, 2);
     f.render_widget(List::new(proc_items).block(proc_block), cols[0]);
 
     let in_ips = stats.top_in(top_n);
     let in_items: Vec<ListItem> = in_ips
         .iter()
-        .take(OVERVIEW_PREVIEW_ROWS)
+        .take(5)
         .map(|(ip, bytes)| ListItem::new(format!("{ip}  {}", human_bytes(*bytes))))
         .collect();
-    let in_block = preview_block("Top Inbound IPs", in_ips.len(), OVERVIEW_PREVIEW_ROWS, 3);
+    let in_block = preview_block("Top Inbound IPs", in_ips.len(), 5, 3);
     f.render_widget(List::new(in_items).block(in_block), cols[1]);
 
     let out_ips = stats.top_out(top_n);
     let out_items: Vec<ListItem> = out_ips
         .iter()
-        .take(OVERVIEW_PREVIEW_ROWS)
+        .take(5)
         .map(|(ip, bytes)| ListItem::new(format!("{ip}  {}", human_bytes(*bytes))))
         .collect();
-    let out_block = preview_block("Top Outbound IPs", out_ips.len(), OVERVIEW_PREVIEW_ROWS, 3);
+    let out_block = preview_block("Top Outbound IPs", out_ips.len(), 5, 3);
     f.render_widget(List::new(out_items).block(out_block), cols[2]);
 }
 
