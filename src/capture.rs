@@ -66,7 +66,7 @@ impl CaptureSource {
         let device = Device::list()?
             .into_iter()
             .find(|d| d.name == name)
-            .ok_or_else(|| anyhow!("网卡不存在：{name}"))?;
+            .ok_or_else(|| anyhow!("Interface not found: {name}"))?;
 
         let local_ips = device
             .addresses
