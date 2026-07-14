@@ -12,7 +12,7 @@ use capture::CaptureSource;
 use stats::Direction;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-const TOP_N: usize = 10;
+const DEFAULT_TOP_N: u64 = 10;
 const DEFAULT_PROC_REFRESH: u64 = 2;
 
 fn main() -> ExitCode {
@@ -28,7 +28,7 @@ fn main() -> ExitCode {
     let mut source = match CaptureSource::open(&interface) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("打开网卡失败：{e}");
+            eprintln!("Failed to open interface: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -37,7 +37,7 @@ fn main() -> ExitCode {
 
     if let Some(path) = &cli.output {
         eprintln!(
-            "后台运行：每 {} 秒刷新统计到 {path}",
+            "Background mode: refreshing stats to {path} every {}s",
             REFRESH_INTERVAL.as_secs()
         );
     }
@@ -61,7 +61,7 @@ fn main() -> ExitCode {
                 }
             }
             Ok(None) => {}
-            Err(e) => eprintln!("抓包错误：{e}"),
+            Err(e) => eprintln!("Capture error: {e}"),
         }
 
         if Instant::now() >= next_refresh {
@@ -73,13 +73,19 @@ fn main() -> ExitCode {
                         &started_wall,
                         started_at,
                         &stats,
-                        TOP_N,
+                        cli.top_n as usize,
                     ) {
-                        eprintln!("写入输出文件失败：{e}");
+                        eprintln!("Failed to write output file: {e}");
                     }
                 }
                 None => {
-                    report::render_terminal(&interface, &started_wall, started_at, &stats, TOP_N);
+                    report::render_terminal(
+                        &interface,
+                        &started_wall,
+                        started_at,
+                        &stats,
+                        cli.top_n as usize,
+                    );
                 }
             }
             next_refresh = Instant::now() + REFRESH_INTERVAL;
@@ -87,30 +93,35 @@ fn main() -> ExitCode {
     }
 }
 
-/// 命令行参数。
+/// CLI arguments.
 #[derive(Parser)]
 #[command(
     name = "delray",
     version,
-    about = "面向资源受限 Linux 服务器的网络流量分析工具"
+    about = "Network traffic analyzer for resource-constrained Linux servers"
 )]
 struct Cli {
-    /// 监听网卡名
+    /// Network interface to capture on (omit to list available interfaces)
     interface: Option<String>,
-    /// 进程 inode 表重建间隔（秒）
+    /// /proc inode-table rebuild interval in seconds (must be > 0)
     #[arg(long, default_value_t = DEFAULT_PROC_REFRESH, value_parser = positive_u64)]
     proc_refresh: u64,
-    /// 后台模式输出文件（不指定则前台输出终端）
+    /// Output file for background mode (omit for foreground terminal display)
     #[arg(long)]
     output: Option<String>,
+    /// Output format: plain (default) or json
+    #[arg(long = "format", short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
+    format: String,
+    /// Number of entries per top-N list (default: 10, min: 1)
+    #[arg(long = "top-n", short = 'n', default_value_t = DEFAULT_TOP_N, value_parser = clap::value_parser!(u64).range(1..))]
+    top_n: u64,
 }
 
-/// 校验 `--proc-refresh` 为大于 0 的整数。
 fn positive_u64(s: &str) -> Result<u64, String> {
     match s.parse::<u64>() {
         Ok(v) if v > 0 => Ok(v),
-        Ok(_) => Err(String::from("--proc-refresh 必须大于 0")),
-        Err(_) => Err(String::from("--proc-refresh 需要正整数")),
+        Ok(_) => Err(String::from("value must be greater than 0")),
+        Err(_) => Err(String::from("value must be a positive integer")),
     }
 }
 

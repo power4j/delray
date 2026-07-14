@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fs;
 use std::net::IpAddr;
 
 use anyhow::{Result, anyhow};
@@ -23,21 +24,39 @@ pub struct Flow {
     pub local_socket: Option<(IpAddr, u16)>,
 }
 
-/// 打印可用网卡列表。
+/// Determine the default route interface from /proc/net/route.
+fn default_interface() -> Option<String> {
+    let content = fs::read_to_string("/proc/net/route").ok()?;
+    for line in content.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 11 {
+            let dest = u32::from_str_radix(fields[1], 16).ok()?;
+            if dest == 0 {
+                return Some(fields[0].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Print available interfaces with the default-route interface highlighted.
 pub fn list_interfaces() {
+    let default = default_interface();
     match Device::list() {
         Ok(devs) => {
-            println!("请指定网卡，当前可用：");
+            println!("Available interfaces:");
             for d in devs {
+                let highlight = default.as_deref() == Some(d.name.as_str());
+                let marker = if highlight { "  [default route]" } else { "" };
                 match d.desc {
-                    Some(desc) => println!("  {}  ({desc})", d.name),
-                    None => println!("  {}", d.name),
+                    Some(desc) => println!("  {}  ({}){}", d.name, desc, marker),
+                    None => println!("  {}{}", d.name, marker),
                 }
             }
-            println!("\n用法：delray <网卡> [--proc-refresh <秒>] [--output <文件>]");
-            println!("运行 delray --help 查看完整用法");
+            println!("\nUsage: delray <interface> [OPTIONS]");
+            println!("Run delray --help for full usage");
         }
-        Err(e) => eprintln!("无法枚举网卡：{e}"),
+        Err(e) => eprintln!("Failed to enumerate interfaces: {e}"),
     }
 }
 
