@@ -21,9 +21,8 @@
 | libpcap 开发包 | Debian/Ubuntu：`apt install libpcap-dev`；RHEL 系：`yum install libpcap-devel` |
 | zig | 交叉编译所需：从 [ziglang.org](https://ziglang.org/download/) 下载解压并加入 `PATH` |
 | cargo-zigbuild | `cargo install cargo-zigbuild` |
-| libpcap 库链接（无 `libpcap-dev` 时） | 可在 `temp/lib/` 下创建软链指向系统 `libpcap.so`，编译时 `LIBPCAP_LIBDIR=temp/lib cargo build` |
 
-开发编译无需 root，零依赖构建顺序：
+开发编译无需 root：
 
 ```bash
 # 安装 zig（如未安装）
@@ -32,10 +31,8 @@
 # 安装 cargo-zigbuild
 cargo install cargo-zigbuild
 
-# 本地开发编译
+# 本地开发编译（需 libpcap-dev 已安装）
 cargo build
-# 或指定 libpcap 库路径
-LIBPCAP_LIBDIR=temp/lib cargo build
 
 # 裁剪检查
 cargo clippy -- -D warnings
@@ -48,7 +45,7 @@ cargo test
 以 glibc 2.28 为基线交叉构建，产物兼容 glibc ≥ 2.28 的目标机：
 
 ```bash
-LIBPCAP_LIBDIR=temp/lib cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.28
+cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.28
 ```
 
 产物位于 `target/x86_64-unknown-linux-gnu/release/delray`（约 1.4M），拷贝到目标机即可运行。
@@ -63,7 +60,7 @@ readelf -d target/x86_64-unknown-linux-gnu/release/delray | grep NEEDED
 ## 用法
 
 ```
-Network traffic analyzer for resource-constrained Linux servers
+Network traffic analyzer
 
 Usage: delray [OPTIONS] [INTERFACE]
 
@@ -82,10 +79,10 @@ Options:
 示例：
 
 ```bash
-# 前台 plain 表格
+# 前台 TUI 交互（多页：概览/进程/IP/关于）
 ./delray eth0
 
-# 后台写文件（去 ANSI 的纯表格）
+# 后台写文件（tab 排版，无样式）
 ./delray eth0 --output /tmp/stats.txt
 
 # JSONL 流到 stdout

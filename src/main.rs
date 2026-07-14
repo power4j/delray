@@ -168,7 +168,7 @@ fn drain(
 #[command(
     name = "delray",
     version,
-    about = "Network traffic analyzer for resource-constrained Linux servers"
+    about = "Network traffic analyzer"
 )]
 struct Cli {
     /// Network interface to capture on (omit to list available interfaces)
