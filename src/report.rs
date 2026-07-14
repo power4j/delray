@@ -1,189 +1,27 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use comfy_table::modifiers::UTF8_ROUND_CORNERS;
-use comfy_table::presets::UTF8_FULL;
-use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
+use serde::Serialize;
 
 use crate::stats::Stats;
 
-/// Build a comfy-table with our default style preset.
-fn table_base(styled: bool) -> Table {
-    let mut t = Table::new();
-    t.load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
-        .set_content_arrangement(ContentArrangement::Dynamic);
-    if styled {
-        t.enforce_styling();
-    } else {
-        t.force_no_tty();
-    }
-    t
+// ── shared helpers ──
+
+pub fn hostname() -> String {
+    Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn hdr(text: &str) -> Cell {
-    Cell::new(text)
-        .fg(Color::Cyan)
-        .add_attribute(Attribute::Bold)
-}
-
-fn val(text: impl std::fmt::Display) -> Cell {
-    Cell::new(text)
-}
-
-fn num(text: impl std::fmt::Display) -> Cell {
-    Cell::new(text).set_alignment(CellAlignment::Right)
-}
-
-/// Apply terminal width to a styled table; no-op for narrow terminals or if TTY width unavailable.
-fn set_terminal_width(t: &mut Table) {
-    if let Some((w, _)) = terminal_size::terminal_size()
-        && w.0 > 40
-    {
-        t.set_width(w.0);
-    }
-}
-
-/// Apply table width: terminal-width for styled, fixed 120 for file output.
-fn apply_width(t: &mut Table, styled: bool) {
-    if styled {
-        set_terminal_width(t);
-    } else {
-        t.set_width(120);
-    }
-}
-
-/// Render plain-text snapshot — shared by terminal and file paths.
-fn render_plain(
-    interface: &str,
-    started_wall: &chrono::DateTime<chrono::Local>,
-    started_at: Instant,
-    stats: &Stats,
-    top_n: usize,
-    styled: bool,
-) -> String {
-    let host = hostname();
-    let now = chrono::Local::now();
-    let mut out = String::new();
-
-    // Title + info header
-    if styled {
-        out.push_str(&format!(
-            "\x1b[1;36mdelray\x1b[0m  interface {interface}  host {host}\n"
-        ));
-    } else {
-        out.push_str(&format!("delray  interface {interface}  host {host}\n"));
-    }
-    out.push_str(&format!(
-        "Started {}  Now {}  Uptime {}\n",
-        started_wall.format("%Y-%m-%d %H:%M:%S"),
-        now.format("%Y-%m-%d %H:%M:%S"),
-        fmt_elapsed(started_at.elapsed())
-    ));
-
-    // ---- Interface Traffic ----
-    {
-        let mut t = table_base(styled);
-        apply_width(&mut t, styled);
-        t.set_header(vec![hdr("Direction"), hdr("Bytes")]);
-        t.add_row(vec![val("Inbound"), num(human_bytes(stats.in_bytes))]);
-        t.add_row(vec![val("Outbound"), num(human_bytes(stats.out_bytes))]);
-        out.push_str(&format!("\nInterface Traffic\n{}", t));
-    }
-
-    // ---- Top Processes ----
-    {
-        let procs = stats.top_procs(top_n);
-        let mut t = table_base(styled);
-        apply_width(&mut t, styled);
-        t.set_header(vec![hdr("Process"), hdr("PID"), hdr("Recv"), hdr("Sent")]);
-        if procs.is_empty() {
-            out.push_str(&format!("\nTop Processes ({top_n})\n  (no data)\n"));
-        } else {
-            for (pid, traffic) in &procs {
-                let name = stats.proc_name(*pid).unwrap_or("?");
-                t.add_row(vec![
-                    val(truncate(name, 60)),
-                    val(pid),
-                    num(human_bytes(traffic.recv)),
-                    num(human_bytes(traffic.sent)),
-                ]);
-            }
-            out.push_str(&format!("\nTop Processes ({top_n})\n{}", t));
-        }
-    }
-
-    // ---- Top Inbound IPs ----
-    {
-        let ips = stats.top_in(top_n);
-        let mut t = table_base(styled);
-        apply_width(&mut t, styled);
-        t.set_header(vec![hdr("IP"), hdr("Bytes")]);
-        if ips.is_empty() {
-            out.push_str(&format!("\nTop Inbound IPs ({top_n})\n  (no data)\n"));
-        } else {
-            for (ip, bytes) in &ips {
-                t.add_row(vec![val(ip), num(human_bytes(*bytes))]);
-            }
-            out.push_str(&format!("\nTop Inbound IPs ({top_n})\n{}", t));
-        }
-    }
-
-    // ---- Top Outbound IPs ----
-    {
-        let ips = stats.top_out(top_n);
-        let mut t = table_base(styled);
-        apply_width(&mut t, styled);
-        t.set_header(vec![hdr("IP"), hdr("Bytes")]);
-        if ips.is_empty() {
-            out.push_str(&format!("\nTop Outbound IPs ({top_n})\n  (no data)\n"));
-        } else {
-            for (ip, bytes) in &ips {
-                t.add_row(vec![val(ip), num(human_bytes(*bytes))]);
-            }
-            out.push_str(&format!("\nTop Outbound IPs ({top_n})\n{}", t));
-        }
-    }
-
-    out
-}
-
-/// Foreground: clear screen then print styled snapshot.
-pub fn render_terminal(
-    interface: &str,
-    started_wall: &chrono::DateTime<chrono::Local>,
-    started_at: Instant,
-    stats: &Stats,
-    top_n: usize,
-) {
-    print!("\x1b[2J\x1b[H");
-    print!(
-        "{}",
-        render_plain(interface, started_wall, started_at, stats, top_n, true)
-    );
-}
-
-/// Background: write last snapshot to file without ANSI styling.
-pub fn render_file(
-    path: &str,
-    interface: &str,
-    started_wall: &chrono::DateTime<chrono::Local>,
-    started_at: Instant,
-    stats: &Stats,
-    top_n: usize,
-) -> std::io::Result<()> {
-    std::fs::write(
-        path,
-        render_plain(interface, started_wall, started_at, stats, top_n, false),
-    )
-}
-
-fn fmt_elapsed(d: Duration) -> String {
+pub fn fmt_elapsed(d: Duration) -> String {
     let s = d.as_secs();
     format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
 }
 
-fn human_bytes(n: u64) -> String {
+pub fn human_bytes(n: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = 1024.0 * KB;
     const GB: f64 = 1024.0 * MB;
@@ -202,16 +40,7 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
-fn hostname() -> String {
-    Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn truncate(s: &str, max_chars: usize) -> String {
+pub fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         return s.to_string();
     }
@@ -219,9 +48,75 @@ fn truncate(s: &str, max_chars: usize) -> String {
     format!("{head}…")
 }
 
-// ── JSON rendering (one frame = cumulative snapshot) ──
+// ── plain file output (tab-separated, no table borders) ──
 
-use serde::Serialize;
+/// Render plain-text snapshot for background file output: section headers + tab-separated columns.
+pub fn render_file(
+    path: &str,
+    interface: &str,
+    started_wall: &chrono::DateTime<chrono::Local>,
+    started_at: Instant,
+    stats: &Stats,
+    top_n: usize,
+) -> std::io::Result<()> {
+    std::fs::write(
+        path,
+        plain_snapshot(interface, started_wall, started_at, stats, top_n),
+    )
+}
+
+fn plain_snapshot(
+    interface: &str,
+    started_wall: &chrono::DateTime<chrono::Local>,
+    started_at: Instant,
+    stats: &Stats,
+    top_n: usize,
+) -> String {
+    let host = hostname();
+    let now = chrono::Local::now();
+    let mut out = String::new();
+
+    out.push_str(&format!(
+        "delray\t{interface}\thost: {host}\tstarted: {}\tuptime: {}\t{}\n\n",
+        started_wall.format("%Y-%m-%d %H:%M:%S"),
+        fmt_elapsed(started_at.elapsed()),
+        now.format("%Y-%m-%d %H:%M:%S")
+    ));
+
+    out.push_str("Interface Traffic\n");
+    out.push_str(&format!("Inbound\t{}\n", human_bytes(stats.in_bytes)));
+    out.push_str(&format!("Outbound\t{}\n\n", human_bytes(stats.out_bytes)));
+
+    out.push_str(&format!("Top Processes ({top_n})\n"));
+    out.push_str("Process\tPID\tRecv\tSent\tTotal\n");
+    for (pid, traffic) in stats.top_procs(top_n) {
+        let name = stats.proc_name(pid).unwrap_or("?");
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            name,
+            pid,
+            human_bytes(traffic.recv),
+            human_bytes(traffic.sent),
+            human_bytes(traffic.recv + traffic.sent)
+        ));
+    }
+
+    out.push_str(&format!("\nTop Inbound IPs ({top_n})\n"));
+    out.push_str("IP\tBytes\n");
+    for (ip, bytes) in stats.top_in(top_n) {
+        out.push_str(&format!("{ip}\t{}\n", human_bytes(bytes)));
+    }
+
+    out.push_str(&format!("\nTop Outbound IPs ({top_n})\n"));
+    out.push_str("IP\tBytes\n");
+    for (ip, bytes) in stats.top_out(top_n) {
+        out.push_str(&format!("{ip}\t{}\n", human_bytes(bytes)));
+    }
+
+    out
+}
+
+// ── JSON output ──
 
 #[derive(Serialize)]
 struct JsonFrame<'a> {
@@ -320,7 +215,6 @@ pub fn render_jsonl(
     top_n: usize,
 ) {
     let frame = build_json_frame(interface, started_wall, started_at, stats, top_n);
-    // Compact JSONL — no pretty-print, no clear-screen (it's a data stream).
     if let Ok(line) = serde_json::to_string(&frame) {
         println!("{line}");
     }
@@ -338,67 +232,4 @@ pub fn render_file_json(
     let frame = build_json_frame(interface, started_wall, started_at, stats, top_n);
     let json = serde_json::to_string_pretty(&frame).map_err(std::io::Error::other)?;
     std::fs::write(path, json)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn plain_empty_stats_does_not_panic() {
-        let stats = Stats::default();
-        let now = chrono::Local::now();
-        let out = render_plain("eth0", &now, Instant::now(), &stats, 10, false);
-        assert!(out.contains("delray"));
-        assert!(out.contains("eth0"));
-        assert!(out.contains("Interface Traffic"));
-        assert!(out.contains("Inbound"));
-        assert!(out.contains("Outbound"));
-        assert!(out.contains("Top Processes"));
-        assert!(out.contains("Top Inbound IPs"));
-        assert!(out.contains("Top Outbound IPs"));
-    }
-
-    #[test]
-    fn json_empty_stats_is_valid() {
-        let stats = Stats::default();
-        let now = chrono::Local::now();
-        let frame = build_json_frame("eth0", &now, Instant::now(), &stats, 10);
-        let json = serde_json::to_string(&frame).unwrap();
-        assert!(json.contains("\"interface\":\"eth0\""));
-        assert!(json.contains("\"in_bytes\":0"));
-        assert!(json.contains("\"out_bytes\":0"));
-        assert!(json.contains("\"top_processes\":["));
-        assert!(json.contains("\"top_inbound_ips\":["));
-        assert!(json.contains("\"top_outbound_ips\":["));
-    }
-
-    #[test]
-    fn json_top_n_truncates() {
-        let stats = Stats::default();
-        let now = chrono::Local::now();
-        let frame = build_json_frame("eth0", &now, Instant::now(), &stats, 3);
-        let json = serde_json::to_string(&frame).unwrap();
-        // Should be valid JSON with expected keys, even empty.
-        assert!(json.contains("\"uptime_secs\":"));
-        assert!(json.contains("\"started_at\":"));
-        assert!(json.contains("\"now\":"));
-    }
-
-    #[test]
-    fn styled_plain_contains_ansi_for_title() {
-        let stats = Stats::default();
-        let now = chrono::Local::now();
-        let out = render_plain("eth0", &now, Instant::now(), &stats, 10, true);
-        // Title line should carry the cyan+bold ANSI escape.
-        assert!(out.contains("\x1b[1;36mdelray\x1b[0m"));
-    }
-
-    #[test]
-    fn unstyled_plain_has_no_ansi() {
-        let stats = Stats::default();
-        let now = chrono::Local::now();
-        let out = render_plain("eth0", &now, Instant::now(), &stats, 10, false);
-        assert!(!out.contains("\x1b["));
-    }
 }

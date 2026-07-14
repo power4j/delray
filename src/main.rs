@@ -2,6 +2,7 @@ mod capture;
 mod proc_table;
 mod report;
 mod stats;
+mod tui;
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -35,16 +36,109 @@ fn main() -> ExitCode {
 
     let proc_table = proc_table::spawn(Duration::from_secs(cli.proc_refresh));
 
-    if let Some(path) = &cli.output {
-        eprintln!(
-            "Background mode: refreshing stats to {path} every {}s",
-            REFRESH_INTERVAL.as_secs()
-        );
+    let top_n = cli.top_n as usize;
+    let is_json = cli.format == "json";
+
+    match &cli.output {
+        Some(path) => {
+            // Background file mode: write snapshot each refresh tick.
+            eprintln!(
+                "Background mode: refreshing stats to {path} every {}s",
+                REFRESH_INTERVAL.as_secs()
+            );
+            background_loop(
+                &mut source,
+                &proc_table,
+                path,
+                &interface,
+                &started_wall,
+                started_at,
+                top_n,
+                is_json,
+            );
+        }
+        None => {
+            // Foreground mode.
+            if is_json {
+                // JSON streams to stdout as a data source (no TUI).
+                json_stdout_loop(
+                    &mut source,
+                    &proc_table,
+                    &interface,
+                    &started_wall,
+                    started_at,
+                    top_n,
+                );
+            } else {
+                // Plain foreground = interactive TUI.
+                if let Err(e) = tui::run(&interface, &mut source, &proc_table, top_n) {
+                    eprintln!("TUI error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
     }
 
+    ExitCode::SUCCESS
+}
+
+/// Background file loop: capture continuously, write snapshot every refresh interval.
+#[allow(clippy::too_many_arguments)]
+fn background_loop(
+    source: &mut CaptureSource,
+    proc_table: &proc_table::SharedProcTable,
+    path: &str,
+    interface: &str,
+    started_wall: &chrono::DateTime<chrono::Local>,
+    started_at: Instant,
+    top_n: usize,
+    is_json: bool,
+) {
     let mut stats = stats::Stats::default();
     let mut next_refresh = Instant::now() + REFRESH_INTERVAL;
+    loop {
+        drain(source, proc_table, &mut stats);
+        if Instant::now() >= next_refresh {
+            let res = if is_json {
+                report::render_file_json(path, interface, started_wall, started_at, &stats, top_n)
+            } else {
+                report::render_file(path, interface, started_wall, started_at, &stats, top_n)
+            };
+            if let Err(e) = res {
+                eprintln!("Failed to write output file: {e}");
+            }
+            next_refresh = Instant::now() + REFRESH_INTERVAL;
+        }
+    }
+}
 
+/// JSON stdout loop: stream one compact JSON line per refresh interval.
+#[allow(clippy::too_many_arguments)]
+fn json_stdout_loop(
+    source: &mut CaptureSource,
+    proc_table: &proc_table::SharedProcTable,
+    interface: &str,
+    started_wall: &chrono::DateTime<chrono::Local>,
+    started_at: Instant,
+    top_n: usize,
+) {
+    let mut stats = stats::Stats::default();
+    let mut next_refresh = Instant::now() + REFRESH_INTERVAL;
+    loop {
+        drain(source, proc_table, &mut stats);
+        if Instant::now() >= next_refresh {
+            report::render_jsonl(interface, started_wall, started_at, &stats, top_n);
+            next_refresh = Instant::now() + REFRESH_INTERVAL;
+        }
+    }
+}
+
+/// Drain available packets from the capture source into stats.
+fn drain(
+    source: &mut CaptureSource,
+    proc_table: &proc_table::SharedProcTable,
+    stats: &mut stats::Stats,
+) {
     loop {
         match source.next() {
             Ok(Some(flow)) => {
@@ -60,54 +154,11 @@ fn main() -> ExitCode {
                     stats.add_proc(pid, name.as_deref(), flow.direction, flow.bytes);
                 }
             }
-            Ok(None) => {}
-            Err(e) => eprintln!("Capture error: {e}"),
-        }
-
-        if Instant::now() >= next_refresh {
-            let top_n = cli.top_n as usize;
-            let is_json = cli.format == "json";
-
-            match &cli.output {
-                Some(path) => {
-                    let res = if is_json {
-                        report::render_file_json(
-                            path,
-                            &interface,
-                            &started_wall,
-                            started_at,
-                            &stats,
-                            top_n,
-                        )
-                    } else {
-                        report::render_file(
-                            path,
-                            &interface,
-                            &started_wall,
-                            started_at,
-                            &stats,
-                            top_n,
-                        )
-                    };
-                    if let Err(e) = res {
-                        eprintln!("Failed to write output file: {e}");
-                    }
-                }
-                None => {
-                    if is_json {
-                        report::render_jsonl(&interface, &started_wall, started_at, &stats, top_n);
-                    } else {
-                        report::render_terminal(
-                            &interface,
-                            &started_wall,
-                            started_at,
-                            &stats,
-                            top_n,
-                        );
-                    }
-                }
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("Capture error: {e}");
+                break;
             }
-            next_refresh = Instant::now() + REFRESH_INTERVAL;
         }
     }
 }
