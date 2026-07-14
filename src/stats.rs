@@ -7,27 +7,27 @@ pub enum Direction {
     Outbound,
 }
 
-/// 自启动以来的累计流量统计。
+/// Proc traffic with recv/sent breakdown.
+#[derive(Default, Clone, Copy)]
+pub struct ProcTraffic {
+    /// Recv (inbound) bytes.
+    pub recv: u64,
+    /// Sent (outbound) bytes.
+    pub sent: u64,
+}
+
+/// Cumulative stats since start.
 #[derive(Default)]
 pub struct Stats {
-    /// 入站总字节数。
+    /// Total inbound bytes.
     pub in_bytes: u64,
-    /// 出站总字节数。
+    /// Total outbound bytes.
     pub out_bytes: u64,
     in_by_ip: HashMap<IpAddr, u64>,
     out_by_ip: HashMap<IpAddr, u64>,
     by_proc: HashMap<u32, ProcTraffic>,
-    /// pid -> 进程展示名缓存，避免进程退出后名字丢失为 "?"。
+    /// pid → display name cache, so exited processes don't show as "?".
     pid_names: HashMap<u32, String>,
-}
-
-/// 单个进程的收发流量。
-#[derive(Default, Clone, Copy)]
-pub struct ProcTraffic {
-    /// 接收（入站）字节数。
-    pub recv: u64,
-    /// 发送（出站）字节数。
-    pub sent: u64,
 }
 
 impl Stats {

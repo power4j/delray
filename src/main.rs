@@ -65,27 +65,46 @@ fn main() -> ExitCode {
         }
 
         if Instant::now() >= next_refresh {
+            let top_n = cli.top_n as usize;
+            let is_json = cli.format == "json";
+
             match &cli.output {
                 Some(path) => {
-                    if let Err(e) = report::render_file(
-                        path,
-                        &interface,
-                        &started_wall,
-                        started_at,
-                        &stats,
-                        cli.top_n as usize,
-                    ) {
+                    let res = if is_json {
+                        report::render_file_json(
+                            path,
+                            &interface,
+                            &started_wall,
+                            started_at,
+                            &stats,
+                            top_n,
+                        )
+                    } else {
+                        report::render_file(
+                            path,
+                            &interface,
+                            &started_wall,
+                            started_at,
+                            &stats,
+                            top_n,
+                        )
+                    };
+                    if let Err(e) = res {
                         eprintln!("Failed to write output file: {e}");
                     }
                 }
                 None => {
-                    report::render_terminal(
-                        &interface,
-                        &started_wall,
-                        started_at,
-                        &stats,
-                        cli.top_n as usize,
-                    );
+                    if is_json {
+                        report::render_jsonl(&interface, &started_wall, started_at, &stats, top_n);
+                    } else {
+                        report::render_terminal(
+                            &interface,
+                            &started_wall,
+                            started_at,
+                            &stats,
+                            top_n,
+                        );
+                    }
                 }
             }
             next_refresh = Instant::now() + REFRESH_INTERVAL;
