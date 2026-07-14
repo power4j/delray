@@ -23,7 +23,3 @@ cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.28
 - 安装 libpcap 开发包：Debian / Ubuntu 安装 `libpcap-dev`，RHEL 系安装 `libpcap-devel`
 
 产物位于 `target/x86_64-unknown-linux-gnu.2.28/release/delray`，拷贝到目标机即可运行。
-
-## 相关文档
-
-- [产品定义 v2](docs/public/idea-v2.md) — 产品定位、v1 功能范围、约束与技术方案
