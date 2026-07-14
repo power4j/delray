@@ -165,11 +165,7 @@ fn drain(
 
 /// CLI arguments.
 #[derive(Parser)]
-#[command(
-    name = "delray",
-    version,
-    about = "Network traffic analyzer"
-)]
+#[command(name = "delray", version, about = "Network traffic analyzer")]
 struct Cli {
     /// Network interface to capture on (omit to list available interfaces)
     interface: Option<String>,
