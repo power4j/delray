@@ -1,4 +1,5 @@
 mod capture;
+mod pipeline;
 mod proc_table;
 mod report;
 mod stats;
@@ -71,7 +72,15 @@ fn main() -> ExitCode {
                 );
             } else {
                 // Plain foreground = interactive TUI.
-                if let Err(e) = tui::run(&interface, &mut source, &proc_table, top_n) {
+                let pipeline =
+                    match pipeline::TrafficPipeline::spawn(source, proc_table.clone(), top_n) {
+                        Ok(pipeline) => pipeline,
+                        Err(e) => {
+                            eprintln!("Failed to start traffic pipeline: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                if let Err(e) = tui::run(&interface, &pipeline) {
                     eprintln!("TUI error: {e}");
                     return ExitCode::FAILURE;
                 }
@@ -151,7 +160,7 @@ fn drain(
                     && let Some(pid) = table.lookup(ip, port)
                 {
                     let name = table.names.get(&pid).cloned();
-                    stats.add_proc(pid, name.as_deref(), flow.direction, flow.bytes);
+                    stats.add_proc(pid, name, flow.direction, flow.bytes);
                 }
             }
             Ok(None) => break,

@@ -1,10 +1,10 @@
 //! Terminal UI: tabbed pages with scrollable tables.
 //!
-//! Architecture: the capture loop runs in the main thread, feeding a shared `Stats`.
-//! The TUI polls keyboard events and redraws on a 5s refresh tick, keeping scroll
-//! state across frames.
+//! The TUI owns only interaction state and the latest immutable traffic snapshot.
+//! Capture and aggregation run in the traffic pipeline.
 
-use std::io::{self, Stdout};
+use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -14,18 +14,16 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction as LayoutDir, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction as LayoutDir, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
-use crate::capture::CaptureSource;
-use crate::proc_table::SharedProcTable;
+use crate::pipeline::TrafficPipeline;
 use crate::report::{fmt_elapsed, hostname, human_bytes, truncate};
-use crate::stats::{Direction, Stats};
+use crate::stats::{IpSnapshot, TrafficSnapshot};
 
-const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-const DRAIN_MAX_PER_TICK: usize = 256;
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Which page is active.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -56,6 +54,49 @@ enum IpFocus {
     Outbound,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyOutcome {
+    Quit,
+    Changed,
+    Ignored,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutMode {
+    Compact,
+    Standard,
+    Wide,
+}
+
+impl LayoutMode {
+    fn from_area(area: Rect) -> Self {
+        match area.width {
+            120.. => Self::Wide,
+            80.. => Self::Standard,
+            _ => Self::Compact,
+        }
+    }
+}
+
+const MIN_TERMINAL_WIDTH: u16 = 60;
+const MIN_TERMINAL_HEIGHT: u16 = 16;
+
+const COLOR_BG: Color = Color::Rgb(9, 13, 20);
+const COLOR_TEXT: Color = Color::Rgb(216, 224, 232);
+const COLOR_STRONG: Color = Color::Rgb(244, 247, 250);
+const COLOR_MUTED: Color = Color::Rgb(116, 129, 145);
+const COLOR_BORDER: Color = Color::Rgb(37, 53, 68);
+const COLOR_ACCENT: Color = Color::Rgb(255, 183, 3);
+const COLOR_ACCENT_DIM: Color = Color::Rgb(154, 111, 8);
+const COLOR_INBOUND: Color = Color::Rgb(255, 191, 36);
+const COLOR_OUTBOUND: Color = Color::Rgb(41, 197, 246);
+const COLOR_VIOLET: Color = Color::Rgb(167, 139, 250);
+const COLOR_CORAL: Color = Color::Rgb(251, 113, 133);
+const COLOR_SELECTION: Color = Color::Rgb(23, 43, 60);
+const COLOR_INBOUND_BORDER: Color = Color::Rgb(102, 80, 30);
+const COLOR_OUTBOUND_BORDER: Color = Color::Rgb(29, 86, 108);
+const COLOR_VIOLET_BORDER: Color = Color::Rgb(76, 65, 111);
+
 /// Persistent UI state across refreshes.
 struct AppState {
     page: Page,
@@ -84,14 +125,14 @@ impl AppState {
     }
 }
 
-/// Run the TUI until the user quits. Owns the capture loop + event loop.
-pub fn run(
-    interface: &str,
-    source: &mut CaptureSource,
-    proc_table: &SharedProcTable,
-    top_n: usize,
-) -> io::Result<()> {
+/// Run the TUI until the user quits.
+pub fn run(interface: &str, pipeline: &TrafficPipeline) -> io::Result<()> {
     let started_at = Instant::now();
+    let host = hostname();
+    let mut snapshot = pipeline
+        .try_latest()
+        .map_err(io::Error::other)?
+        .unwrap_or_else(|| Arc::new(TrafficSnapshot::default()));
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -100,22 +141,17 @@ pub fn run(
     let mut terminal = Terminal::new(backend)?;
 
     let mut state = AppState::new();
-    let mut stats = Stats::default();
-    let mut next_refresh = Instant::now();
-
     let result = tui_loop(
         &mut terminal,
         &mut state,
-        &mut stats,
+        &mut snapshot,
         interface,
+        &host,
         started_at,
-        source,
-        proc_table,
-        top_n,
-        &mut next_refresh,
+        pipeline,
     );
 
-    // Restore terminal regardless of how we exited.
+    // Restore terminal regardless of how the event loop exited.
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -123,89 +159,90 @@ pub fn run(
     result
 }
 
-#[allow(clippy::too_many_arguments)]
 fn tui_loop(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut AppState,
-    stats: &mut Stats,
+    snapshot: &mut Arc<TrafficSnapshot>,
     interface: &str,
+    host: &str,
     started_at: Instant,
-    source: &mut CaptureSource,
-    proc_table: &SharedProcTable,
-    top_n: usize,
-    next_refresh: &mut Instant,
+    pipeline: &TrafficPipeline,
 ) -> io::Result<()> {
+    terminal.draw(|f| draw(f, state, snapshot, interface, host, started_at))?;
+
     loop {
-        // Drain at most N packets per tick so the event loop stays responsive.
-        drain_capture(source, proc_table, stats, DRAIN_MAX_PER_TICK);
-
-        // Redraw.
-        terminal.draw(|f| draw(f, state, stats, interface, started_at, top_n))?;
-
-        // Wait for either a key event or the refresh tick.
-        while Instant::now() < *next_refresh {
-            if event::poll(Duration::from_millis(50))?
-                && let Event::Key(key) = event::read()?
-            {
-                if handle_key(state, key, stats, top_n) {
-                    return Ok(());
-                }
-                // Any key: redraw immediately so the user sees the change.
-                drain_capture(source, proc_table, stats, DRAIN_MAX_PER_TICK);
-                terminal.draw(|f| draw(f, state, stats, interface, started_at, top_n))?;
+        let key = if event::poll(EVENT_POLL_INTERVAL)? {
+            match event::read()? {
+                Event::Key(key) => Some(key),
+                _ => None,
             }
-        }
-        *next_refresh = Instant::now() + REFRESH_INTERVAL;
-    }
-}
+        } else {
+            None
+        };
 
-fn drain_capture(
-    source: &mut CaptureSource,
-    proc_table: &SharedProcTable,
-    stats: &mut Stats,
-    max: usize,
-) {
-    for _ in 0..max {
-        match source.next() {
-            Ok(Some(flow)) => {
-                match flow.direction {
-                    Direction::Inbound => stats.add_in(flow.peer, flow.bytes),
-                    Direction::Outbound => stats.add_out(flow.peer, flow.bytes),
-                }
-                if let Some((ip, port)) = flow.local_socket
-                    && let Ok(table) = proc_table.read()
-                    && let Some(pid) = table.lookup(ip, port)
-                {
-                    let name = table.names.get(&pid).cloned();
-                    stats.add_proc(pid, name.as_deref(), flow.direction, flow.bytes);
-                }
-            }
-            Ok(None) => break,
-            Err(_) => break,
+        let quit = process_iteration(
+            state,
+            snapshot,
+            key,
+            |state, snapshot| {
+                terminal
+                    .draw(|f| draw(f, state, snapshot, interface, host, started_at))
+                    .map(|_| ())
+            },
+            || pipeline.try_latest().map_err(io::Error::other),
+        )?;
+        if quit {
+            return Ok(());
         }
     }
 }
 
-/// Handle a key. Returns true if the app should quit.
-fn handle_key(state: &mut AppState, key: KeyEvent, stats: &Stats, top_n: usize) -> bool {
+fn process_iteration<D, L, E>(
+    state: &mut AppState,
+    snapshot: &mut Arc<TrafficSnapshot>,
+    key: Option<KeyEvent>,
+    mut draw: D,
+    mut try_latest: L,
+) -> Result<bool, E>
+where
+    D: FnMut(&mut AppState, &TrafficSnapshot) -> Result<(), E>,
+    L: FnMut() -> Result<Option<Arc<TrafficSnapshot>>, E>,
+{
+    if let Some(key) = key {
+        match handle_key(state, key, snapshot) {
+            KeyOutcome::Quit => return Ok(true),
+            KeyOutcome::Changed => draw(state, snapshot)?,
+            KeyOutcome::Ignored => {}
+        }
+    }
+
+    if let Some(latest) = try_latest()? {
+        *snapshot = latest;
+        draw(state, snapshot)?;
+    }
+
+    Ok(false)
+}
+
+fn handle_key(state: &mut AppState, key: KeyEvent, snapshot: &TrafficSnapshot) -> KeyOutcome {
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => true,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
+        KeyCode::Char('q') | KeyCode::Esc => KeyOutcome::Quit,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyOutcome::Quit,
         KeyCode::Char('1') => {
             state.page = Page::Overview;
-            false
+            KeyOutcome::Changed
         }
         KeyCode::Char('2') => {
             state.page = Page::Processes;
-            false
+            KeyOutcome::Changed
         }
         KeyCode::Char('3') => {
             state.page = Page::Ips;
-            false
+            KeyOutcome::Changed
         }
         KeyCode::Char('4') => {
             state.page = Page::About;
-            false
+            KeyOutcome::Changed
         }
         KeyCode::Tab => {
             if state.page == Page::Ips {
@@ -213,42 +250,44 @@ fn handle_key(state: &mut AppState, key: KeyEvent, stats: &Stats, top_n: usize) 
                     IpFocus::Inbound => IpFocus::Outbound,
                     IpFocus::Outbound => IpFocus::Inbound,
                 };
+                KeyOutcome::Changed
+            } else {
+                KeyOutcome::Ignored
             }
-            false
         }
         KeyCode::Left | KeyCode::Char('h') => {
             state.page = prev_page(state.page);
-            false
+            KeyOutcome::Changed
         }
         KeyCode::Right | KeyCode::Char('l') => {
             state.page = next_page(state.page);
-            false
+            KeyOutcome::Changed
         }
         KeyCode::Down | KeyCode::Char('j') => {
             scroll(state, 1);
-            false
+            KeyOutcome::Changed
         }
         KeyCode::Up | KeyCode::Char('k') => {
             scroll(state, -1);
-            false
+            KeyOutcome::Changed
         }
         KeyCode::PageDown => {
             scroll(state, state.current_view_height() as isize);
-            false
+            KeyOutcome::Changed
         }
         KeyCode::PageUp => {
             scroll(state, -(state.current_view_height() as isize));
-            false
+            KeyOutcome::Changed
         }
         KeyCode::Home => {
             scroll_to_top(state);
-            false
+            KeyOutcome::Changed
         }
         KeyCode::End => {
-            scroll_to_bottom(state, stats, top_n);
-            false
+            scroll_to_bottom(state, snapshot);
+            KeyOutcome::Changed
         }
-        _ => false,
+        _ => KeyOutcome::Ignored,
     }
 }
 
@@ -303,19 +342,19 @@ fn scroll_to_top(state: &mut AppState) {
     }
 }
 
-fn scroll_to_bottom(state: &mut AppState, stats: &Stats, top_n: usize) {
+fn scroll_to_bottom(state: &mut AppState, snapshot: &TrafficSnapshot) {
     match state.page {
         Page::Processes => {
-            let len = stats.top_procs(top_n).len();
+            let len = snapshot.processes.len();
             state.proc_scroll = len.saturating_sub(state.proc_view_height);
         }
         Page::Ips => match state.ip_focus {
             IpFocus::Inbound => {
-                let len = stats.top_in(top_n).len();
+                let len = snapshot.inbound_ips.len();
                 state.ip_in_scroll = len.saturating_sub(state.ip_in_view_height);
             }
             IpFocus::Outbound => {
-                let len = stats.top_out(top_n).len();
+                let len = snapshot.outbound_ips.len();
                 state.ip_out_scroll = len.saturating_sub(state.ip_out_view_height);
             }
         },
@@ -329,328 +368,737 @@ fn scroll_to_bottom(state: &mut AppState, stats: &Stats, top_n: usize) {
 fn draw(
     f: &mut ratatui::Frame,
     state: &mut AppState,
-    stats: &Stats,
+    snapshot: &TrafficSnapshot,
     interface: &str,
+    host: &str,
     started_at: Instant,
-    top_n: usize,
 ) {
+    let area = f.area();
+    f.render_widget(
+        Block::default().style(Style::default().fg(COLOR_TEXT).bg(COLOR_BG)),
+        area,
+    );
+
+    if area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT {
+        draw_too_small(f, area);
+        return;
+    }
+
+    let mode = LayoutMode::from_area(area);
     let chunks = Layout::default()
         .direction(LayoutDir::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
-        .split(f.area());
-
-    draw_title_bar(f, chunks[0], stats, interface, started_at);
-    match state.page {
-        Page::Overview => draw_overview(f, chunks[1], stats, top_n),
-        Page::Processes => draw_processes(f, chunks[1], state, stats, top_n),
-        Page::Ips => draw_ips(f, chunks[1], state, stats, top_n),
-        Page::About => draw_about(f, chunks[1]),
-    }
-    draw_status_bar(f, chunks[2], state.page);
-}
-
-fn draw_title_bar(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    stats: &Stats,
-    interface: &str,
-    started_at: Instant,
-) {
-    let host = hostname();
-    let now = chrono::Local::now();
-    let title = format!(
-        " delray | {} | host: {} | uptime: {} | In: {} Out: {} | {} ",
-        interface,
-        host,
-        fmt_elapsed(started_at.elapsed()),
-        human_bytes(stats.in_bytes),
-        human_bytes(stats.out_bytes),
-        now.format("%Y-%m-%d %H:%M:%S")
-    );
-    let para = Paragraph::new(title).style(
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    );
-    f.render_widget(para, area);
-}
-
-fn draw_overview(f: &mut ratatui::Frame, area: Rect, stats: &Stats, top_n: usize) {
-    let chunks = Layout::default()
-        .direction(LayoutDir::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(0)])
         .split(area);
 
-    // In/Out bars
-    let total = stats.in_bytes + stats.out_bytes;
-    let in_ratio = if total > 0 {
-        stats.in_bytes as f64 / total as f64
-    } else {
-        0.0
-    };
-    let out_ratio = if total > 0 {
-        stats.out_bytes as f64 / total as f64
-    } else {
-        0.0
-    };
-    let bars = vec![
-        Line::from(format!(
-            "  Inbound  {}  ({:.1}%)",
-            bar(in_ratio, 30),
-            in_ratio * 100.0
+    draw_header(f, chunks[0], state.page, interface, host, started_at, mode);
+    let body = chunks[1].inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    match state.page {
+        Page::Overview => draw_overview(f, body, snapshot, mode),
+        Page::Processes => draw_processes(f, body, state, snapshot, mode),
+        Page::Ips => draw_ips(f, body, state, snapshot, mode),
+        Page::About => draw_about(f, body),
+    }
+    draw_status_bar(f, chunks[2], state.page, mode);
+}
+
+fn draw_too_small(f: &mut ratatui::Frame, area: Rect) {
+    let message_area = Layout::default()
+        .direction(LayoutDir::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(3),
+            Constraint::Fill(1),
+        ])
+        .split(area)[1];
+    let lines = vec![
+        Line::from(Span::styled(
+            "delray",
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
         )),
-        Line::from(format!(
-            " Outbound  {}  ({:.1}%)",
-            bar(out_ratio, 30),
-            out_ratio * 100.0
-        )),
-        Line::from(format!(
-            "   In: {}   Out: {}",
-            human_bytes(stats.in_bytes),
-            human_bytes(stats.out_bytes)
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("Terminal too small (minimum {MIN_TERMINAL_WIDTH}x{MIN_TERMINAL_HEIGHT})"),
+            Style::default().fg(COLOR_MUTED),
         )),
     ];
-    f.render_widget(Paragraph::new(bars), chunks[0]);
+    f.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        message_area,
+    );
+}
 
-    // Three preview columns
-    let cols = Layout::default()
+fn draw_header(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    page: Page,
+    interface: &str,
+    host: &str,
+    started_at: Instant,
+    mode: LayoutMode,
+) {
+    let navigation = navigation_line(page, mode);
+    if page == Page::About {
+        f.render_widget(Paragraph::new(navigation), area);
+        return;
+    }
+
+    let runtime = runtime_line(interface, host, started_at, mode);
+    let runtime_width = (runtime.width() as u16).min(area.width / 2);
+    let chunks = Layout::default()
         .direction(LayoutDir::Horizontal)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
-        .split(chunks[1]);
-
-    let procs = stats.top_procs(top_n);
-    let proc_items: Vec<ListItem> = procs
-        .iter()
-        .take(5)
-        .map(|(pid, t)| {
-            let name = stats.proc_name(*pid).unwrap_or("?");
-            ListItem::new(format!(
-                "{}  {}",
-                truncate(name, 18),
-                human_bytes(t.recv + t.sent)
-            ))
-        })
-        .collect();
-    let proc_block = preview_block("Top Processes", procs.len(), 5, 2);
-    f.render_widget(List::new(proc_items).block(proc_block), cols[0]);
-
-    let in_ips = stats.top_in(top_n);
-    let in_items: Vec<ListItem> = in_ips
-        .iter()
-        .take(5)
-        .map(|(ip, bytes)| ListItem::new(format!("{ip}  {}", human_bytes(*bytes))))
-        .collect();
-    let in_block = preview_block("Top Inbound IPs", in_ips.len(), 5, 3);
-    f.render_widget(List::new(in_items).block(in_block), cols[1]);
-
-    let out_ips = stats.top_out(top_n);
-    let out_items: Vec<ListItem> = out_ips
-        .iter()
-        .take(5)
-        .map(|(ip, bytes)| ListItem::new(format!("{ip}  {}", human_bytes(*bytes))))
-        .collect();
-    let out_block = preview_block("Top Outbound IPs", out_ips.len(), 5, 3);
-    f.render_widget(List::new(out_items).block(out_block), cols[2]);
+        .constraints([Constraint::Min(0), Constraint::Length(runtime_width)])
+        .split(area);
+    f.render_widget(Paragraph::new(navigation), chunks[0]);
+    f.render_widget(
+        Paragraph::new(runtime).alignment(Alignment::Right),
+        chunks[1],
+    );
 }
 
-fn preview_block(title: &str, total: usize, shown: usize, goto: usize) -> Block<'_> {
-    let footer = if total > shown {
-        format!("+{} more (press {})", total - shown, goto)
+fn navigation_line(page: Page, mode: LayoutMode) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        " delray ",
+        Style::default()
+            .fg(COLOR_ACCENT)
+            .add_modifier(Modifier::BOLD),
+    )];
+    for candidate in Page::ALL {
+        let label = match (candidate, mode) {
+            (Page::Overview, LayoutMode::Compact) => " 1 ".to_string(),
+            (Page::Processes, LayoutMode::Compact) => " 2 ".to_string(),
+            (Page::Ips, LayoutMode::Compact) => " 3 ".to_string(),
+            (Page::About, LayoutMode::Compact) => " 4 ".to_string(),
+            (Page::Overview, _) => " 1 Overview ".to_string(),
+            (Page::Processes, _) => " 2 Processes ".to_string(),
+            (Page::Ips, _) => " 3 IPs ".to_string(),
+            (Page::About, _) => " 4 About ".to_string(),
+        };
+        let style = if candidate == page {
+            Style::default()
+                .fg(COLOR_STRONG)
+                .bg(Color::Rgb(43, 37, 15))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLOR_MUTED)
+        };
+        spans.push(Span::styled(label, style));
+    }
+    Line::from(spans)
+}
+
+fn runtime_line(
+    interface: &str,
+    host: &str,
+    started_at: Instant,
+    mode: LayoutMode,
+) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(" ", Style::default()),
+        Span::styled(interface.to_string(), Style::default().fg(COLOR_STRONG)),
+    ];
+    if mode == LayoutMode::Wide {
+        spans.push(Span::styled("  ", Style::default()));
+        spans.push(Span::styled(
+            host.to_string(),
+            Style::default().fg(COLOR_STRONG),
+        ));
+    }
+    spans.push(Span::styled("  up ", Style::default().fg(COLOR_MUTED)));
+    spans.push(Span::styled(
+        fmt_elapsed(started_at.elapsed()),
+        Style::default().fg(COLOR_STRONG),
+    ));
+    if mode != LayoutMode::Compact {
+        spans.push(Span::styled(
+            format!("  {}", chrono::Local::now().format("%H:%M:%S")),
+            Style::default().fg(COLOR_MUTED),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn draw_overview(f: &mut ratatui::Frame, area: Rect, snapshot: &TrafficSnapshot, mode: LayoutMode) {
+    match mode {
+        LayoutMode::Wide => {
+            let columns = Layout::default()
+                .direction(LayoutDir::Horizontal)
+                .constraints([
+                    Constraint::Percentage(42),
+                    Constraint::Length(1),
+                    Constraint::Percentage(58),
+                ])
+                .split(area);
+            let left = Layout::default()
+                .direction(LayoutDir::Vertical)
+                .constraints([
+                    Constraint::Length(6),
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                ])
+                .split(columns[0]);
+            draw_traffic(f, left[0], snapshot);
+            draw_ip_preview(f, left[2], snapshot, true);
+            draw_ip_preview(f, left[4], snapshot, false);
+            draw_process_preview(f, columns[2], snapshot, mode);
+        }
+        LayoutMode::Standard => {
+            let rows = Layout::default()
+                .direction(LayoutDir::Vertical)
+                .constraints([
+                    Constraint::Length(6),
+                    Constraint::Length(1),
+                    Constraint::Fill(2),
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                ])
+                .split(area);
+            let ips = Layout::default()
+                .direction(LayoutDir::Horizontal)
+                .constraints([
+                    Constraint::Percentage(50),
+                    Constraint::Length(1),
+                    Constraint::Percentage(50),
+                ])
+                .split(rows[4]);
+            draw_traffic(f, rows[0], snapshot);
+            draw_process_preview(f, rows[2], snapshot, mode);
+            draw_ip_preview(f, ips[0], snapshot, true);
+            draw_ip_preview(f, ips[2], snapshot, false);
+        }
+        LayoutMode::Compact => {
+            let rows = Layout::default()
+                .direction(LayoutDir::Vertical)
+                .constraints([
+                    Constraint::Length(6),
+                    Constraint::Length(1),
+                    Constraint::Fill(2),
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                ])
+                .split(area);
+            draw_traffic(f, rows[0], snapshot);
+            draw_process_preview(f, rows[2], snapshot, mode);
+            draw_ip_preview(f, rows[4], snapshot, true);
+        }
+    }
+}
+
+fn draw_traffic(f: &mut ratatui::Frame, area: Rect, snapshot: &TrafficSnapshot) {
+    let block = panel_block(
+        "net",
+        "Traffic",
+        None,
+        COLOR_VIOLET,
+        COLOR_VIOLET_BORDER,
+        None,
+    );
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let total = snapshot.in_bytes.saturating_add(snapshot.out_bytes);
+    let inbound_ratio = ratio(snapshot.in_bytes, total);
+    let outbound_ratio = ratio(snapshot.out_bytes, total);
+    let lines = vec![
+        traffic_line(
+            "IN total",
+            COLOR_INBOUND,
+            inbound_ratio,
+            &human_bytes(snapshot.in_bytes),
+            inner.width,
+        ),
+        traffic_line(
+            "OUT total",
+            COLOR_OUTBOUND,
+            outbound_ratio,
+            &human_bytes(snapshot.out_bytes),
+            inner.width,
+        ),
+        traffic_line(
+            "Combined",
+            COLOR_ACCENT_DIM,
+            if total > 0 { 1.0 } else { 0.0 },
+            &human_bytes(total),
+            inner.width,
+        ),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn ratio(value: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
     } else {
-        String::new()
-    };
-    Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {title} "))
-        .title_bottom(Line::from(format!(" {footer} ")).alignment(Alignment::Center))
+        value as f64 / total as f64
+    }
 }
 
-fn bar(ratio: f64, width: usize) -> String {
-    let filled = ((ratio * width as f64).round() as usize).min(width);
-    let empty = width - filled;
-    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+fn traffic_line(label: &str, color: Color, ratio: f64, value: &str, width: u16) -> Line<'static> {
+    const LABEL_WIDTH: usize = 10;
+    let value_width = value.chars().count();
+    let bar_width = (width as usize).saturating_sub(LABEL_WIDTH + value_width + 2);
+    let filled = ((bar_width as f64 * ratio).round() as usize).min(bar_width);
+    Line::from(vec![
+        Span::styled(format!("{label:<LABEL_WIDTH$}"), Style::default().fg(color)),
+        Span::styled("█".repeat(filled), Style::default().fg(color)),
+        Span::styled(
+            "─".repeat(bar_width.saturating_sub(filled)),
+            Style::default().fg(COLOR_BORDER),
+        ),
+        Span::styled(format!("  {value}"), Style::default().fg(COLOR_STRONG)),
+    ])
+}
+
+fn panel_block(
+    prefix: &str,
+    title: &str,
+    count: Option<usize>,
+    prefix_color: Color,
+    border_color: Color,
+    footer: Option<String>,
+) -> Block<'static> {
+    let mut title_spans = vec![
+        Span::styled(
+            format!(" {prefix} "),
+            Style::default()
+                .fg(prefix_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(COLOR_STRONG)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(count) = count {
+        title_spans.push(Span::styled(
+            format!(" {count} "),
+            Style::default().fg(COLOR_MUTED),
+        ));
+    } else {
+        title_spans.push(Span::raw(" "));
+    }
+
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(Line::from(title_spans));
+    if let Some(footer) = footer {
+        block = block.title_bottom(
+            Line::from(Span::styled(
+                format!(" {footer} "),
+                Style::default().fg(COLOR_MUTED),
+            ))
+            .alignment(Alignment::Right),
+        );
+    }
+    block
 }
 
 fn draw_processes(
     f: &mut ratatui::Frame,
     area: Rect,
     state: &mut AppState,
-    stats: &Stats,
-    top_n: usize,
+    snapshot: &TrafficSnapshot,
+    mode: LayoutMode,
 ) {
-    let procs = stats.top_procs(top_n);
-    let rows: Vec<Row> = procs
-        .iter()
-        .map(|(pid, t)| {
-            let name = stats.proc_name(*pid).unwrap_or("?");
-            Row::new(vec![
-                truncate(name, 40).to_string(),
-                pid.to_string(),
-                human_bytes(t.recv),
-                human_bytes(t.sent),
-                human_bytes(t.recv + t.sent),
-            ])
-        })
-        .collect();
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Min(20),
-            Constraint::Length(10),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(12),
-        ],
-    )
-    .header(
-        Row::new(vec!["Process", "PID", "Recv", "Sent", "Total"]).style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-    )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" Processes ({}) ", procs.len())),
-    );
-
-    let view_h = area.height.saturating_sub(4) as usize; // borders + header + padding
+    let view_h = area.height.saturating_sub(3) as usize;
     state.proc_view_height = view_h.max(1);
-    state.proc_scroll = state.proc_scroll.min(procs.len().saturating_sub(1));
+    state.proc_scroll = state
+        .proc_scroll
+        .min(snapshot.processes.len().saturating_sub(1));
 
+    let footer = selected_position(state.proc_scroll, snapshot.processes.len());
+    let block = panel_block(
+        "proc",
+        "Processes",
+        Some(snapshot.processes.len()),
+        COLOR_CORAL,
+        COLOR_CORAL,
+        Some(footer),
+    );
+    let table = process_table(snapshot, mode, block)
+        .row_highlight_style(
+            Style::default()
+                .fg(COLOR_STRONG)
+                .bg(COLOR_SELECTION)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
     f.render_stateful_widget(
         table,
         area,
-        &mut ratatui_state(procs.len(), state.proc_scroll),
+        &mut ratatui_state(snapshot.processes.len(), state.proc_scroll),
     );
 }
 
-fn draw_ips(f: &mut ratatui::Frame, area: Rect, state: &mut AppState, stats: &Stats, top_n: usize) {
-    let cols = Layout::default()
-        .direction(LayoutDir::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-
-    let in_ips = stats.top_in(top_n);
-    let out_ips = stats.top_out(top_n);
-
-    let in_block_style = if state.ip_focus == IpFocus::Inbound {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default()
-    };
-    let out_block_style = if state.ip_focus == IpFocus::Outbound {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default()
-    };
-
-    let in_rows: Vec<Row> = in_ips
-        .iter()
-        .map(|(ip, bytes)| Row::new(vec![ip.to_string(), human_bytes(*bytes)]))
-        .collect();
-    let in_table = Table::new(in_rows, [Constraint::Min(20), Constraint::Length(14)])
-        .header(
-            Row::new(vec!["IP", "Bytes"]).style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+fn draw_process_preview(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    snapshot: &TrafficSnapshot,
+    mode: LayoutMode,
+) {
+    let footer = preview_position(snapshot.processes.len(), area.height);
+    let block = panel_block(
+        "proc",
+        "Top Processes",
+        Some(snapshot.processes.len()),
+        COLOR_CORAL,
+        COLOR_CORAL,
+        Some(footer),
+    );
+    let table = process_table(snapshot, mode, block)
+        .row_highlight_style(
+            Style::default()
+                .fg(COLOR_STRONG)
+                .bg(COLOR_SELECTION)
+                .add_modifier(Modifier::BOLD),
         )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Inbound IPs ({}) ", in_ips.len()))
-                .border_style(in_block_style),
-        );
+        .highlight_symbol("> ");
+    f.render_stateful_widget(table, area, &mut ratatui_state(snapshot.processes.len(), 0));
+}
 
-    let out_rows: Vec<Row> = out_ips
-        .iter()
-        .map(|(ip, bytes)| Row::new(vec![ip.to_string(), human_bytes(*bytes)]))
-        .collect();
-    let out_table = Table::new(out_rows, [Constraint::Min(20), Constraint::Length(14)])
-        .header(
-            Row::new(vec!["IP", "Bytes"]).style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+fn process_table(
+    snapshot: &TrafficSnapshot,
+    mode: LayoutMode,
+    block: Block<'static>,
+) -> Table<'static> {
+    let compact = mode == LayoutMode::Compact;
+    let rows = process_rows(snapshot, compact);
+    let header_style = Style::default().fg(COLOR_MUTED);
+    let table = if compact {
+        Table::new(
+            rows,
+            [
+                Constraint::Min(18),
+                Constraint::Length(12),
+                Constraint::Length(12),
+            ],
         )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Outbound IPs ({}) ", out_ips.len()))
-                .border_style(out_block_style),
-        );
+        .header(Row::new(vec!["Process", "Sent", "Total"]).style(header_style))
+    } else {
+        Table::new(
+            rows,
+            [
+                Constraint::Min(20),
+                Constraint::Length(10),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Length(12),
+            ],
+        )
+        .header(Row::new(vec!["Process", "PID", "Recv", "Sent", "Total"]).style(header_style))
+    };
+    table.column_spacing(1).block(block)
+}
 
-    let in_vh = cols[0].height.saturating_sub(4) as usize;
-    let out_vh = cols[1].height.saturating_sub(4) as usize;
+fn process_rows(snapshot: &TrafficSnapshot, compact: bool) -> Vec<Row<'static>> {
+    if snapshot.processes.is_empty() {
+        let cells = if compact {
+            vec![
+                Cell::from("No traffic observed"),
+                Cell::from(""),
+                Cell::from(""),
+            ]
+        } else {
+            vec![
+                Cell::from("No traffic observed"),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+            ]
+        };
+        return vec![Row::new(cells).style(Style::default().fg(COLOR_MUTED))];
+    }
+
+    snapshot
+        .processes
+        .iter()
+        .map(|process| {
+            let name = truncate(process.name.as_deref().unwrap_or("?"), 40).to_string();
+            let total = process.recv.saturating_add(process.sent);
+            if compact {
+                Row::new(vec![
+                    Cell::from(name),
+                    Cell::from(human_bytes(process.sent))
+                        .style(Style::default().fg(COLOR_OUTBOUND)),
+                    Cell::from(human_bytes(total)).style(Style::default().fg(COLOR_STRONG)),
+                ])
+            } else {
+                Row::new(vec![
+                    Cell::from(name),
+                    Cell::from(process.pid.to_string()),
+                    Cell::from(human_bytes(process.recv)).style(Style::default().fg(COLOR_INBOUND)),
+                    Cell::from(human_bytes(process.sent))
+                        .style(Style::default().fg(COLOR_OUTBOUND)),
+                    Cell::from(human_bytes(total)).style(Style::default().fg(COLOR_STRONG)),
+                ])
+            }
+        })
+        .collect()
+}
+
+fn selected_position(selected: usize, len: usize) -> String {
+    if len == 0 {
+        "0/0".to_string()
+    } else {
+        format!("{}/{}", selected.min(len - 1) + 1, len)
+    }
+}
+
+fn preview_position(len: usize, height: u16) -> String {
+    if len == 0 {
+        return "0/0".to_string();
+    }
+    let shown = len.min(height.saturating_sub(3) as usize);
+    format!("1-{shown}/{len}")
+}
+
+fn draw_ips(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    state: &mut AppState,
+    snapshot: &TrafficSnapshot,
+    mode: LayoutMode,
+) {
+    let panes = if mode == LayoutMode::Compact {
+        Layout::default()
+            .direction(LayoutDir::Vertical)
+            .constraints([
+                Constraint::Percentage(50),
+                Constraint::Length(1),
+                Constraint::Percentage(50),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(LayoutDir::Horizontal)
+            .constraints([
+                Constraint::Percentage(50),
+                Constraint::Length(1),
+                Constraint::Percentage(50),
+            ])
+            .split(area)
+    };
+
+    let inbound_area = panes[0];
+    let outbound_area = panes[2];
+    let in_vh = inbound_area.height.saturating_sub(3) as usize;
+    let out_vh = outbound_area.height.saturating_sub(3) as usize;
     state.ip_in_view_height = in_vh.max(1);
     state.ip_out_view_height = out_vh.max(1);
-    state.ip_in_scroll = state.ip_in_scroll.min(in_ips.len().saturating_sub(1));
-    state.ip_out_scroll = state.ip_out_scroll.min(out_ips.len().saturating_sub(1));
+    state.ip_in_scroll = state
+        .ip_in_scroll
+        .min(snapshot.inbound_ips.len().saturating_sub(1));
+    state.ip_out_scroll = state
+        .ip_out_scroll
+        .min(snapshot.outbound_ips.len().saturating_sub(1));
 
-    f.render_stateful_widget(
-        in_table,
-        cols[0],
-        &mut ratatui_state(in_ips.len(), state.ip_in_scroll),
+    draw_ip_table(
+        f,
+        inbound_area,
+        snapshot.inbound_ips.as_ref(),
+        true,
+        state.ip_focus == IpFocus::Inbound,
+        state.ip_in_scroll,
     );
-    f.render_stateful_widget(
-        out_table,
-        cols[1],
-        &mut ratatui_state(out_ips.len(), state.ip_out_scroll),
+    draw_ip_table(
+        f,
+        outbound_area,
+        snapshot.outbound_ips.as_ref(),
+        false,
+        state.ip_focus == IpFocus::Outbound,
+        state.ip_out_scroll,
     );
+}
+
+fn draw_ip_preview(f: &mut ratatui::Frame, area: Rect, snapshot: &TrafficSnapshot, inbound: bool) {
+    let entries = if inbound {
+        snapshot.inbound_ips.as_ref()
+    } else {
+        snapshot.outbound_ips.as_ref()
+    };
+    let (prefix, title, color, border) = ip_theme(inbound);
+    let block = panel_block(
+        prefix,
+        title,
+        Some(entries.len()),
+        color,
+        border,
+        Some(preview_position(entries.len(), area.height)),
+    );
+    let table = ip_table(entries, color, block);
+    f.render_widget(table, area);
+}
+
+fn draw_ip_table(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    entries: &[IpSnapshot],
+    inbound: bool,
+    focused: bool,
+    selected: usize,
+) {
+    let (prefix, title, color, border) = ip_theme(inbound);
+    let block = panel_block(
+        prefix,
+        title,
+        Some(entries.len()),
+        color,
+        if focused { COLOR_CORAL } else { border },
+        Some(selected_position(selected, entries.len())),
+    );
+    let table = ip_table(entries, color, block)
+        .row_highlight_style(if focused {
+            Style::default()
+                .fg(COLOR_STRONG)
+                .bg(COLOR_SELECTION)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        })
+        .highlight_symbol(if focused { "> " } else { "  " });
+    f.render_stateful_widget(table, area, &mut ratatui_state(entries.len(), selected));
+}
+
+fn ip_theme(inbound: bool) -> (&'static str, &'static str, Color, Color) {
+    if inbound {
+        ("in", "Inbound IPs", COLOR_INBOUND, COLOR_INBOUND_BORDER)
+    } else {
+        ("out", "Outbound IPs", COLOR_OUTBOUND, COLOR_OUTBOUND_BORDER)
+    }
+}
+
+fn ip_table(entries: &[IpSnapshot], color: Color, block: Block<'static>) -> Table<'static> {
+    let rows = if entries.is_empty() {
+        vec![Row::new(vec!["No traffic observed", ""]).style(Style::default().fg(COLOR_MUTED))]
+    } else {
+        entries
+            .iter()
+            .map(|entry| {
+                Row::new(vec![
+                    Cell::from(entry.ip.to_string()),
+                    Cell::from(human_bytes(entry.bytes)).style(Style::default().fg(color)),
+                ])
+            })
+            .collect()
+    };
+    Table::new(rows, [Constraint::Min(20), Constraint::Length(14)])
+        .header(Row::new(vec!["Remote address", "Bytes"]).style(Style::default().fg(COLOR_MUTED)))
+        .column_spacing(1)
+        .block(block)
 }
 
 fn draw_about(f: &mut ratatui::Frame, area: Rect) {
     let version = env!("CARGO_PKG_VERSION");
+    let frame_width = area.width.saturating_sub(4).min(62);
+    let horizontal = Layout::default()
+        .direction(LayoutDir::Horizontal)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(frame_width),
+            Constraint::Fill(1),
+        ])
+        .split(area)[1];
+    let frame_area = Layout::default()
+        .direction(LayoutDir::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(7),
+            Constraint::Fill(1),
+        ])
+        .split(horizontal)[1];
+    let frame = Block::default()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::default().fg(COLOR_BORDER));
+    let content_area = frame.inner(frame_area);
+    f.render_widget(frame, frame_area);
+
     let lines = vec![
-        Line::from(""),
-        Line::from(""),
         Line::from(Span::styled(
             "delray",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(COLOR_ACCENT)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("Network Traffic Analyzer"),
-        Line::from(""),
-        Line::from(format!("Version {version}")),
-        Line::from(""),
-        Line::from(""),
         Line::from(Span::styled(
-            "─────────────────────────────",
-            Style::default().fg(Color::DarkGray),
+            "Network Traffic Analyzer",
+            Style::default().fg(COLOR_STRONG),
         )),
         Line::from(""),
-        Line::from("capture · analyze · locate"),
-        Line::from("which process and IP consumes"),
-        Line::from("your server's bandwidth"),
+        Line::from(Span::styled(
+            format!("Version {version}"),
+            Style::default().fg(COLOR_MUTED),
+        )),
     ];
     let para = Paragraph::new(lines).alignment(Alignment::Center);
-    f.render_widget(para, area);
+    f.render_widget(para, content_area);
 }
 
-fn draw_status_bar(f: &mut ratatui::Frame, area: Rect, page: Page) {
-    let hint = match page {
-        Page::Overview => "1-4:page  ←→/hl:switch  q:quit",
-        Page::Processes => "1-4:page  ←→/hl:switch  ↑↓/jk:scroll  PgUp/Dn:page  Home/End  q:quit",
-        Page::Ips => "1-4:page  ←→/hl:switch  Tab:panel  ↑↓/jk:scroll  PgUp/Dn:page  q:quit",
-        Page::About => "1-4:page  ←→/hl:switch  q:quit",
-    };
-    let para = Paragraph::new(format!(" {hint} ")).style(Style::default().fg(Color::DarkGray));
-    f.render_widget(para, area);
+fn draw_status_bar(f: &mut ratatui::Frame, area: Rect, page: Page, mode: LayoutMode) {
+    let mut spans = Vec::new();
+    push_hint(&mut spans, "1-4", "page");
+    push_hint(&mut spans, "h/l", "switch");
+    if page == Page::Ips {
+        push_hint(&mut spans, "Tab", "panel");
+    }
+    if matches!(page, Page::Processes | Page::Ips) {
+        push_hint(&mut spans, "j/k", "scroll");
+        if mode != LayoutMode::Compact {
+            push_hint(&mut spans, "PgUp/PgDn", "page");
+            push_hint(&mut spans, "Home/End", "jump");
+        }
+    }
+
+    let chunks = Layout::default()
+        .direction(LayoutDir::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(8)])
+        .split(area);
+    f.render_widget(Paragraph::new(Line::from(spans)), chunks[0]);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "q",
+                Style::default()
+                    .fg(COLOR_CORAL)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" quit ", Style::default().fg(COLOR_MUTED)),
+        ]))
+        .alignment(Alignment::Right),
+        chunks[1],
+    );
+}
+
+fn push_hint(spans: &mut Vec<Span<'static>>, key: &str, action: &str) {
+    if !spans.is_empty() {
+        spans.push(Span::raw("  "));
+    } else {
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled(
+        key.to_string(),
+        Style::default()
+            .fg(COLOR_ACCENT)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        format!(" {action}"),
+        Style::default().fg(COLOR_MUTED),
+    ));
 }
 
 /// Build a ratatui TableState at the given offset.
@@ -660,4 +1108,313 @@ fn ratatui_state(len: usize, scroll: usize) -> ratatui::widgets::TableState {
         s.select(Some(scroll.min(len - 1)));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+    use crate::stats::{IpSnapshot, ProcessSnapshot, TrafficSnapshot};
+
+    fn rendered_lines(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn layout_mode_uses_three_width_breakpoints() {
+        assert_eq!(
+            LayoutMode::from_area(Rect::new(0, 0, 72, 24)),
+            LayoutMode::Compact
+        );
+        assert_eq!(
+            LayoutMode::from_area(Rect::new(0, 0, 80, 24)),
+            LayoutMode::Standard
+        );
+        assert_eq!(
+            LayoutMode::from_area(Rect::new(0, 0, 119, 30)),
+            LayoutMode::Standard
+        );
+        assert_eq!(
+            LayoutMode::from_area(Rect::new(0, 0, 120, 30)),
+            LayoutMode::Wide
+        );
+    }
+
+    #[test]
+    fn processes_page_renders_from_snapshot() {
+        let snapshot = TrafficSnapshot {
+            in_bytes: 40,
+            out_bytes: 60,
+            processes: vec![ProcessSnapshot {
+                pid: 7,
+                name: Some(Arc::from("curl --silent")),
+                recv: 40,
+                sent: 60,
+            }]
+            .into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        state.page = Page::Processes;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now());
+            })
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("curl --silent"));
+        assert!(rendered.contains("100 B"));
+    }
+
+    #[test]
+    fn overview_page_renders_from_snapshot() {
+        let snapshot = TrafficSnapshot {
+            in_bytes: 1024,
+            out_bytes: 2048,
+            processes: vec![ProcessSnapshot {
+                pid: 7,
+                name: Some(Arc::from("curl --silent")),
+                recv: 1024,
+                sent: 2048,
+            }]
+            .into(),
+            inbound_ips: vec![IpSnapshot {
+                ip: "192.0.2.10".parse().unwrap(),
+                bytes: 1024,
+            }]
+            .into(),
+            outbound_ips: vec![IpSnapshot {
+                ip: "198.51.100.20".parse().unwrap(),
+                bytes: 2048,
+            }]
+            .into(),
+        };
+        let mut state = AppState::new();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("curl --silent"));
+        assert!(rendered.contains("192.0.2.10"));
+        assert!(rendered.contains("198.51.100.20"));
+        assert!(rendered.contains("3.00 KB"));
+    }
+
+    #[test]
+    fn ips_page_renders_from_snapshot() {
+        let snapshot = TrafficSnapshot {
+            inbound_ips: vec![IpSnapshot {
+                ip: "192.0.2.10".parse().unwrap(),
+                bytes: 1024,
+            }]
+            .into(),
+            outbound_ips: vec![IpSnapshot {
+                ip: "198.51.100.20".parse().unwrap(),
+                bytes: 2048,
+            }]
+            .into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        state.page = Page::Ips;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("192.0.2.10"));
+        assert!(rendered.contains("1.00 KB"));
+        assert!(rendered.contains("198.51.100.20"));
+        assert!(rendered.contains("2.00 KB"));
+    }
+
+    #[test]
+    fn compact_processes_hide_lower_priority_columns() {
+        let snapshot = TrafficSnapshot {
+            processes: vec![ProcessSnapshot {
+                pid: 7,
+                name: Some(Arc::from("curl")),
+                recv: 40,
+                sent: 60,
+            }]
+            .into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        state.page = Page::Processes;
+        let mut terminal = Terminal::new(TestBackend::new(72, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("Process"));
+        assert!(rendered.contains("Sent"));
+        assert!(rendered.contains("Total"));
+        assert!(!rendered.contains("PID"));
+        assert!(!rendered.contains("Recv"));
+    }
+
+    #[test]
+    fn about_page_does_not_render_capture_context() {
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::new();
+        state.page = Page::About;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    "private-interface",
+                    "private-host",
+                    Instant::now(),
+                )
+            })
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("Network Traffic Analyzer"));
+        assert!(rendered.contains("Version"));
+        assert!(!rendered.contains("private-interface"));
+        assert!(!rendered.contains("private-host"));
+        assert!(!rendered.contains("uptime"));
+    }
+
+    #[test]
+    fn about_page_frames_identity_with_horizontal_rules() {
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::new();
+        state.page = Page::About;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let lines = rendered_lines(&terminal);
+        let identity_row = lines
+            .iter()
+            .rposition(|line| line.contains("delray"))
+            .expect("about identity");
+        assert!(
+            lines[..identity_row]
+                .iter()
+                .any(|line| line.contains("────────"))
+        );
+        assert!(
+            lines[identity_row + 1..]
+                .iter()
+                .any(|line| line.contains("────────"))
+        );
+    }
+
+    #[test]
+    fn compact_layout_prioritizes_panels_by_page() {
+        let snapshot = TrafficSnapshot::default();
+        let mut terminal = Terminal::new(TestBackend::new(72, 24)).unwrap();
+        let mut state = AppState::new();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+        let overview = rendered_lines(&terminal).join("\n");
+        assert!(overview.contains("Inbound IPs"));
+        assert!(!overview.contains("Outbound IPs"));
+
+        state.page = Page::Ips;
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+        let ips = rendered_lines(&terminal).join("\n");
+        assert!(ips.contains("Inbound IPs"));
+        assert!(ips.contains("Outbound IPs"));
+    }
+
+    #[test]
+    fn undersized_terminal_shows_minimum_size_message() {
+        let snapshot = TrafficSnapshot::default();
+        let mut terminal = Terminal::new(TestBackend::new(59, 15)).unwrap();
+        let mut state = AppState::new();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("Terminal too small"));
+        assert!(!rendered.contains("eth0"));
+    }
+
+    #[test]
+    fn page_key_reports_changed() {
+        let mut state = AppState::new();
+        let snapshot = TrafficSnapshot::default();
+
+        let outcome = handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+            &snapshot,
+        );
+
+        assert!(matches!(outcome, KeyOutcome::Changed));
+        assert!(state.page == Page::Processes);
+    }
+
+    #[test]
+    fn page_key_draws_before_checking_for_snapshot_update() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let draw_calls = calls.clone();
+        let latest_calls = calls.clone();
+        let mut state = AppState::new();
+        let mut snapshot = Arc::new(TrafficSnapshot::default());
+
+        let quit = process_iteration(
+            &mut state,
+            &mut snapshot,
+            Some(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)),
+            |_, _| {
+                draw_calls.borrow_mut().push("draw");
+                Ok::<_, ()>(())
+            },
+            || {
+                latest_calls.borrow_mut().push("latest");
+                Ok::<_, ()>(None)
+            },
+        )
+        .unwrap();
+
+        assert!(!quit);
+        assert_eq!(*calls.borrow(), vec!["draw", "latest"]);
+    }
 }

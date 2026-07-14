@@ -11,7 +11,7 @@ pub struct ProcTable {
     /// (本机 IP, 本机端口) -> 进程信息。
     entries: HashMap<(IpAddr, u16), ProcInfo>,
     /// pid -> 进程展示名（cmdline 优先）。
-    pub names: HashMap<u32, String>,
+    pub names: HashMap<u32, Arc<str>>,
 }
 
 #[derive(Clone)]
@@ -24,6 +24,12 @@ pub type SharedProcTable = Arc<RwLock<ProcTable>>;
 impl ProcTable {
     pub fn lookup(&self, ip: IpAddr, port: u16) -> Option<u32> {
         self.entries.get(&(ip, port)).map(|info| info.pid)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&mut self, ip: IpAddr, port: u16, pid: u32, name: Arc<str>) {
+        self.entries.insert((ip, port), ProcInfo { pid });
+        self.names.insert(pid, name);
     }
 }
 
@@ -64,7 +70,7 @@ fn build() -> ProcTable {
 
     // 3. 扫 /proc/*/fd，匹配 socket inode -> pid
     let mut entries: HashMap<(IpAddr, u16), ProcInfo> = HashMap::new();
-    let mut names: HashMap<u32, String> = HashMap::new();
+    let mut names: HashMap<u32, Arc<str>> = HashMap::new();
 
     if let Ok(dir) = fs::read_dir("/proc") {
         for entry in dir.flatten() {
@@ -86,7 +92,7 @@ fn build() -> ProcTable {
             }
             // 仅对命中 socket 的进程读取进程名，控制开销
             let name = read_name(pid).unwrap_or_else(|| pid.to_string());
-            names.insert(pid, name);
+            names.insert(pid, name.into());
             for (ip, port) in hits {
                 entries.insert((ip, port), ProcInfo { pid });
             }
