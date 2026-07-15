@@ -92,20 +92,23 @@ fn plain_snapshot(
     ));
 
     out.push_str(&format!("Top Processes ({top_n})\n"));
-    out.push_str("Process\tPID\tRecv\tSent\tTotal\n");
+    out.push_str("Process\tPID\tRecv\tSent\tTotal\tPath\tLast Seen\n");
     for process in snapshot.processes.iter() {
         let name = process.display_name();
         let pid = process
             .pid()
             .map(|pid| pid.to_string())
             .unwrap_or_else(|| "-".to_string());
+        let path = process.path().unwrap_or("-");
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             name,
             pid,
             human_bytes(process.recv),
             human_bytes(process.sent),
-            human_bytes(process.total())
+            human_bytes(process.total()),
+            path,
+            process.last_seen().to_rfc3339()
         ));
     }
 
@@ -149,6 +152,8 @@ struct JsonTotals {
 struct JsonProc {
     pid: Option<u32>,
     name: Option<String>,
+    path: Option<String>,
+    last_seen: String,
     recv: u64,
     sent: u64,
     total: u64,
@@ -177,6 +182,8 @@ fn build_json_frame<'a>(
         .map(|process| JsonProc {
             pid: process.pid(),
             name: process.name().map(str::to_string),
+            path: process.path().map(str::to_string),
+            last_seen: process.last_seen().to_rfc3339(),
             recv: process.recv,
             sent: process.sent,
             total: process.total(),
@@ -248,27 +255,53 @@ pub fn render_file_json(
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
 
     use super::*;
     use crate::capture::Flow;
-    use crate::stats::Direction;
+    use crate::stats::{Direction, ObservedProcess};
+
+    #[test]
+    fn plain_snapshot_renders_process_path_and_last_seen() {
+        let mut stats = Stats::default();
+        stats.record_flow_at(
+            flow(Direction::Inbound, 40),
+            Some(ObservedProcess {
+                pid: 7,
+                name: Some(Arc::from("curl")),
+                path: Some(Arc::from("/usr/bin/curl")),
+            }),
+            "2026-07-15T08:00:00Z".parse().unwrap(),
+        );
+
+        let rendered = plain_snapshot("eth0", &chrono::Local::now(), Instant::now(), &stats, 10);
+
+        assert!(rendered.contains("Process\tPID\tRecv\tSent\tTotal\tPath\tLast Seen"));
+        assert!(
+            rendered.contains("curl\t7\t40 B\t0 B\t40 B\t/usr/bin/curl\t2026-07-15T08:00:00+00:00")
+        );
+    }
 
     #[test]
     fn plain_snapshot_renders_unattributed_traffic() {
         let mut stats = Stats::default();
-        stats.record_flow(flow(Direction::Inbound, 40), None);
-        stats.record_flow(flow(Direction::Outbound, 60), None);
+        let observed_at = "2026-07-15T08:02:00Z".parse().unwrap();
+        stats.record_flow_at(flow(Direction::Inbound, 40), None, observed_at);
+        stats.record_flow_at(flow(Direction::Outbound, 60), None, observed_at);
 
         let rendered = plain_snapshot("eth0", &chrono::Local::now(), Instant::now(), &stats, 10);
 
-        assert!(rendered.contains("<unattributed traffic>\t-\t40 B\t60 B\t100 B"));
+        assert!(rendered.contains(
+            "<unattributed traffic>\t-\t40 B\t60 B\t100 B\t-\t2026-07-15T08:02:00+00:00"
+        ));
     }
 
     #[test]
     fn json_snapshot_renders_unattributed_traffic_as_null_identity() {
         let mut stats = Stats::default();
-        stats.record_flow(flow(Direction::Inbound, 40), None);
-        stats.record_flow(flow(Direction::Outbound, 60), None);
+        let observed_at = "2026-07-15T08:02:00Z".parse().unwrap();
+        stats.record_flow_at(flow(Direction::Inbound, 40), None, observed_at);
+        stats.record_flow_at(flow(Direction::Outbound, 60), None, observed_at);
 
         let frame = build_json_frame("eth0", &chrono::Local::now(), Instant::now(), &stats, 10);
         let value = serde_json::to_value(frame).unwrap();
@@ -276,9 +309,56 @@ mod tests {
 
         assert!(process["pid"].is_null());
         assert!(process["name"].is_null());
+        assert!(process["path"].is_null());
+        assert_eq!(process["last_seen"], "2026-07-15T08:02:00+00:00");
         assert_eq!(process["recv"], 40);
         assert_eq!(process["sent"], 60);
         assert_eq!(process["total"], 100);
+    }
+
+    #[test]
+    fn json_snapshot_renders_process_path_and_last_seen() {
+        let mut stats = Stats::default();
+        stats.record_flow_at(
+            flow(Direction::Outbound, 60),
+            Some(ObservedProcess {
+                pid: 7,
+                name: Some(Arc::from("curl")),
+                path: Some(Arc::from("/usr/bin/curl")),
+            }),
+            "2026-07-15T08:01:30Z".parse().unwrap(),
+        );
+
+        let frame = build_json_frame("eth0", &chrono::Local::now(), Instant::now(), &stats, 10);
+        let value = serde_json::to_value(frame).unwrap();
+        let process = &value["top_processes"][0];
+
+        assert_eq!(process["path"], "/usr/bin/curl");
+        assert_eq!(process["last_seen"], "2026-07-15T08:01:30+00:00");
+    }
+
+    #[test]
+    fn missing_process_name_and_path_keep_known_pid() {
+        let mut stats = Stats::default();
+        stats.record_flow_at(
+            flow(Direction::Inbound, 40),
+            Some(ObservedProcess {
+                pid: 7,
+                name: None,
+                path: None,
+            }),
+            "2026-07-15T08:03:00Z".parse().unwrap(),
+        );
+
+        let rendered = plain_snapshot("eth0", &chrono::Local::now(), Instant::now(), &stats, 10);
+        assert!(rendered.contains("?\t7\t40 B\t0 B\t40 B\t-\t2026-07-15T08:03:00+00:00"));
+
+        let frame = build_json_frame("eth0", &chrono::Local::now(), Instant::now(), &stats, 10);
+        let value = serde_json::to_value(frame).unwrap();
+        let process = &value["top_processes"][0];
+        assert_eq!(process["pid"], 7);
+        assert!(process["name"].is_null());
+        assert!(process["path"].is_null());
     }
 
     fn flow(direction: Direction, bytes: u64) -> Flow {

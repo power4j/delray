@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
 use crate::capture::Flow;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -23,6 +25,13 @@ pub struct ProcTraffic {
 pub struct ObservedProcess {
     pub pid: u32,
     pub name: Option<Arc<str>>,
+    pub path: Option<Arc<str>>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ProcessKey {
+    pid: u32,
+    path: Option<Arc<str>>,
 }
 
 #[derive(Clone, Default)]
@@ -39,28 +48,42 @@ pub struct ProcessSnapshot {
     identity: ProcessIdentity,
     pub recv: u64,
     pub sent: u64,
+    last_seen: DateTime<Utc>,
 }
 
 #[derive(Clone)]
 enum ProcessIdentity {
-    Attributed { pid: u32, name: Option<Arc<str>> },
+    Attributed {
+        pid: u32,
+        name: Option<Arc<str>>,
+        path: Option<Arc<str>>,
+    },
     Unattributed,
 }
 
 impl ProcessSnapshot {
-    pub(crate) fn attributed(pid: u32, name: Option<Arc<str>>, recv: u64, sent: u64) -> Self {
+    pub(crate) fn attributed(
+        pid: u32,
+        name: Option<Arc<str>>,
+        path: Option<Arc<str>>,
+        last_seen: DateTime<Utc>,
+        recv: u64,
+        sent: u64,
+    ) -> Self {
         Self {
-            identity: ProcessIdentity::Attributed { pid, name },
+            identity: ProcessIdentity::Attributed { pid, name, path },
             recv,
             sent,
+            last_seen,
         }
     }
 
-    pub(crate) fn unattributed(recv: u64, sent: u64) -> Self {
+    pub(crate) fn unattributed(recv: u64, sent: u64, last_seen: DateTime<Utc>) -> Self {
         Self {
             identity: ProcessIdentity::Unattributed,
             recv,
             sent,
+            last_seen,
         }
     }
 
@@ -76,6 +99,17 @@ impl ProcessSnapshot {
             ProcessIdentity::Attributed { name, .. } => name.as_deref(),
             ProcessIdentity::Unattributed => None,
         }
+    }
+
+    pub(crate) fn path(&self) -> Option<&str> {
+        match &self.identity {
+            ProcessIdentity::Attributed { path, .. } => path.as_deref(),
+            ProcessIdentity::Unattributed => None,
+        }
+    }
+
+    pub(crate) fn last_seen(&self) -> DateTime<Utc> {
+        self.last_seen
     }
 
     pub(crate) fn is_unattributed(&self) -> bool {
@@ -109,10 +143,11 @@ pub struct Stats {
     pub out_bytes: u64,
     in_by_ip: HashMap<IpAddr, u64>,
     out_by_ip: HashMap<IpAddr, u64>,
-    by_proc: HashMap<u32, ProcTraffic>,
+    by_proc: HashMap<ProcessKey, ProcTraffic>,
+    proc_last_seen: HashMap<ProcessKey, DateTime<Utc>>,
     unattributed: ProcTraffic,
-    /// pid → display name cache, so exited processes don't show as "?".
-    pid_names: HashMap<u32, Arc<str>>,
+    unattributed_last_seen: Option<DateTime<Utc>>,
+    proc_names: HashMap<ProcessKey, Arc<str>>,
 }
 
 impl Stats {
@@ -126,30 +161,53 @@ impl Stats {
         *self.out_by_ip.entry(destination).or_default() += bytes;
     }
 
-    fn add_proc(&mut self, pid: u32, name: Option<Arc<str>>, direction: Direction, bytes: u64) {
-        let entry = self.by_proc.entry(pid).or_default();
+    fn add_proc(
+        &mut self,
+        process: ObservedProcess,
+        direction: Direction,
+        bytes: u64,
+        observed_at: DateTime<Utc>,
+    ) {
+        let key = ProcessKey {
+            pid: process.pid,
+            path: process.path,
+        };
+        let entry = self.by_proc.entry(key.clone()).or_default();
         match direction {
             Direction::Inbound => entry.recv += bytes,
             Direction::Outbound => entry.sent += bytes,
         }
-        if let Some(name) = name {
-            self.pid_names.entry(pid).or_insert(name);
+        if let Some(name) = process.name {
+            self.proc_names.entry(key.clone()).or_insert(name);
         }
+        self.proc_last_seen.insert(key, observed_at);
     }
 
     pub fn record_flow(&mut self, flow: Flow, process: Option<ObservedProcess>) {
+        self.record_flow_at(flow, process, Utc::now());
+    }
+
+    pub(crate) fn record_flow_at(
+        &mut self,
+        flow: Flow,
+        process: Option<ObservedProcess>,
+        observed_at: DateTime<Utc>,
+    ) {
         match flow.direction {
             Direction::Inbound => self.add_in(flow.peer, flow.bytes),
             Direction::Outbound => self.add_out(flow.peer, flow.bytes),
         }
         match process {
             Some(process) => {
-                self.add_proc(process.pid, process.name, flow.direction, flow.bytes);
+                self.add_proc(process, flow.direction, flow.bytes, observed_at);
             }
-            None => match flow.direction {
-                Direction::Inbound => self.unattributed.recv += flow.bytes,
-                Direction::Outbound => self.unattributed.sent += flow.bytes,
-            },
+            None => {
+                match flow.direction {
+                    Direction::Inbound => self.unattributed.recv += flow.bytes,
+                    Direction::Outbound => self.unattributed.sent += flow.bytes,
+                }
+                self.unattributed_last_seen = Some(observed_at);
+            }
         }
     }
 
@@ -157,10 +215,13 @@ impl Stats {
         let mut processes = self
             .top_procs(top_n)
             .into_iter()
-            .map(|(pid, traffic)| {
+            .map(|(key, traffic)| {
+                let last_seen = self.proc_last_seen[&key];
                 ProcessSnapshot::attributed(
-                    pid,
-                    self.pid_names.get(&pid).cloned(),
+                    key.pid,
+                    self.proc_names.get(&key).cloned(),
+                    key.path,
+                    last_seen,
                     traffic.recv,
                     traffic.sent,
                 )
@@ -170,6 +231,8 @@ impl Stats {
             processes.push(ProcessSnapshot::unattributed(
                 self.unattributed.recv,
                 self.unattributed.sent,
+                self.unattributed_last_seen
+                    .expect("unattributed traffic has an observation time"),
             ));
         }
         processes.sort_unstable_by_key(|process| std::cmp::Reverse(process.total()));
@@ -204,9 +267,12 @@ impl Stats {
         top_n_ip(&self.out_by_ip, n)
     }
 
-    fn top_procs(&self, n: usize) -> Vec<(u32, ProcTraffic)> {
-        let mut entries: Vec<(u32, ProcTraffic)> =
-            self.by_proc.iter().map(|(pid, t)| (*pid, *t)).collect();
+    fn top_procs(&self, n: usize) -> Vec<(ProcessKey, ProcTraffic)> {
+        let mut entries: Vec<(ProcessKey, ProcTraffic)> = self
+            .by_proc
+            .iter()
+            .map(|(key, traffic)| (key.clone(), *traffic))
+            .collect();
         entries.sort_unstable_by_key(|(_, t)| std::cmp::Reverse(t.recv + t.sent));
         entries.truncate(n);
         entries
@@ -231,13 +297,20 @@ mod tests {
     #[test]
     fn unattributed_flow_appears_in_snapshot() {
         let mut stats = Stats::default();
+        let observed_at = "2026-07-15T07:59:00Z".parse().unwrap();
 
-        stats.record_flow(flow(Direction::Inbound, [10, 0, 0, 1], 40), None);
+        stats.record_flow_at(
+            flow(Direction::Inbound, [10, 0, 0, 1], 40),
+            None,
+            observed_at,
+        );
         let snapshot = stats.snapshot(10);
 
         assert_eq!(snapshot.processes.len(), 1);
         assert_eq!(snapshot.processes[0].pid(), None);
         assert!(snapshot.processes[0].name().is_none());
+        assert!(snapshot.processes[0].path().is_none());
+        assert_eq!(snapshot.processes[0].last_seen(), observed_at);
         assert_eq!(snapshot.processes[0].recv, 40);
         assert_eq!(snapshot.processes[0].sent, 0);
     }
@@ -247,7 +320,11 @@ mod tests {
         let mut stats = Stats::default();
         stats.record_flow(
             flow(Direction::Inbound, [10, 0, 0, 1], 10),
-            Some(ObservedProcess { pid: 7, name: None }),
+            Some(ObservedProcess {
+                pid: 7,
+                name: None,
+                path: None,
+            }),
         );
         stats.record_flow(flow(Direction::Inbound, [10, 0, 0, 2], 100), None);
 
@@ -266,15 +343,94 @@ mod tests {
     }
 
     #[test]
+    fn same_pid_with_different_paths_has_distinct_traffic_history() {
+        let mut stats = Stats::default();
+        stats.record_flow(
+            flow(Direction::Inbound, [10, 0, 0, 1], 40),
+            Some(ObservedProcess {
+                pid: 7,
+                name: Some(Arc::from("old-curl")),
+                path: Some(Arc::from("/opt/old/curl")),
+            }),
+        );
+        stats.record_flow(
+            flow(Direction::Outbound, [10, 0, 0, 2], 60),
+            Some(ObservedProcess {
+                pid: 7,
+                name: Some(Arc::from("new-curl")),
+                path: Some(Arc::from("/opt/new/curl")),
+            }),
+        );
+
+        let snapshot = stats.snapshot(10);
+
+        assert_eq!(snapshot.processes.len(), 2);
+        let old = snapshot
+            .processes
+            .iter()
+            .find(|process| process.path() == Some("/opt/old/curl"))
+            .unwrap();
+        let new = snapshot
+            .processes
+            .iter()
+            .find(|process| process.path() == Some("/opt/new/curl"))
+            .unwrap();
+        assert_eq!((old.recv, old.sent), (40, 0));
+        assert_eq!((new.recv, new.sent), (0, 60));
+    }
+
+    #[test]
+    fn last_seen_advances_only_when_flow_is_recorded() {
+        let mut stats = Stats::default();
+        let first = "2026-07-15T08:00:00Z".parse().unwrap();
+        let second = "2026-07-15T08:01:30Z".parse().unwrap();
+        let process = ObservedProcess {
+            pid: 7,
+            name: Some(Arc::from("curl")),
+            path: Some(Arc::from("/usr/bin/curl")),
+        };
+
+        stats.record_flow_at(
+            flow(Direction::Inbound, [10, 0, 0, 1], 40),
+            Some(process.clone()),
+            first,
+        );
+        assert_eq!(stats.snapshot(10).processes[0].last_seen(), first);
+
+        let unchanged = stats.snapshot(10);
+        assert_eq!(unchanged.processes[0].last_seen(), first);
+
+        stats.record_flow_at(
+            flow(Direction::Outbound, [10, 0, 0, 2], 60),
+            Some(process),
+            second,
+        );
+        let updated = stats.snapshot(10);
+        assert_eq!(
+            (updated.processes[0].recv, updated.processes[0].sent),
+            (40, 60)
+        );
+        assert_eq!(updated.processes[0].last_seen(), second);
+    }
+
+    #[test]
     fn process_buckets_partition_captured_traffic() {
         let mut stats = Stats::default();
         stats.record_flow(
             flow(Direction::Inbound, [10, 0, 0, 1], 40),
-            Some(ObservedProcess { pid: 7, name: None }),
+            Some(ObservedProcess {
+                pid: 7,
+                name: None,
+                path: None,
+            }),
         );
         stats.record_flow(
             flow(Direction::Outbound, [10, 0, 0, 2], 10),
-            Some(ObservedProcess { pid: 7, name: None }),
+            Some(ObservedProcess {
+                pid: 7,
+                name: None,
+                path: None,
+            }),
         );
         stats.record_flow(flow(Direction::Inbound, [10, 0, 0, 3], 30), None);
         stats.record_flow(flow(Direction::Outbound, [10, 0, 0, 4], 20), None);
@@ -299,6 +455,7 @@ mod tests {
             Some(ObservedProcess {
                 pid: 7,
                 name: Some(process_name.clone()),
+                path: None,
             }),
         );
         stats.record_flow(
@@ -306,15 +463,24 @@ mod tests {
             Some(ObservedProcess {
                 pid: 7,
                 name: Some(process_name.clone()),
+                path: None,
             }),
         );
         stats.record_flow(
             flow(Direction::Inbound, [10, 0, 0, 3], 30),
-            Some(ObservedProcess { pid: 8, name: None }),
+            Some(ObservedProcess {
+                pid: 8,
+                name: None,
+                path: None,
+            }),
         );
         stats.record_flow(
             flow(Direction::Inbound, [10, 0, 0, 4], 10),
-            Some(ObservedProcess { pid: 9, name: None }),
+            Some(ObservedProcess {
+                pid: 9,
+                name: None,
+                path: None,
+            }),
         );
 
         let snapshot = stats.snapshot(2);
@@ -327,6 +493,8 @@ mod tests {
         assert_eq!(snapshot.processes[0].recv, 40);
         assert_eq!(snapshot.processes[0].sent, 60);
         assert_eq!(snapshot.processes[1].pid(), Some(8));
+        assert!(snapshot.processes[1].name().is_none());
+        assert!(snapshot.processes[1].path().is_none());
         assert!(
             !snapshot
                 .processes
@@ -361,7 +529,16 @@ mod tests {
         let mut stats = Stats::default();
         let name: Arc<str> = Arc::from("nginx");
 
-        stats.add_proc(9, Some(name.clone()), Direction::Outbound, 50);
+        stats.add_proc(
+            ObservedProcess {
+                pid: 9,
+                name: Some(name.clone()),
+                path: None,
+            },
+            Direction::Outbound,
+            50,
+            Utc::now(),
+        );
         let snapshot = stats.snapshot(1);
 
         assert!(Arc::ptr_eq(

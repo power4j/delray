@@ -124,6 +124,7 @@ fn resolve_process(flow: &Flow, proc_table: &SharedProcTable) -> Option<Observed
     Some(ObservedProcess {
         pid: process.pid,
         name: process.name.clone(),
+        path: process.path.clone(),
     })
 }
 
@@ -423,6 +424,7 @@ mod tests {
             crate::capture::TransportProtocol::Tcp,
             7,
             Arc::from("curl"),
+            Some(Arc::from("/usr/bin/curl")),
         );
         let proc_table = Arc::new(RwLock::new(table));
         let (flow_tx, flow_rx) = sync_channel(1);
@@ -462,6 +464,7 @@ mod tests {
         assert_eq!(snapshot.processes.len(), 1);
         assert_eq!(snapshot.processes[0].pid(), Some(7));
         assert_eq!(snapshot.processes[0].name(), Some("curl"));
+        assert_eq!(snapshot.processes[0].path(), Some("/usr/bin/curl"));
         assert_eq!(snapshot.processes[0].sent, 120);
         stop.store(true, Ordering::Release);
         drop(flow_tx);
@@ -478,6 +481,7 @@ mod tests {
             crate::capture::TransportProtocol::Tcp,
             7,
             Arc::from("server-a"),
+            None,
         );
         table.insert_for_test(
             local_ip,
@@ -485,6 +489,7 @@ mod tests {
             crate::capture::TransportProtocol::Tcp,
             8,
             Arc::from("server-b"),
+            None,
         );
         let proc_table = Arc::new(RwLock::new(table));
         let mut stats = Stats::default();
@@ -518,6 +523,7 @@ mod tests {
             crate::capture::TransportProtocol::Tcp,
             7,
             Arc::from("curl"),
+            None,
         );
         let resolved = socket_flow(local_ip, 443, 60);
         let process = resolve_process(&resolved, &proc_table);

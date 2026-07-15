@@ -20,6 +20,7 @@ pub struct ProcTable {
 pub struct ProcInfo {
     pub pid: u32,
     pub name: Option<Arc<str>>,
+    pub path: Option<Arc<str>>,
 }
 
 struct ListenerRecord {
@@ -71,6 +72,7 @@ impl ProcTable {
                 .or_insert(ProcInfo {
                     pid: record.pid,
                     name: executable_name(&record.path).map(Arc::from),
+                    path: (!record.path.is_empty()).then(|| Arc::from(record.path)),
                 });
         }
         Self {
@@ -102,6 +104,7 @@ impl ProcTable {
         protocol: TransportProtocol,
         pid: u32,
         name: Arc<str>,
+        path: Option<Arc<str>>,
     ) {
         self.entries
             .entry((ip, port, protocol))
@@ -111,6 +114,7 @@ impl ProcTable {
                 ProcInfo {
                     pid,
                     name: Some(name),
+                    path,
                 },
             );
     }
@@ -367,6 +371,19 @@ mod tests {
     }
 
     #[test]
+    fn process_observation_includes_executable_path() {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let table =
+            ProcTable::from_records([record(ip, 443, TransportProtocol::Tcp, 7, "/usr/bin/curl")]);
+
+        let process = table
+            .lookup(ip, 443, TransportProtocol::Tcp)
+            .expect("injected listener should match");
+
+        assert_eq!(process.path.as_deref(), Some("/usr/bin/curl"));
+    }
+
+    #[test]
     fn missing_process_name_uses_executable_file_name() {
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let table = ProcTable::from_records([record_with_name(
@@ -411,6 +428,7 @@ mod tests {
             .lookup(ip, 443, TransportProtocol::Tcp)
             .expect("PID attribution should survive a missing path");
         assert!(process.name.is_none());
+        assert!(process.path.is_none());
     }
 
     #[test]

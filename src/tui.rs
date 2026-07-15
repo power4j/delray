@@ -732,6 +732,8 @@ mod tests {
             processes: vec![ProcessSnapshot::attributed(
                 7,
                 Some(Arc::from("curl --silent")),
+                None,
+                chrono::Utc::now(),
                 40,
                 60,
             )]
@@ -762,7 +764,7 @@ mod tests {
     #[test]
     fn unattributed_process_row_uses_special_label_and_style() {
         let snapshot = TrafficSnapshot {
-            processes: vec![ProcessSnapshot::unattributed(40, 60)].into(),
+            processes: vec![ProcessSnapshot::unattributed(40, 60, chrono::Utc::now())].into(),
             ..TrafficSnapshot::default()
         };
         let mut state = AppState::new();
@@ -786,6 +788,8 @@ mod tests {
             processes: vec![ProcessSnapshot::attributed(
                 7,
                 Some(Arc::from("curl --silent")),
+                None,
+                chrono::Utc::now(),
                 1024,
                 2048,
             )]
@@ -818,7 +822,7 @@ mod tests {
     #[test]
     fn overview_uses_special_style_for_unattributed_traffic() {
         let snapshot = TrafficSnapshot {
-            processes: vec![ProcessSnapshot::unattributed(40, 60)].into(),
+            processes: vec![ProcessSnapshot::unattributed(40, 60, chrono::Utc::now())].into(),
             ..TrafficSnapshot::default()
         };
         let mut state = AppState::new();

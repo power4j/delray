@@ -161,6 +161,7 @@ fn drain(
                     Some(stats::ObservedProcess {
                         pid: process.pid,
                         name: process.name.clone(),
+                        path: process.path.clone(),
                     })
                 });
                 stats.record_flow(flow, process);
