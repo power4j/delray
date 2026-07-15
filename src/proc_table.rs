@@ -34,6 +34,15 @@ struct ListenerRecord {
 pub type SharedProcTable = Arc<RwLock<ProcTable>>;
 
 impl ProcTable {
+    pub(crate) fn is_fresh(&self) -> bool {
+        self.is_fresh_at(Instant::now())
+    }
+
+    fn is_fresh_at(&self, now: Instant) -> bool {
+        self.refreshed_at
+            .is_some_and(|refreshed_at| now.saturating_duration_since(refreshed_at) <= self.max_age)
+    }
+
     pub fn lookup(&self, ip: IpAddr, port: u16, protocol: TransportProtocol) -> Option<&ProcInfo> {
         self.lookup_at(ip, port, protocol, Instant::now())
     }
@@ -106,6 +115,8 @@ impl ProcTable {
         name: Arc<str>,
         path: Option<Arc<str>>,
     ) {
+        self.refreshed_at = Some(Instant::now());
+        self.max_age = Duration::MAX;
         self.entries
             .entry((ip, port, protocol))
             .or_default()
@@ -483,6 +494,19 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn process_data_freshness_uses_the_last_successful_refresh() {
+        let started_at = Instant::now();
+        let refresh = Duration::from_secs(5);
+        let mut table = ProcTable::default();
+        table
+            .refresh_at(Ok(Vec::new()), started_at, refresh)
+            .unwrap();
+
+        assert!(table.is_fresh_at(started_at + refresh * 2));
+        assert!(!table.is_fresh_at(started_at + refresh * 2 + Duration::from_nanos(1)));
     }
 
     #[test]

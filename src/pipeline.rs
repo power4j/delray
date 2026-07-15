@@ -84,7 +84,9 @@ fn aggregate_loop(
 
         let now = Instant::now();
         if now >= next_snapshot {
-            let snapshot = Arc::new(stats.snapshot(top_n));
+            let mut snapshot = stats.snapshot(top_n);
+            snapshot.process_data_fresh = proc_table.read().is_ok_and(|table| table.is_fresh());
+            let snapshot = Arc::new(snapshot);
             match snapshot_tx.try_send(snapshot) {
                 Ok(()) | Err(TrySendError::Full(_)) => {}
                 Err(TrySendError::Disconnected(_)) => {
@@ -381,6 +383,74 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_snapshot_marks_uninitialized_process_data_stale() {
+        let (flow_tx, flow_rx) = sync_channel(1);
+        let (snapshot_tx, snapshot_rx) = sync_channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let failure = Arc::new(OnceLock::new());
+        let proc_table = Arc::new(RwLock::new(ProcTable::default()));
+        let worker_stop = stop.clone();
+        let worker_failure = failure.clone();
+        let worker = thread::spawn(move || {
+            aggregate_loop(
+                flow_rx,
+                snapshot_tx,
+                proc_table,
+                10,
+                Duration::from_millis(10),
+                worker_stop,
+                worker_failure,
+            );
+        });
+
+        let snapshot = snapshot_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap();
+
+        assert!(!snapshot.process_data_fresh);
+        stop.store(true, Ordering::Release);
+        drop(flow_tx);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn aggregate_snapshot_treats_a_poisoned_process_table_as_stale() {
+        let proc_table = Arc::new(RwLock::new(ProcTable::default()));
+        let poisoned = proc_table.clone();
+        let _ = thread::spawn(move || {
+            let _guard = poisoned.write().unwrap();
+            panic!("poison process table for test");
+        })
+        .join();
+        let (flow_tx, flow_rx) = sync_channel(1);
+        let (snapshot_tx, snapshot_rx) = sync_channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let failure = Arc::new(OnceLock::new());
+        let worker_stop = stop.clone();
+        let worker_failure = failure.clone();
+        let worker = thread::spawn(move || {
+            aggregate_loop(
+                flow_rx,
+                snapshot_tx,
+                proc_table,
+                10,
+                Duration::from_millis(10),
+                worker_stop,
+                worker_failure,
+            );
+        });
+
+        let snapshot = snapshot_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap();
+
+        assert!(!snapshot.process_data_fresh);
+        stop.store(true, Ordering::Release);
+        drop(flow_tx);
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn aggregate_loop_does_not_block_when_snapshot_channel_is_full() {
         let (flow_tx, flow_rx) = sync_channel(1);
         let (snapshot_tx, snapshot_rx) = sync_channel(1);
@@ -466,6 +536,7 @@ mod tests {
         assert_eq!(snapshot.processes[0].name(), Some("curl"));
         assert_eq!(snapshot.processes[0].path(), Some("/usr/bin/curl"));
         assert_eq!(snapshot.processes[0].sent, 120);
+        assert!(snapshot.process_data_fresh);
         stop.store(true, Ordering::Release);
         drop(flow_tx);
         worker.join().unwrap();

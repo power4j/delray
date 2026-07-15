@@ -38,6 +38,7 @@ struct ProcessKey {
 pub struct TrafficSnapshot {
     pub in_bytes: u64,
     pub out_bytes: u64,
+    pub process_data_fresh: bool,
     pub processes: Arc<[ProcessSnapshot]>,
     pub inbound_ips: Arc<[IpSnapshot]>,
     pub outbound_ips: Arc<[IpSnapshot]>,
@@ -125,6 +126,25 @@ impl ProcessSnapshot {
 
     pub(crate) fn total(&self) -> u64 {
         self.recv.saturating_add(self.sent)
+    }
+
+    pub(crate) fn same_identity_as(&self, other: &Self) -> bool {
+        match (&self.identity, &other.identity) {
+            (ProcessIdentity::Unattributed, ProcessIdentity::Unattributed) => true,
+            (
+                ProcessIdentity::Attributed {
+                    pid: left_pid,
+                    path: left_path,
+                    ..
+                },
+                ProcessIdentity::Attributed {
+                    pid: right_pid,
+                    path: right_path,
+                    ..
+                },
+            ) => left_pid == right_pid && left_path == right_path,
+            _ => false,
+        }
     }
 }
 
@@ -253,6 +273,7 @@ impl Stats {
         TrafficSnapshot {
             in_bytes: self.in_bytes,
             out_bytes: self.out_bytes,
+            process_data_fresh: false,
             processes: processes.into(),
             inbound_ips,
             outbound_ips,

@@ -17,7 +17,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction as LayoutDir, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table, Wrap};
 
 use crate::pipeline::TrafficPipeline;
 use crate::report::{fmt_elapsed, hostname, human_bytes, truncate};
@@ -61,10 +61,41 @@ enum KeyOutcome {
     Ignored,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrackingPause {
+    OutsideTopN,
+    Stale,
+}
+
+impl TrackingPause {
+    fn message(self) -> &'static str {
+        match self {
+            Self::OutsideTopN => "Tracking paused: process is no longer in Top-N.",
+            Self::Stale => "Tracking paused: process data is stale.",
+        }
+    }
+}
+
+struct ProcessDetail {
+    process: ProcessSnapshot,
+    paused: Option<TrackingPause>,
+    pause_notice: Option<TrackingPause>,
+}
+
+impl ProcessDetail {
+    fn pause(&mut self, reason: TrackingPause) {
+        if self.paused != Some(reason) {
+            self.pause_notice = Some(reason);
+        }
+        self.paused = Some(reason);
+    }
+}
+
 /// Persistent UI state across refreshes.
 struct AppState {
     page: Page,
     proc_scroll: usize,
+    process_detail: Option<ProcessDetail>,
     ip_in_scroll: usize,
     ip_out_scroll: usize,
     ip_focus: IpFocus,
@@ -79,12 +110,34 @@ impl AppState {
         Self {
             page: Page::Overview,
             proc_scroll: 0,
+            process_detail: None,
             ip_in_scroll: 0,
             ip_out_scroll: 0,
             ip_focus: IpFocus::Inbound,
             proc_view_height: 1,
             ip_in_view_height: 1,
             ip_out_view_height: 1,
+        }
+    }
+
+    fn update_process_detail(&mut self, snapshot: &TrafficSnapshot) {
+        let Some(detail) = self.process_detail.as_mut() else {
+            return;
+        };
+        if !snapshot.process_data_fresh {
+            detail.pause(TrackingPause::Stale);
+            return;
+        }
+        if let Some(process) = snapshot
+            .processes
+            .iter()
+            .find(|process| process.same_identity_as(&detail.process))
+        {
+            detail.process = process.clone();
+            detail.paused = None;
+            detail.pause_notice = None;
+        } else {
+            detail.pause(TrackingPause::OutsideTopN);
         }
     }
 }
@@ -182,6 +235,7 @@ where
 
     if let Some(latest) = try_latest()? {
         *snapshot = latest;
+        state.update_process_detail(snapshot);
         draw(state, snapshot)?;
     }
 
@@ -190,8 +244,29 @@ where
 
 fn handle_key(state: &mut AppState, key: KeyEvent, snapshot: &TrafficSnapshot) -> KeyOutcome {
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => KeyOutcome::Quit,
+        KeyCode::Char('q') => KeyOutcome::Quit,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyOutcome::Quit,
+        KeyCode::Esc if state.process_detail.is_some() => {
+            state.process_detail = None;
+            KeyOutcome::Changed
+        }
+        KeyCode::Esc => KeyOutcome::Quit,
+        KeyCode::Enter if state.page == Page::Processes && state.process_detail.is_none() => {
+            let Some(process) = snapshot.processes.get(state.proc_scroll) else {
+                return KeyOutcome::Ignored;
+            };
+            let mut detail = ProcessDetail {
+                process: process.clone(),
+                paused: None,
+                pause_notice: None,
+            };
+            if !snapshot.process_data_fresh {
+                detail.pause(TrackingPause::Stale);
+            }
+            state.process_detail = Some(detail);
+            KeyOutcome::Changed
+        }
+        _ if state.process_detail.is_some() => KeyOutcome::Ignored,
         KeyCode::Char('1') => {
             state.page = Page::Overview;
             KeyOutcome::Changed
@@ -336,6 +411,26 @@ fn draw(
     host: &str,
     started_at: Instant,
 ) {
+    draw_at(
+        f,
+        state,
+        snapshot,
+        interface,
+        host,
+        started_at,
+        chrono::Utc::now(),
+    );
+}
+
+fn draw_at(
+    f: &mut ratatui::Frame,
+    state: &mut AppState,
+    snapshot: &TrafficSnapshot,
+    interface: &str,
+    host: &str,
+    started_at: Instant,
+    now: chrono::DateTime<chrono::Utc>,
+) {
     let chunks = Layout::default()
         .direction(LayoutDir::Vertical)
         .constraints([
@@ -348,11 +443,14 @@ fn draw(
     draw_title_bar(f, chunks[0], snapshot, interface, host, started_at);
     match state.page {
         Page::Overview => draw_overview(f, chunks[1], snapshot),
-        Page::Processes => draw_processes(f, chunks[1], state, snapshot),
+        Page::Processes => match state.process_detail.as_ref() {
+            Some(detail) => draw_process_detail(f, chunks[1], detail, now),
+            None => draw_processes(f, chunks[1], state, snapshot),
+        },
         Page::Ips => draw_ips(f, chunks[1], state, snapshot),
         Page::About => draw_about(f, chunks[1]),
     }
-    draw_status_bar(f, chunks[2], state.page);
+    draw_status_bar(f, chunks[2], state);
 }
 
 fn draw_title_bar(
@@ -541,6 +639,8 @@ fn draw_processes(
                 .add_modifier(Modifier::BOLD),
         ),
     )
+    .row_highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED))
+    .highlight_symbol("> ")
     .block(
         Block::default()
             .borders(Borders::ALL)
@@ -556,6 +656,70 @@ fn draw_processes(
         area,
         &mut ratatui_state(processes.len(), state.proc_scroll),
     );
+}
+
+fn draw_process_detail(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    detail: &ProcessDetail,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let process = &detail.process;
+    let mut lines = vec![
+        Line::from(vec![
+            Span::raw("Name: "),
+            process_name_span(process, usize::MAX),
+        ]),
+        Line::from(format!(
+            "PID: {}",
+            process
+                .pid()
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        )),
+        Line::from(format!("Path: {}", process.path().unwrap_or("-"))),
+        Line::from(""),
+        Line::from(format!("Recv: {}", human_bytes(process.recv))),
+        Line::from(format!("Sent: {}", human_bytes(process.sent))),
+        Line::from(format!("Total: {}", human_bytes(process.total()))),
+        Line::from(format!(
+            "Last seen: {}",
+            relative_last_seen(process.last_seen(), now)
+        )),
+    ];
+    if detail.paused.is_some() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Tracking paused",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Process Details "),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(paragraph, area);
+}
+
+fn relative_last_seen(
+    last_seen: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let seconds = now.signed_duration_since(last_seen).num_seconds().max(0);
+    if seconds < 60 {
+        format!("{seconds}s ago")
+    } else if seconds < 60 * 60 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 24 * 60 * 60 {
+        format!("{}h ago", seconds / (60 * 60))
+    } else {
+        format!("{}d ago", seconds / (24 * 60 * 60))
+    }
 }
 
 fn draw_ips(f: &mut ratatui::Frame, area: Rect, state: &mut AppState, snapshot: &TrafficSnapshot) {
@@ -667,15 +831,27 @@ fn draw_about(f: &mut ratatui::Frame, area: Rect) {
     f.render_widget(para, area);
 }
 
-fn draw_status_bar(f: &mut ratatui::Frame, area: Rect, page: Page) {
-    let hint = match page {
-        Page::Overview => "1-4:page  ←→/hl:switch  q:quit",
-        Page::Processes => "1-4:page  ←→/hl:switch  ↑↓/jk:scroll  PgUp/Dn:page  Home/End  q:quit",
-        Page::Ips => "1-4:page  ←→/hl:switch  Tab:panel  ↑↓/jk:scroll  PgUp/Dn:page  q:quit",
-        Page::About => "1-4:page  ←→/hl:switch  q:quit",
+fn draw_status_bar(f: &mut ratatui::Frame, area: Rect, state: &mut AppState) {
+    let hint = if let Some(detail) = state.process_detail.as_ref() {
+        match (detail.pause_notice, detail.paused) {
+            (Some(reason), _) => format!("{}  Esc:back  q:quit", reason.message()),
+            (None, Some(_)) => "Tracking paused  Esc:back  q:quit".to_string(),
+            (None, None) => "Esc:back  q:quit".to_string(),
+        }
+    } else {
+        match state.page {
+            Page::Overview => "1-4:page  ←→/hl:switch  q:quit",
+            Page::Processes => "Enter:details  1-4:page  ←→/hl:switch  ↑↓/jk:select  q:quit",
+            Page::Ips => "1-4:page  ←→/hl:switch  Tab:panel  ↑↓/jk:scroll  PgUp/Dn:page  q:quit",
+            Page::About => "1-4:page  ←→/hl:switch  q:quit",
+        }
+        .to_string()
     };
     let para = Paragraph::new(format!(" {hint} ")).style(Style::default().fg(Color::DarkGray));
     f.render_widget(para, area);
+    if let Some(detail) = state.process_detail.as_mut() {
+        detail.pause_notice = None;
+    }
 }
 
 /// Build a ratatui TableState at the given offset.
@@ -762,6 +938,58 @@ mod tests {
     }
 
     #[test]
+    fn processes_page_marks_the_selected_row() {
+        let snapshot = TrafficSnapshot {
+            processes: vec![
+                ProcessSnapshot::attributed(
+                    7,
+                    Some(Arc::from("curl")),
+                    Some(Arc::from("/usr/bin/curl")),
+                    chrono::Utc::now(),
+                    40,
+                    60,
+                ),
+                ProcessSnapshot::attributed(
+                    8,
+                    Some(Arc::from("ssh")),
+                    Some(Arc::from("/usr/bin/ssh")),
+                    chrono::Utc::now(),
+                    10,
+                    20,
+                ),
+            ]
+            .into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        state.page = Page::Processes;
+        assert!(matches!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &snapshot,
+            ),
+            KeyOutcome::Changed
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("> ssh"));
+        assert!(rendered.contains("Process"));
+        assert!(rendered.contains("PID"));
+        assert!(rendered.contains("Recv"));
+        assert!(rendered.contains("Sent"));
+        assert!(rendered.contains("Total"));
+        assert!(rendered.contains("Enter:details"));
+        assert!(rendered.contains("q:quit"));
+        assert!(!rendered.contains("/usr/bin/ssh"));
+    }
+
+    #[test]
     fn unattributed_process_row_uses_special_label_and_style() {
         let snapshot = TrafficSnapshot {
             processes: vec![ProcessSnapshot::unattributed(40, 60, chrono::Utc::now())].into(),
@@ -788,7 +1016,7 @@ mod tests {
             processes: vec![ProcessSnapshot::attributed(
                 7,
                 Some(Arc::from("curl --silent")),
-                None,
+                Some(Arc::from("/usr/bin/curl")),
                 chrono::Utc::now(),
                 1024,
                 2048,
@@ -804,6 +1032,7 @@ mod tests {
                 bytes: 2048,
             }]
             .into(),
+            process_data_fresh: false,
         };
         let mut state = AppState::new();
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
@@ -817,6 +1046,7 @@ mod tests {
         assert!(rendered.contains("192.0.2.10"));
         assert!(rendered.contains("198.51.100.20"));
         assert!(rendered.contains("Top Processes"));
+        assert!(!rendered.contains("/usr/bin/curl"));
     }
 
     #[test]
@@ -907,5 +1137,532 @@ mod tests {
 
         assert!(!quit);
         assert_eq!(*calls.borrow(), vec!["draw", "latest"]);
+    }
+
+    #[test]
+    fn selected_process_opens_in_details_and_escape_returns_to_list() {
+        let snapshot = TrafficSnapshot {
+            process_data_fresh: true,
+            processes: vec![
+                ProcessSnapshot::attributed(
+                    7,
+                    Some(Arc::from("curl")),
+                    Some(Arc::from("/usr/bin/curl")),
+                    "2026-07-15T08:00:00Z".parse().unwrap(),
+                    40,
+                    60,
+                ),
+                ProcessSnapshot::attributed(
+                    8,
+                    Some(Arc::from("ssh")),
+                    Some(Arc::from("/usr/bin/ssh")),
+                    "2026-07-15T08:01:00Z".parse().unwrap(),
+                    10,
+                    20,
+                ),
+            ]
+            .into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        state.page = Page::Processes;
+        state.proc_scroll = 1;
+
+        let outcome = handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+        );
+
+        assert!(matches!(outcome, KeyOutcome::Changed));
+        assert_eq!(
+            state.process_detail.as_ref().unwrap().process.pid(),
+            Some(8)
+        );
+
+        let outcome = handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &snapshot,
+        );
+
+        assert!(matches!(outcome, KeyOutcome::Changed));
+        assert!(state.process_detail.is_none());
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+        );
+        assert!(matches!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                &snapshot,
+            ),
+            KeyOutcome::Quit
+        ));
+        assert!(matches!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &snapshot,
+            ),
+            KeyOutcome::Quit
+        ));
+    }
+
+    #[test]
+    fn process_details_render_all_fields_at_eighty_columns() {
+        let path = "/opt/services/payments/releases/2026-07-15/production/workers/payment-processing/payment-worker";
+        let snapshot = TrafficSnapshot {
+            process_data_fresh: true,
+            processes: vec![ProcessSnapshot::attributed(
+                7,
+                Some(Arc::from("payment-worker")),
+                Some(Arc::from(path)),
+                "2026-07-15T08:00:00Z".parse().unwrap(),
+                1024,
+                2048,
+            )]
+            .into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        state.page = Page::Processes;
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_at(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    "eth0",
+                    "host",
+                    Instant::now(),
+                    "2026-07-15T08:02:00Z".parse().unwrap(),
+                );
+            })
+            .unwrap();
+
+        let lines = rendered_lines(&terminal);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("Process Details"));
+        assert!(rendered.contains("Name: payment-worker"));
+        assert!(rendered.contains("PID: 7"));
+        assert!(rendered.contains("Recv: 1.00 KB"));
+        assert!(rendered.contains("Sent: 2.00 KB"));
+        assert!(rendered.contains("Total: 3.00 KB"));
+        assert!(rendered.contains("Last seen: 2m ago"));
+        assert!(rendered.contains("Esc:back"));
+        let inner_lines = lines
+            .iter()
+            .map(|line| line.chars().skip(1).take(78).collect::<String>())
+            .collect::<Vec<_>>();
+        let path_line = inner_lines
+            .iter()
+            .position(|line| line.starts_with("Path: "))
+            .unwrap();
+        let mut displayed_path = inner_lines[path_line]
+            .trim_end()
+            .strip_prefix("Path:")
+            .unwrap()
+            .trim_start()
+            .to_string();
+        for continuation in &inner_lines[path_line + 1..] {
+            if continuation.trim().is_empty() {
+                break;
+            }
+            displayed_path.push_str(continuation.trim_end());
+        }
+        assert_eq!(displayed_path, path);
+        for line in lines {
+            let field_count = [
+                "Name:",
+                "PID:",
+                "Path:",
+                "Recv:",
+                "Sent:",
+                "Total:",
+                "Last seen:",
+            ]
+            .iter()
+            .filter(|field| line.contains(**field))
+            .count();
+            assert!(field_count <= 1, "detail fields overlap: {line}");
+        }
+    }
+
+    #[test]
+    fn details_update_when_the_same_identity_arrives() {
+        let selected = ProcessSnapshot::attributed(
+            7,
+            Some(Arc::from("curl")),
+            None,
+            "2026-07-15T08:00:00Z".parse().unwrap(),
+            40,
+            60,
+        );
+        let latest = ProcessSnapshot::attributed(
+            7,
+            Some(Arc::from("renamed-curl")),
+            None,
+            "2026-07-15T08:01:00Z".parse().unwrap(),
+            140,
+            160,
+        );
+        let mut snapshot = Arc::new(TrafficSnapshot {
+            process_data_fresh: true,
+            processes: vec![selected].into(),
+            ..TrafficSnapshot::default()
+        });
+        let mut state = AppState::new();
+        state.page = Page::Processes;
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+        );
+
+        process_iteration(
+            &mut state,
+            &mut snapshot,
+            None,
+            |_, _| Ok::<_, ()>(()),
+            || {
+                Ok::<_, ()>(Some(Arc::new(TrafficSnapshot {
+                    process_data_fresh: true,
+                    processes: vec![latest.clone()].into(),
+                    ..TrafficSnapshot::default()
+                })))
+            },
+        )
+        .unwrap();
+
+        let detail = &state.process_detail.as_ref().unwrap().process;
+        assert_eq!((detail.recv, detail.sent), (140, 160));
+        assert_eq!(detail.name(), Some("renamed-curl"));
+        assert!(detail.path().is_none());
+        assert_eq!(
+            detail.last_seen(),
+            "2026-07-15T08:01:00Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn same_pid_with_a_different_path_does_not_update_details() {
+        let mut snapshot = Arc::new(TrafficSnapshot {
+            process_data_fresh: true,
+            processes: vec![ProcessSnapshot::attributed(
+                7,
+                Some(Arc::from("old-curl")),
+                Some(Arc::from("/opt/old/curl")),
+                "2026-07-15T08:00:00Z".parse().unwrap(),
+                40,
+                60,
+            )]
+            .into(),
+            ..TrafficSnapshot::default()
+        });
+        let mut state = AppState::new();
+        state.page = Page::Processes;
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+        );
+
+        process_iteration(
+            &mut state,
+            &mut snapshot,
+            None,
+            |_, _| Ok::<_, ()>(()),
+            || {
+                Ok::<_, ()>(Some(Arc::new(TrafficSnapshot {
+                    process_data_fresh: true,
+                    processes: vec![ProcessSnapshot::attributed(
+                        7,
+                        Some(Arc::from("new-curl")),
+                        Some(Arc::from("/opt/new/curl")),
+                        "2026-07-15T08:01:00Z".parse().unwrap(),
+                        140,
+                        160,
+                    )]
+                    .into(),
+                    ..TrafficSnapshot::default()
+                })))
+            },
+        )
+        .unwrap();
+
+        let detail = state.process_detail.as_ref().unwrap();
+        assert_eq!(detail.process.path(), Some("/opt/old/curl"));
+        assert_eq!((detail.process.recv, detail.process.sent), (40, 60));
+        assert_eq!(detail.paused, Some(TrackingPause::OutsideTopN));
+    }
+
+    #[test]
+    fn top_n_pause_notice_is_drawn_once_while_paused_details_persist() {
+        let mut snapshot = Arc::new(TrafficSnapshot {
+            process_data_fresh: true,
+            processes: vec![ProcessSnapshot::attributed(
+                7,
+                Some(Arc::from("curl")),
+                Some(Arc::from("/usr/bin/curl")),
+                "2026-07-15T08:00:00Z".parse().unwrap(),
+                40,
+                60,
+            )]
+            .into(),
+            ..TrafficSnapshot::default()
+        });
+        let mut state = AppState::new();
+        state.page = Page::Processes;
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let now = "2026-07-15T08:05:00Z".parse().unwrap();
+
+        process_iteration(
+            &mut state,
+            &mut snapshot,
+            None,
+            |state, snapshot| {
+                terminal
+                    .draw(|frame| {
+                        draw_at(frame, state, snapshot, "eth0", "host", Instant::now(), now);
+                    })
+                    .map(|_| ())
+            },
+            || {
+                Ok::<_, io::Error>(Some(Arc::new(TrafficSnapshot {
+                    process_data_fresh: true,
+                    ..TrafficSnapshot::default()
+                })))
+            },
+        )
+        .unwrap();
+
+        let first_draw = rendered_lines(&terminal).join("\n");
+        assert!(first_draw.contains("Tracking paused: process is no longer in Top-N."));
+        assert!(first_draw.contains("Total: 100 B"));
+        assert!(first_draw.contains("Last seen: 5m ago"));
+
+        process_iteration(
+            &mut state,
+            &mut snapshot,
+            None,
+            |state, snapshot| {
+                terminal
+                    .draw(|frame| {
+                        draw_at(frame, state, snapshot, "eth0", "host", Instant::now(), now);
+                    })
+                    .map(|_| ())
+            },
+            || {
+                Ok::<_, io::Error>(Some(Arc::new(TrafficSnapshot {
+                    process_data_fresh: true,
+                    ..TrafficSnapshot::default()
+                })))
+            },
+        )
+        .unwrap();
+
+        let second_draw = rendered_lines(&terminal).join("\n");
+        assert!(!second_draw.contains("process is no longer in Top-N"));
+        assert!(second_draw.contains("Tracking paused"));
+        assert!(second_draw.contains("Total: 100 B"));
+        assert!(second_draw.contains("Last seen: 5m ago"));
+    }
+
+    #[test]
+    fn stale_process_data_pauses_details_without_claiming_process_exit() {
+        let mut snapshot = Arc::new(TrafficSnapshot {
+            process_data_fresh: true,
+            processes: vec![ProcessSnapshot::attributed(
+                7,
+                Some(Arc::from("curl")),
+                Some(Arc::from("/usr/bin/curl")),
+                "2026-07-15T08:00:00Z".parse().unwrap(),
+                40,
+                60,
+            )]
+            .into(),
+            ..TrafficSnapshot::default()
+        });
+        let stale_process = ProcessSnapshot::attributed(
+            7,
+            Some(Arc::from("curl")),
+            Some(Arc::from("/usr/bin/curl")),
+            "2026-07-15T08:01:00Z".parse().unwrap(),
+            140,
+            160,
+        );
+        let mut state = AppState::new();
+        state.page = Page::Processes;
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        process_iteration(
+            &mut state,
+            &mut snapshot,
+            None,
+            |state, snapshot| {
+                terminal
+                    .draw(|frame| {
+                        draw_at(
+                            frame,
+                            state,
+                            snapshot,
+                            "eth0",
+                            "host",
+                            Instant::now(),
+                            "2026-07-15T08:02:00Z".parse().unwrap(),
+                        );
+                    })
+                    .map(|_| ())
+            },
+            || {
+                Ok::<_, io::Error>(Some(Arc::new(TrafficSnapshot {
+                    process_data_fresh: false,
+                    processes: vec![stale_process.clone()].into(),
+                    ..TrafficSnapshot::default()
+                })))
+            },
+        )
+        .unwrap();
+
+        let detail = state.process_detail.as_ref().unwrap();
+        assert_eq!(detail.paused, Some(TrackingPause::Stale));
+        assert_eq!((detail.process.recv, detail.process.sent), (40, 60));
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("Tracking paused: process data is stale."));
+        assert!(!rendered.contains("exited"));
+    }
+
+    #[test]
+    fn details_resume_when_the_same_identity_returns_to_top_n() {
+        let selected = ProcessSnapshot::attributed(
+            7,
+            Some(Arc::from("curl")),
+            Some(Arc::from("/usr/bin/curl")),
+            "2026-07-15T08:00:00Z".parse().unwrap(),
+            40,
+            60,
+        );
+        let mut snapshot = Arc::new(TrafficSnapshot {
+            process_data_fresh: true,
+            processes: vec![selected].into(),
+            ..TrafficSnapshot::default()
+        });
+        let mut state = AppState::new();
+        state.page = Page::Processes;
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+        );
+        process_iteration(
+            &mut state,
+            &mut snapshot,
+            None,
+            |_, _| Ok::<_, ()>(()),
+            || {
+                Ok::<_, ()>(Some(Arc::new(TrafficSnapshot {
+                    process_data_fresh: true,
+                    ..TrafficSnapshot::default()
+                })))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            state.process_detail.as_ref().unwrap().paused,
+            Some(TrackingPause::OutsideTopN)
+        );
+
+        let resumed = ProcessSnapshot::attributed(
+            7,
+            Some(Arc::from("curl")),
+            Some(Arc::from("/usr/bin/curl")),
+            "2026-07-15T08:03:00Z".parse().unwrap(),
+            140,
+            160,
+        );
+        process_iteration(
+            &mut state,
+            &mut snapshot,
+            None,
+            |_, _| Ok::<_, ()>(()),
+            || {
+                Ok::<_, ()>(Some(Arc::new(TrafficSnapshot {
+                    process_data_fresh: true,
+                    processes: vec![resumed.clone()].into(),
+                    ..TrafficSnapshot::default()
+                })))
+            },
+        )
+        .unwrap();
+
+        let detail = state.process_detail.as_ref().unwrap();
+        assert_eq!(detail.paused, None);
+        assert_eq!(detail.pause_notice, None);
+        assert_eq!((detail.process.recv, detail.process.sent), (140, 160));
+    }
+
+    #[test]
+    fn unattributed_traffic_details_keep_missing_fields_and_special_style() {
+        let snapshot = TrafficSnapshot {
+            process_data_fresh: true,
+            processes: vec![ProcessSnapshot::unattributed(
+                40,
+                60,
+                "2026-07-15T08:00:00Z".parse().unwrap(),
+            )]
+            .into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        state.page = Page::Processes;
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_at(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    "eth0",
+                    "host",
+                    Instant::now(),
+                    "2026-07-15T08:01:00Z".parse().unwrap(),
+                );
+            })
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("Name: <unattributed traffic>"));
+        assert!(rendered.contains("PID: -"));
+        assert!(rendered.contains("Path: -"));
+        assert_unattributed_style(&terminal);
     }
 }
