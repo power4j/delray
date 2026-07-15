@@ -154,10 +154,10 @@ fn socket_inodes_of(pid: u32) -> Vec<u64> {
         return v;
     };
     for entry in dir.flatten() {
-        if let Ok(target) = fs::read_link(entry.path())
-            && let Some(inode) = parse_socket_inode(&target.to_string_lossy())
-        {
-            v.push(inode);
+        if let Ok(target) = fs::read_link(entry.path()) {
+            if let Some(inode) = parse_socket_inode(&target.to_string_lossy()) {
+                v.push(inode);
+            }
         }
     }
     v
