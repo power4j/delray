@@ -2,9 +2,10 @@
 set -euo pipefail
 
 binary=${1:-target/debug/delray}
+interface=${2:-lo}
 threshold=${DELRAY_TUI_LATENCY_THRESHOLD:-0.100}
-cycles=${DELRAY_TUI_CYCLES:-1}
-key_interval=${DELRAY_TUI_KEY_INTERVAL:-0.250}
+cycles=${DELRAY_TUI_CYCLES:-100}
+key_interval=${DELRAY_TUI_KEY_INTERVAL:-0.125}
 
 if [[ ! $cycles =~ ^[1-9][0-9]*$ ]]; then
     printf 'DELRAY_TUI_CYCLES must be a positive integer\n' >&2
@@ -12,9 +13,19 @@ if [[ ! $cycles =~ ^[1-9][0-9]*$ ]]; then
 fi
 timeout_seconds=$(perl -MPOSIX=ceil -e 'print ceil(10 + 4 * $ARGV[0] * $ARGV[1])' "$cycles" "$key_interval")
 
-if [[ ${DELRAY_TUI_NETNS:-0} != 1 ]]; then
-    binary=$(realpath "$binary")
-    exec unshare -Urn env DELRAY_TUI_NETNS=1 "$0" "$binary"
+binary=$(realpath "$binary")
+if [[ ! -x $binary ]]; then
+    printf 'binary is not executable: %s\n' "$binary" >&2
+    exit 2
+fi
+
+if [[ $interface == lo && ${DELRAY_TUI_NETNS:-0} != 1 ]]; then
+    exec unshare -Urn env DELRAY_TUI_NETNS=1 "$0" "$binary" "$interface"
+fi
+
+if ! ip link show dev "$interface" > /dev/null 2>&1; then
+    printf 'network interface not found: %s\n' "$interface" >&2
+    exit 2
 fi
 
 tmpdir=$(mktemp -d)
@@ -31,9 +42,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-ip link set lo up
-ping -q -i 0.01 127.0.0.1 > /dev/null &
-ping_pid=$!
+if [[ $interface == lo ]]; then
+    ip link set lo up
+    ping -q -i 0.01 127.0.0.1 > /dev/null &
+    ping_pid=$!
+fi
+
+printf -v script_command 'stty rows 24 cols 80 && exec %q %q' "$binary" "$interface"
 
 {
     sleep 2
@@ -51,7 +66,7 @@ ping_pid=$!
     -I "$tmpdir/input.log" \
     -O "$tmpdir/output.log" \
     -T "$tmpdir/timing.log" \
-    -c "stty rows 24 cols 80 && exec $binary lo" \
+    -c "$script_command" \
     > /dev/null
 
 perl - "$tmpdir/timing.log" "$tmpdir/output.log" "$threshold" "$cycles" <<'PERL'
@@ -73,10 +88,10 @@ my @keys;
 push @keys, qw(2 3 4 1) for 1 .. $cycles;
 push @keys, 'q';
 my %markers = (
-    2 => 'proc Processes',
-    3 => 'in Inbound IP',
+    2 => 'Processes',
+    3 => 'Inbound',
     4 => 'Analyzer',
-    1 => 'net Traffic',
+    1 => 'Top',
 );
 my $key_index = 0;
 my ($pending_key, $pending_at, $pending_output);
