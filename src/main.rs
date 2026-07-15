@@ -18,20 +18,26 @@ const DEFAULT_PROC_REFRESH: u64 = 2;
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let Some(interface) = cli.interface else {
-        capture::list_interfaces();
-        return ExitCode::FAILURE;
+    let Some(interface_selector) = cli.interface else {
+        return match capture::list_interfaces() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Failed to enumerate interfaces: {error}");
+                ExitCode::FAILURE
+            }
+        };
     };
 
     let started_wall = chrono::Local::now();
     let started_at = Instant::now();
-    let mut source = match CaptureSource::open(&interface) {
+    let mut source = match CaptureSource::open(&interface_selector) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to open interface: {e}");
             return ExitCode::FAILURE;
         }
     };
+    let interface = source.interface_name().to_string();
 
     let proc_table = proc_table::spawn(Duration::from_secs(cli.proc_refresh));
 
