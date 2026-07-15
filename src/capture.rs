@@ -5,7 +5,7 @@ use std::fs;
 use std::net::IpAddr;
 
 use anyhow::{Result, anyhow};
-use etherparse::{NetHeaders, PacketHeaders, TransportHeader};
+use etherparse::{EtherType, NetHeaders, PacketHeaders, TransportHeader};
 use pcap::{Capture, Device};
 
 use crate::stats::Direction;
@@ -18,10 +18,25 @@ pub struct CaptureSource {
     local_ips: HashSet<IpAddr>,
 }
 
+// rust-pcap exposes normalized LINKTYPE_RAW (101), while live Linux handles use DLT_RAW (12).
+const LINUX_DLT_RAW: pcap::Linktype = pcap::Linktype(12);
+
 #[derive(Clone, Copy)]
-enum PacketStart {
+enum PacketFormat {
     Ethernet,
-    Ip(usize),
+    Raw,
+    Ipv4,
+    Ipv6,
+    Null,
+    Loop,
+    LinuxSll,
+    LinuxSll2,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum IpVersion {
+    V4,
+    V6,
 }
 
 /// 解析后的单向流量记录。
@@ -142,7 +157,7 @@ impl CaptureSource {
             .promisc(false)
             .open()?;
         let link_type = cap.get_datalink();
-        packet_start(link_type)?;
+        packet_format(link_type)?;
 
         Ok(Self {
             cap,
@@ -172,11 +187,14 @@ fn parse(
     data: &[u8],
     local_ips: &HashSet<IpAddr>,
 ) -> Result<Option<Flow>> {
-    let headers = match packet_start(link_type)? {
-        PacketStart::Ethernet => PacketHeaders::from_ethernet_slice(data).ok(),
-        PacketStart::Ip(offset) => data
-            .get(offset..)
-            .and_then(|packet| PacketHeaders::from_ip_slice(packet).ok()),
+    let headers = match packet_format(link_type)? {
+        PacketFormat::Ethernet => PacketHeaders::from_ethernet_slice(data).ok(),
+        format => ip_payload(format, data).and_then(|(packet, expected_version)| {
+            if expected_version.is_some_and(|expected| ip_version(packet) != Some(expected)) {
+                return None;
+            }
+            PacketHeaders::from_ip_slice(packet).ok()
+        }),
     };
 
     let Some(headers) = headers else {
@@ -243,22 +261,105 @@ fn parse(
     }))
 }
 
-fn packet_start(link_type: pcap::Linktype) -> Result<PacketStart> {
+fn packet_format(link_type: pcap::Linktype) -> Result<PacketFormat> {
     if link_type == pcap::Linktype::ETHERNET {
-        Ok(PacketStart::Ethernet)
-    } else if matches!(
-        link_type,
-        pcap::Linktype::RAW | pcap::Linktype::IPV4 | pcap::Linktype::IPV6
-    ) {
-        Ok(PacketStart::Ip(0))
-    } else if matches!(link_type, pcap::Linktype::NULL | pcap::Linktype::LOOP) {
-        Ok(PacketStart::Ip(4))
+        Ok(PacketFormat::Ethernet)
+    } else if matches!(link_type, pcap::Linktype::RAW | LINUX_DLT_RAW) {
+        Ok(PacketFormat::Raw)
+    } else if link_type == pcap::Linktype::IPV4 {
+        Ok(PacketFormat::Ipv4)
+    } else if link_type == pcap::Linktype::IPV6 {
+        Ok(PacketFormat::Ipv6)
+    } else if link_type == pcap::Linktype::NULL {
+        Ok(PacketFormat::Null)
+    } else if link_type == pcap::Linktype::LOOP {
+        Ok(PacketFormat::Loop)
     } else if link_type == pcap::Linktype::LINUX_SLL {
-        Ok(PacketStart::Ip(16))
+        Ok(PacketFormat::LinuxSll)
     } else if link_type == pcap::Linktype::LINUX_SLL2 {
-        Ok(PacketStart::Ip(20))
+        Ok(PacketFormat::LinuxSll2)
     } else {
         Err(anyhow!("Unsupported data link type: {}", link_type.0))
+    }
+}
+
+fn ip_payload(format: PacketFormat, data: &[u8]) -> Option<(&[u8], Option<IpVersion>)> {
+    match format {
+        PacketFormat::Raw => Some((data, None)),
+        PacketFormat::Ipv4 => Some((data, Some(IpVersion::V4))),
+        PacketFormat::Ipv6 => Some((data, Some(IpVersion::V6))),
+        PacketFormat::Null => {
+            let family = u32::from_ne_bytes(data.get(..4)?.try_into().ok()?);
+            Some((
+                data.get(4..)?,
+                Some(ip_version_from_address_family(family)?),
+            ))
+        }
+        PacketFormat::Loop => {
+            let family = u32::from_be_bytes(data.get(..4)?.try_into().ok()?);
+            Some((
+                data.get(4..)?,
+                Some(ip_version_from_address_family(family)?),
+            ))
+        }
+        PacketFormat::LinuxSll => {
+            let ether_type = u16::from_be_bytes(data.get(14..16)?.try_into().ok()?);
+            Some((
+                data.get(16..)?,
+                Some(ip_version_from_ether_type(ether_type)?),
+            ))
+        }
+        PacketFormat::LinuxSll2 => {
+            let ether_type = u16::from_be_bytes(data.get(..2)?.try_into().ok()?);
+            Some((
+                data.get(20..)?,
+                Some(ip_version_from_ether_type(ether_type)?),
+            ))
+        }
+        PacketFormat::Ethernet => None,
+    }
+}
+
+fn ip_version(data: &[u8]) -> Option<IpVersion> {
+    match data.first()? >> 4 {
+        4 => Some(IpVersion::V4),
+        6 => Some(IpVersion::V6),
+        _ => None,
+    }
+}
+
+fn ip_version_from_ether_type(ether_type: u16) -> Option<IpVersion> {
+    match EtherType(ether_type) {
+        EtherType::IPV4 => Some(IpVersion::V4),
+        EtherType::IPV6 => Some(IpVersion::V6),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ip_version_from_address_family(family: u32) -> Option<IpVersion> {
+    match family {
+        2 => Some(IpVersion::V4),
+        10 => Some(IpVersion::V6),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn ip_version_from_address_family(family: u32) -> Option<IpVersion> {
+    match family {
+        2 => Some(IpVersion::V4),
+        23 => Some(IpVersion::V6),
+        _ => None,
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn ip_version_from_address_family(family: u32) -> Option<IpVersion> {
+    match family {
+        2 => Some(IpVersion::V4),
+        24 | 28 | 30 => Some(IpVersion::V6),
+        _ => None,
     }
 }
 
@@ -269,12 +370,6 @@ mod tests {
     use pcap::{Address, DeviceFlags};
 
     use super::*;
-
-    #[derive(Clone, Copy)]
-    enum IpVersion {
-        V4,
-        V6,
-    }
 
     struct ExpectedFlow {
         direction: Direction,
@@ -322,6 +417,7 @@ mod tests {
                 &[IpVersion::V4, IpVersion::V6][..],
             ),
             (pcap::Linktype::RAW, &[IpVersion::V4, IpVersion::V6][..]),
+            (LINUX_DLT_RAW, &[IpVersion::V4, IpVersion::V6][..]),
             (pcap::Linktype::IPV4, &[IpVersion::V4][..]),
             (pcap::Linktype::IPV6, &[IpVersion::V6][..]),
             (pcap::Linktype::NULL, &[IpVersion::V4, IpVersion::V6][..]),
@@ -350,6 +446,74 @@ mod tests {
                     assert_flow(flow, expected);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn linux_dlt_raw_12_parses_raw_ip() {
+        let (packet, mut expected) = fixed_ip_packet(IpVersion::V4, TransportProtocol::Udp);
+        expected.bytes = packet.len() as u64;
+        let local_ips = HashSet::from([expected.local_ip]);
+
+        let flow = parse(pcap::Linktype(12), &packet, &local_ips)
+            .expect("Linux DLT_RAW is supported")
+            .expect("local raw IP flow");
+
+        assert_flow(flow, expected);
+    }
+
+    #[test]
+    fn link_protocol_identifier_must_match_ip_payload() {
+        let local_ips = HashSet::from([
+            "192.0.2.10".parse::<IpAddr>().unwrap(),
+            "2001:db8::10".parse::<IpAddr>().unwrap(),
+        ]);
+        let mismatches = [
+            (pcap::Linktype::IPV4, IpVersion::V4, IpVersion::V6),
+            (pcap::Linktype::IPV6, IpVersion::V6, IpVersion::V4),
+            (pcap::Linktype::NULL, IpVersion::V4, IpVersion::V6),
+            (pcap::Linktype::NULL, IpVersion::V6, IpVersion::V4),
+            (pcap::Linktype::LOOP, IpVersion::V4, IpVersion::V6),
+            (pcap::Linktype::LOOP, IpVersion::V6, IpVersion::V4),
+            (pcap::Linktype::LINUX_SLL, IpVersion::V4, IpVersion::V6),
+            (pcap::Linktype::LINUX_SLL, IpVersion::V6, IpVersion::V4),
+            (pcap::Linktype::LINUX_SLL2, IpVersion::V4, IpVersion::V6),
+            (pcap::Linktype::LINUX_SLL2, IpVersion::V6, IpVersion::V4),
+        ];
+
+        for (link_type, advertised_version, payload_version) in mismatches {
+            let (payload, _) = fixed_ip_packet(payload_version, TransportProtocol::Udp);
+            let packet = add_link_header(link_type, advertised_version, payload);
+
+            let flow = parse(link_type, &packet, &local_ips).expect("supported data link");
+
+            assert!(flow.is_none());
+        }
+    }
+
+    #[test]
+    fn unsupported_link_protocol_identifier_is_ignored() {
+        let local_ips = HashSet::from(["192.0.2.10".parse::<IpAddr>().unwrap()]);
+        let (payload, _) = fixed_ip_packet(IpVersion::V4, TransportProtocol::Udp);
+        let mut null = 999_u32.to_ne_bytes().to_vec();
+        null.extend_from_slice(&payload);
+        let mut loop_packet = 999_u32.to_be_bytes().to_vec();
+        loop_packet.extend_from_slice(&payload);
+        let mut sll = vec![0, 0, 0, 1, 0, 6, 0, 1, 2, 3, 4, 5, 0, 0, 0x08, 0x06];
+        sll.extend_from_slice(&payload);
+        let mut sll2 = vec![
+            0x08, 0x06, 0, 0, 0, 0, 0, 1, 0, 1, 0, 6, 0, 1, 2, 3, 4, 5, 0, 0,
+        ];
+        sll2.extend_from_slice(&payload);
+
+        for (link_type, packet) in [
+            (pcap::Linktype::NULL, null),
+            (pcap::Linktype::LOOP, loop_packet),
+            (pcap::Linktype::LINUX_SLL, sll),
+            (pcap::Linktype::LINUX_SLL2, sll2),
+        ] {
+            let flow = parse(link_type, &packet, &local_ips).expect("supported data link");
+            assert!(flow.is_none());
         }
     }
 
