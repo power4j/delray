@@ -1,7 +1,9 @@
 mod capture;
+mod pipeline;
 mod proc_table;
 mod report;
 mod stats;
+mod tui;
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -12,7 +14,7 @@ use capture::CaptureSource;
 use stats::Direction;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-const TOP_N: usize = 10;
+const DEFAULT_TOP_N: u64 = 10;
 const DEFAULT_PROC_REFRESH: u64 = 2;
 
 fn main() -> ExitCode {
@@ -28,23 +30,124 @@ fn main() -> ExitCode {
     let mut source = match CaptureSource::open(&interface) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("打开网卡失败：{e}");
+            eprintln!("Failed to open interface: {e}");
             return ExitCode::FAILURE;
         }
     };
 
     let proc_table = proc_table::spawn(Duration::from_secs(cli.proc_refresh));
 
-    if let Some(path) = &cli.output {
-        eprintln!(
-            "后台运行：每 {} 秒刷新统计到 {path}",
-            REFRESH_INTERVAL.as_secs()
-        );
+    let top_n = cli.top_n as usize;
+    let is_json = cli.format == "json";
+
+    match &cli.output {
+        Some(path) => {
+            // Background file mode: write snapshot each refresh tick.
+            eprintln!(
+                "Background mode: refreshing stats to {path} every {}s",
+                REFRESH_INTERVAL.as_secs()
+            );
+            background_loop(
+                &mut source,
+                &proc_table,
+                path,
+                &interface,
+                &started_wall,
+                started_at,
+                top_n,
+                is_json,
+            );
+        }
+        None => {
+            // Foreground mode.
+            if is_json {
+                // JSON streams to stdout as a data source (no TUI).
+                json_stdout_loop(
+                    &mut source,
+                    &proc_table,
+                    &interface,
+                    &started_wall,
+                    started_at,
+                    top_n,
+                );
+            } else {
+                // Plain foreground = interactive TUI.
+                let pipeline =
+                    match pipeline::TrafficPipeline::spawn(source, proc_table.clone(), top_n) {
+                        Ok(pipeline) => pipeline,
+                        Err(e) => {
+                            eprintln!("Failed to start traffic pipeline: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                if let Err(e) = tui::run(&interface, &pipeline) {
+                    eprintln!("TUI error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
     }
 
+    ExitCode::SUCCESS
+}
+
+/// Background file loop: capture continuously, write snapshot every refresh interval.
+#[allow(clippy::too_many_arguments)]
+fn background_loop(
+    source: &mut CaptureSource,
+    proc_table: &proc_table::SharedProcTable,
+    path: &str,
+    interface: &str,
+    started_wall: &chrono::DateTime<chrono::Local>,
+    started_at: Instant,
+    top_n: usize,
+    is_json: bool,
+) {
     let mut stats = stats::Stats::default();
     let mut next_refresh = Instant::now() + REFRESH_INTERVAL;
+    loop {
+        drain(source, proc_table, &mut stats);
+        if Instant::now() >= next_refresh {
+            let res = if is_json {
+                report::render_file_json(path, interface, started_wall, started_at, &stats, top_n)
+            } else {
+                report::render_file(path, interface, started_wall, started_at, &stats, top_n)
+            };
+            if let Err(e) = res {
+                eprintln!("Failed to write output file: {e}");
+            }
+            next_refresh = Instant::now() + REFRESH_INTERVAL;
+        }
+    }
+}
 
+/// JSON stdout loop: stream one compact JSON line per refresh interval.
+#[allow(clippy::too_many_arguments)]
+fn json_stdout_loop(
+    source: &mut CaptureSource,
+    proc_table: &proc_table::SharedProcTable,
+    interface: &str,
+    started_wall: &chrono::DateTime<chrono::Local>,
+    started_at: Instant,
+    top_n: usize,
+) {
+    let mut stats = stats::Stats::default();
+    let mut next_refresh = Instant::now() + REFRESH_INTERVAL;
+    loop {
+        drain(source, proc_table, &mut stats);
+        if Instant::now() >= next_refresh {
+            report::render_jsonl(interface, started_wall, started_at, &stats, top_n);
+            next_refresh = Instant::now() + REFRESH_INTERVAL;
+        }
+    }
+}
+
+/// Drain available packets from the capture source into stats.
+fn drain(
+    source: &mut CaptureSource,
+    proc_table: &proc_table::SharedProcTable,
+    stats: &mut stats::Stats,
+) {
     loop {
         match source.next() {
             Ok(Some(flow)) => {
@@ -52,65 +155,49 @@ fn main() -> ExitCode {
                     Direction::Inbound => stats.add_in(flow.peer, flow.bytes),
                     Direction::Outbound => stats.add_out(flow.peer, flow.bytes),
                 }
-                if let Some((ip, port)) = flow.local_socket
-                    && let Ok(table) = proc_table.read()
-                    && let Some(pid) = table.lookup(ip, port)
-                {
-                    let name = table.names.get(&pid).cloned();
-                    stats.add_proc(pid, name.as_deref(), flow.direction, flow.bytes);
-                }
-            }
-            Ok(None) => {}
-            Err(e) => eprintln!("抓包错误：{e}"),
-        }
-
-        if Instant::now() >= next_refresh {
-            match &cli.output {
-                Some(path) => {
-                    if let Err(e) = report::render_file(
-                        path,
-                        &interface,
-                        &started_wall,
-                        started_at,
-                        &stats,
-                        TOP_N,
-                    ) {
-                        eprintln!("写入输出文件失败：{e}");
+                if let Some((ip, port)) = flow.local_socket {
+                    if let Ok(table) = proc_table.read() {
+                        if let Some(pid) = table.lookup(ip, port) {
+                            let name = table.names.get(&pid).cloned();
+                            stats.add_proc(pid, name, flow.direction, flow.bytes);
+                        }
                     }
                 }
-                None => {
-                    report::render_terminal(&interface, &started_wall, started_at, &stats, TOP_N);
-                }
             }
-            next_refresh = Instant::now() + REFRESH_INTERVAL;
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("Capture error: {e}");
+                break;
+            }
         }
     }
 }
 
-/// 命令行参数。
+/// CLI arguments.
 #[derive(Parser)]
-#[command(
-    name = "delray",
-    version,
-    about = "面向资源受限 Linux 服务器的网络流量分析工具"
-)]
+#[command(name = "delray", version, about = "Network traffic analyzer")]
 struct Cli {
-    /// 监听网卡名
+    /// Network interface to capture on (omit to list available interfaces)
     interface: Option<String>,
-    /// 进程 inode 表重建间隔（秒）
+    /// /proc inode-table rebuild interval in seconds (must be > 0)
     #[arg(long, default_value_t = DEFAULT_PROC_REFRESH, value_parser = positive_u64)]
     proc_refresh: u64,
-    /// 后台模式输出文件（不指定则前台输出终端）
+    /// Output file for background mode (omit for foreground terminal display)
     #[arg(long)]
     output: Option<String>,
+    /// Output format: plain (default) or json
+    #[arg(long = "format", short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
+    format: String,
+    /// Number of entries per top-N list (default: 10, min: 1)
+    #[arg(long = "top-n", short = 'n', default_value_t = DEFAULT_TOP_N, value_parser = clap::value_parser!(u64).range(1..))]
+    top_n: u64,
 }
 
-/// 校验 `--proc-refresh` 为大于 0 的整数。
 fn positive_u64(s: &str) -> Result<u64, String> {
     match s.parse::<u64>() {
         Ok(v) if v > 0 => Ok(v),
-        Ok(_) => Err(String::from("--proc-refresh 必须大于 0")),
-        Err(_) => Err(String::from("--proc-refresh 需要正整数")),
+        Ok(_) => Err(String::from("value must be greater than 0")),
+        Err(_) => Err(String::from("value must be a positive integer")),
     }
 }
 
