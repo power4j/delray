@@ -2,7 +2,7 @@
 name = "delray"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [dependencies]
 pcap = "2"
@@ -14,3 +14,4 @@ ratatui = "0.29"
 crossterm = "0.28"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+listeners = "0.6"

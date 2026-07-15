@@ -118,12 +118,12 @@ fn aggregate_loop(
 }
 
 fn resolve_process(flow: &Flow, proc_table: &SharedProcTable) -> Option<ObservedProcess> {
-    let (ip, port) = flow.local_socket?;
+    let socket = flow.local_socket?;
     let table = proc_table.read().ok()?;
-    let pid = table.lookup(ip, port)?;
+    let process = table.lookup(socket.ip, socket.port, socket.protocol)?;
     Some(ObservedProcess {
-        pid,
-        name: table.names.get(&pid).cloned(),
+        pid: process.pid,
+        name: process.name.clone(),
     })
 }
 
@@ -418,7 +418,13 @@ mod tests {
     fn aggregate_loop_resolves_process_before_snapshot() {
         let local_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
         let mut table = ProcTable::default();
-        table.insert_for_test(local_ip, 443, 7, Arc::from("curl --silent"));
+        table.insert_for_test(
+            local_ip,
+            443,
+            crate::capture::TransportProtocol::Tcp,
+            7,
+            Arc::from("curl"),
+        );
         let proc_table = Arc::new(RwLock::new(table));
         let (flow_tx, flow_rx) = sync_channel(1);
         let (snapshot_tx, snapshot_rx) = sync_channel(2);
@@ -427,7 +433,11 @@ mod tests {
                 direction: Direction::Outbound,
                 peer: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5)),
                 bytes: 120,
-                local_socket: Some((local_ip, 443)),
+                local_socket: Some(crate::capture::LocalSocket {
+                    ip: local_ip,
+                    port: 443,
+                    protocol: crate::capture::TransportProtocol::Tcp,
+                }),
             })
             .unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -452,7 +462,7 @@ mod tests {
 
         assert_eq!(snapshot.processes.len(), 1);
         assert_eq!(snapshot.processes[0].pid(), Some(7));
-        assert_eq!(snapshot.processes[0].name(), Some("curl --silent"));
+        assert_eq!(snapshot.processes[0].name(), Some("curl"));
         assert_eq!(snapshot.processes[0].sent, 120);
         stop.store(true, Ordering::Release);
         drop(flow_tx);

@@ -17,7 +17,7 @@
 
 | 依赖 | 版本 / 安装方式 |
 |---|---|
-| Rust | ≥ 1.85（edition 2024，MSRV 由 `Cargo.toml` 的 `rust-version` 强制检查） |
+| Rust | ≥ 1.88（edition 2024，MSRV 由 `Cargo.toml` 的 `rust-version` 强制检查） |
 | libpcap 开发包 | Debian/Ubuntu：`apt install libpcap-dev`；RHEL 系：`yum install libpcap-devel` |
 | zig | 交叉编译所需：从 [ziglang.org](https://ziglang.org/download/) 下载解压并加入 `PATH` |
 | cargo-zigbuild | `cargo install cargo-zigbuild` |

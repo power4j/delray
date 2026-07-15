@@ -20,8 +20,21 @@ pub struct Flow {
     /// 远端 IP（用于 IP 维度统计）。
     pub peer: IpAddr,
     pub bytes: u64,
-    /// 本机 (IP, 端口)，仅 TCP/UDP 有；用于进程关联。
-    pub local_socket: Option<(IpAddr, u16)>,
+    /// 本机 socket，仅 TCP/UDP 有；用于进程关联。
+    pub local_socket: Option<LocalSocket>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TransportProtocol {
+    Tcp,
+    Udp,
+}
+
+#[derive(Clone, Copy)]
+pub struct LocalSocket {
+    pub ip: IpAddr,
+    pub port: u16,
+    pub protocol: TransportProtocol,
 }
 
 /// Determine the default route interface from /proc/net/route.
@@ -119,20 +132,30 @@ fn parse(data: &[u8], local_ips: &HashSet<IpAddr>) -> Option<Flow> {
         return None;
     };
 
-    let local_port = match &headers.transport {
+    let local_socket = match &headers.transport {
         Some(TransportHeader::Tcp(tcp)) => {
-            if direction == Direction::Outbound {
-                Some(tcp.source_port)
+            let port = if direction == Direction::Outbound {
+                tcp.source_port
             } else {
-                Some(tcp.destination_port)
-            }
+                tcp.destination_port
+            };
+            Some(LocalSocket {
+                ip: local_ip,
+                port,
+                protocol: TransportProtocol::Tcp,
+            })
         }
         Some(TransportHeader::Udp(udp)) => {
-            if direction == Direction::Outbound {
-                Some(udp.source_port)
+            let port = if direction == Direction::Outbound {
+                udp.source_port
             } else {
-                Some(udp.destination_port)
-            }
+                udp.destination_port
+            };
+            Some(LocalSocket {
+                ip: local_ip,
+                port,
+                protocol: TransportProtocol::Udp,
+            })
         }
         _ => None,
     };
@@ -141,6 +164,60 @@ fn parse(data: &[u8], local_ips: &HashSet<IpAddr>) -> Option<Flow> {
         direction,
         peer,
         bytes,
-        local_socket: local_port.map(|p| (local_ip, p)),
+        local_socket,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+
+    #[test]
+    fn parsed_flows_distinguish_tcp_udp_and_other_protocols() {
+        let local_ip = Ipv4Addr::new(192, 0, 2, 10);
+        let local_ips = HashSet::from([IpAddr::V4(local_ip)]);
+
+        let tcp = parse(
+            &ipv4_frame(
+                6,
+                40,
+                &[
+                    0x30, 0x39, 0x01, 0xbb, 0, 0, 0, 0, 0, 0, 0, 0, 0x50, 2, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
+            &local_ips,
+        )
+        .expect("outbound TCP flow");
+        let udp = parse(
+            &ipv4_frame(17, 28, &[0x14, 0xe9, 0, 53, 0, 8, 0, 0]),
+            &local_ips,
+        )
+        .expect("outbound UDP flow");
+        let icmp = parse(&ipv4_frame(1, 28, &[8, 0, 0, 0, 0, 0, 0, 0]), &local_ips)
+            .expect("outbound ICMP flow");
+
+        let tcp_socket = tcp.local_socket.expect("TCP local socket");
+        assert_eq!(tcp_socket.ip, IpAddr::V4(local_ip));
+        assert_eq!(tcp_socket.port, 12_345);
+        assert_eq!(tcp_socket.protocol, TransportProtocol::Tcp);
+
+        let udp_socket = udp.local_socket.expect("UDP local socket");
+        assert_eq!(udp_socket.ip, IpAddr::V4(local_ip));
+        assert_eq!(udp_socket.port, 5_353);
+        assert_eq!(udp_socket.protocol, TransportProtocol::Udp);
+
+        assert!(icmp.local_socket.is_none());
+    }
+
+    fn ipv4_frame(protocol: u8, total_length: u16, transport: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0x08, 0x00, 0x45, 0];
+        frame.extend_from_slice(&total_length.to_be_bytes());
+        frame.extend_from_slice(&[0, 0, 0, 0, 64, protocol, 0, 0]);
+        frame.extend_from_slice(&[192, 0, 2, 10]);
+        frame.extend_from_slice(&[198, 51, 100, 5]);
+        frame.extend_from_slice(transport);
+        frame
+    }
 }

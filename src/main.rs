@@ -149,12 +149,12 @@ fn drain(
     loop {
         match source.next() {
             Ok(Some(flow)) => {
-                let process = flow.local_socket.and_then(|(ip, port)| {
+                let process = flow.local_socket.and_then(|socket| {
                     let table = proc_table.read().ok()?;
-                    let pid = table.lookup(ip, port)?;
+                    let process = table.lookup(socket.ip, socket.port, socket.protocol)?;
                     Some(stats::ObservedProcess {
-                        pid,
-                        name: table.names.get(&pid).cloned(),
+                        pid: process.pid,
+                        name: process.name.clone(),
                     })
                 });
                 stats.record_flow(flow, process);
@@ -174,7 +174,7 @@ fn drain(
 struct Cli {
     /// Network interface to capture on (omit to list available interfaces)
     interface: Option<String>,
-    /// /proc inode-table rebuild interval in seconds (must be > 0)
+    /// Process table refresh interval in seconds (must be > 0)
     #[arg(long, default_value_t = DEFAULT_PROC_REFRESH, value_parser = positive_u64)]
     proc_refresh: u64,
     /// Output file for background mode (omit for foreground terminal display)

@@ -36,7 +36,7 @@ pub fn human_bytes(n: u64) -> String {
     } else if value >= KB {
         format!("{:.2} KB", value / KB)
     } else {
-        format!("{} B", n)
+        format!("{n} B")
     }
 }
 

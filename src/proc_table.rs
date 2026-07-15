@@ -1,48 +1,111 @@
 use std::collections::HashMap;
-use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
-/// 进程关联表：后台线程定时重建，抓包线程只读查询。
+use crate::capture::TransportProtocol;
+
+type SocketKey = (IpAddr, u16, TransportProtocol);
+
+/// Process association table rebuilt periodically by a background thread.
 #[derive(Default)]
 pub struct ProcTable {
-    /// (本机 IP, 本机端口) -> 进程信息。
-    entries: HashMap<(IpAddr, u16), ProcInfo>,
-    /// pid -> 进程展示名（cmdline 优先）。
-    pub names: HashMap<u32, Arc<str>>,
+    entries: HashMap<SocketKey, ProcInfo>,
 }
 
-#[derive(Clone)]
-struct ProcInfo {
+pub struct ProcInfo {
+    pub pid: u32,
+    pub name: Option<Arc<str>>,
+}
+
+struct ListenerRecord {
+    socket: SocketAddr,
+    protocol: TransportProtocol,
     pid: u32,
+    path: String,
 }
 
 pub type SharedProcTable = Arc<RwLock<ProcTable>>;
 
 impl ProcTable {
-    pub fn lookup(&self, ip: IpAddr, port: u16) -> Option<u32> {
-        self.entries.get(&(ip, port)).map(|info| info.pid)
+    pub fn lookup(&self, ip: IpAddr, port: u16, protocol: TransportProtocol) -> Option<&ProcInfo> {
+        self.entries.get(&(ip, port, protocol))
+    }
+
+    fn from_records(records: impl IntoIterator<Item = ListenerRecord>) -> Self {
+        let entries = records
+            .into_iter()
+            .map(|record| {
+                let key = (record.socket.ip(), record.socket.port(), record.protocol);
+                (
+                    key,
+                    ProcInfo {
+                        pid: record.pid,
+                        name: executable_name(&record.path).map(Arc::from),
+                    },
+                )
+            })
+            .collect();
+        Self { entries }
     }
 
     #[cfg(test)]
-    pub(crate) fn insert_for_test(&mut self, ip: IpAddr, port: u16, pid: u32, name: Arc<str>) {
-        self.entries.insert((ip, port), ProcInfo { pid });
-        self.names.insert(pid, name);
+    pub(crate) fn insert_for_test(
+        &mut self,
+        ip: IpAddr,
+        port: u16,
+        protocol: TransportProtocol,
+        pid: u32,
+        name: Arc<str>,
+    ) {
+        self.entries.insert(
+            (ip, port, protocol),
+            ProcInfo {
+                pid,
+                name: Some(name),
+            },
+        );
     }
 }
 
-/// 启动后台线程定时重建进程表，返回共享句柄。
-/// 重建在锁外完成，write 锁仅做瞬时整表替换，抓包线程几乎不阻塞。
+impl From<listeners::Listener> for ListenerRecord {
+    fn from(listener: listeners::Listener) -> Self {
+        Self {
+            socket: listener.socket,
+            protocol: listener.protocol.into(),
+            pid: listener.process.pid,
+            path: listener.process.path,
+        }
+    }
+}
+
+impl From<listeners::Protocol> for TransportProtocol {
+    fn from(protocol: listeners::Protocol) -> Self {
+        match protocol {
+            listeners::Protocol::TCP => Self::Tcp,
+            listeners::Protocol::UDP => Self::Udp,
+        }
+    }
+}
+
+fn executable_name(path: &str) -> Option<&str> {
+    Path::new(path)
+        .file_name()?
+        .to_str()
+        .filter(|name| !name.is_empty())
+}
+
+/// Start rebuilding the process table on a background thread.
 pub fn spawn(refresh: Duration) -> SharedProcTable {
     let table: SharedProcTable = Arc::new(RwLock::new(ProcTable::default()));
     let handle = table.clone();
     thread::spawn(move || {
         loop {
             let new_table = build();
-            if let Ok(mut w) = handle.write() {
-                *w = new_table;
+            if let Ok(mut table) = handle.write() {
+                *table = new_table;
             }
             thread::sleep(refresh);
         }
@@ -50,226 +113,95 @@ pub fn spawn(refresh: Duration) -> SharedProcTable {
     table
 }
 
-/// 扫描 /proc 重建进程关联表。
 fn build() -> ProcTable {
-    // 1. /proc/net/{tcp,udp,tcp6,udp6} -> (ip, port) -> inode
-    let mut socket_to_inode: HashMap<(IpAddr, u16), u64> = HashMap::new();
-    parse_file("/proc/net/tcp", &mut socket_to_inode, false);
-    parse_file("/proc/net/udp", &mut socket_to_inode, false);
-    parse_file("/proc/net/tcp6", &mut socket_to_inode, true);
-    parse_file("/proc/net/udp6", &mut socket_to_inode, true);
-
-    // 2. 反向索引 inode -> sockets，供 fd 扫描时 O(1) 匹配
-    let mut inode_to_sockets: HashMap<u64, Vec<(IpAddr, u16)>> = HashMap::new();
-    for ((ip, port), inode) in &socket_to_inode {
-        inode_to_sockets
-            .entry(*inode)
-            .or_default()
-            .push((*ip, *port));
-    }
-
-    // 3. 扫 /proc/*/fd，匹配 socket inode -> pid
-    let mut entries: HashMap<(IpAddr, u16), ProcInfo> = HashMap::new();
-    let mut names: HashMap<u32, Arc<str>> = HashMap::new();
-
-    if let Ok(dir) = fs::read_dir("/proc") {
-        for entry in dir.flatten() {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|s| s.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            let mut hits: Vec<(IpAddr, u16)> = Vec::new();
-            for inode in socket_inodes_of(pid) {
-                if let Some(sockets) = inode_to_sockets.get(&inode) {
-                    hits.extend(sockets.iter().copied());
-                }
-            }
-            if hits.is_empty() {
-                continue;
-            }
-            // 仅对命中 socket 的进程读取进程名，控制开销
-            let name = read_name(pid).unwrap_or_else(|| pid.to_string());
-            names.insert(pid, name.into());
-            for (ip, port) in hits {
-                entries.insert((ip, port), ProcInfo { pid });
-            }
-        }
-    }
-
-    ProcTable { entries, names }
-}
-
-fn parse_file(path: &str, out: &mut HashMap<(IpAddr, u16), u64>, ipv6: bool) {
-    let Ok(content) = fs::read_to_string(path) else {
-        return;
-    };
-    for line in content.lines().skip(1) {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 10 {
-            continue;
-        }
-        let Some((ip, port)) = parse_local(fields[1], ipv6) else {
-            continue;
-        };
-        let Ok(inode) = fields[9].parse::<u64>() else {
-            continue;
-        };
-        out.insert((ip, port), inode);
-    }
-}
-
-/// 解析 /proc/net/* 的 local_address 字段 "IP:PORT"（均为十六进制，IP 为 host 字节序）。
-fn parse_local(s: &str, ipv6: bool) -> Option<(IpAddr, u16)> {
-    let (addr_hex, port_hex) = s.split_once(':')?;
-    let port = u16::from_str_radix(port_hex, 16).ok()?;
-    let ip = if ipv6 {
-        IpAddr::V6(parse_ipv6(addr_hex)?)
-    } else {
-        // host 字节序 hex -> 字节即 IP（假设小端架构，覆盖 x86_64/arm64主流 Linux）
-        let n = u32::from_str_radix(addr_hex, 16).ok()?;
-        IpAddr::V4(Ipv4Addr::from(n.to_le_bytes()))
-    };
-    Some((ip, port))
-}
-
-fn parse_ipv6(hex: &str) -> Option<Ipv6Addr> {
-    if hex.len() != 32 {
-        return None;
-    }
-    let mut bytes = [0u8; 16];
-    for i in 0..4 {
-        let part = u32::from_str_radix(&hex[i * 8..i * 8 + 8], 16).ok()?;
-        bytes[i * 4..i * 4 + 4].copy_from_slice(&part.to_le_bytes());
-    }
-    Some(Ipv6Addr::from(bytes))
-}
-
-/// 读取某进程打开的 socket inode 列表。
-fn socket_inodes_of(pid: u32) -> Vec<u64> {
-    let mut v = Vec::new();
-    let Ok(dir) = fs::read_dir(format!("/proc/{pid}/fd")) else {
-        return v;
-    };
-    for entry in dir.flatten() {
-        if let Ok(target) = fs::read_link(entry.path()) {
-            if let Some(inode) = parse_socket_inode(&target.to_string_lossy()) {
-                v.push(inode);
-            }
-        }
-    }
-    v
-}
-
-fn parse_socket_inode(s: &str) -> Option<u64> {
-    let s = s.strip_prefix("socket:[")?;
-    let s = s.strip_suffix(']')?;
-    s.parse().ok()
-}
-
-/// 读取进程展示名：优先 cmdline，其次 exe 基名，最后 comm。
-/// comm 可被程序用 prctl 改名（如代理软件改成协议名），定位价值低，
-/// 故优先用能反映真实程序的 cmdline / exe 路径。
-fn read_name(pid: u32) -> Option<String> {
-    if let Some(cmd) = read_cmdline(pid) {
-        return Some(cmd);
-    }
-    if let Some(exe) = read_exe_basename(pid) {
-        return Some(exe);
-    }
-    read_comm(pid)
-}
-
-fn read_cmdline(pid: u32) -> Option<String> {
-    let data = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    parse_cmdline_bytes(&data)
-}
-
-/// 解析 /proc/<pid>/cmdline 原始字节（NUL 分隔参数）为空格连接的命令行。
-fn parse_cmdline_bytes(data: &[u8]) -> Option<String> {
-    let parts: Vec<&str> = data
-        .split(|&b| b == 0)
-        .filter_map(|s| std::str::from_utf8(s).ok())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" "))
-    }
-}
-
-fn read_exe_basename(pid: u32) -> Option<String> {
-    let path = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-    path.file_name()?.to_str().map(|s| s.to_string())
-}
-
-fn read_comm(pid: u32) -> Option<String> {
-    let s = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-    Some(s.trim_end_matches('\n').to_string())
+    listeners::get_all()
+        .map(|listeners| ProcTable::from_records(listeners.into_iter().map(ListenerRecord::from)))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
     use super::*;
 
-    #[test]
-    fn parse_local_ipv4_loopback() {
-        // /proc/net/tcp 中 127.0.0.1:9000 编码为 host 字节序 hex
-        let (ip, port) = parse_local("0100007F:2328", false).unwrap();
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
-        assert_eq!(port, 0x2328);
+    fn record(
+        ip: IpAddr,
+        port: u16,
+        protocol: TransportProtocol,
+        pid: u32,
+        path: &str,
+    ) -> ListenerRecord {
+        ListenerRecord {
+            socket: SocketAddr::new(ip, port),
+            protocol,
+            pid,
+            path: path.to_string(),
+        }
     }
 
     #[test]
-    fn parse_local_ipv4_wildcard_http() {
-        let (ip, port) = parse_local("00000000:0050", false).unwrap();
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        assert_eq!(port, 80);
-    }
+    fn injected_records_match_address_port_and_protocol() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let table = ProcTable::from_records([
+            record(ip, 443, TransportProtocol::Tcp, 7, "/usr/bin/curl"),
+            record(ip, 443, TransportProtocol::Udp, 8, "/usr/bin/quiche"),
+        ]);
 
-    #[test]
-    fn parse_ipv6_loopback() {
-        // ::1 在 /proc/net/tcp6 的 4×u32 host 字节序编码
-        let ip = parse_ipv6("00000000000000000000000001000000").unwrap();
-        assert_eq!(ip, Ipv6Addr::LOCALHOST);
-    }
-
-    #[test]
-    fn parse_socket_inode_matches() {
-        assert_eq!(parse_socket_inode("socket:[12345]"), Some(12345));
-        assert_eq!(parse_socket_inode("socket:[999]"), Some(999));
-    }
-
-    #[test]
-    fn parse_socket_inode_rejects_non_socket() {
-        assert_eq!(parse_socket_inode("/dev/null"), None);
-        assert_eq!(parse_socket_inode("socket:[abc]"), None);
-    }
-
-    #[test]
-    fn parse_cmdline_basic() {
-        // NUL 分隔的多个参数 -> 空格连接
         assert_eq!(
-            parse_cmdline_bytes(b"/usr/bin/curl\0http://x\0"),
-            Some("/usr/bin/curl http://x".to_string())
+            table.lookup(ip, 443, TransportProtocol::Tcp).map(|p| p.pid),
+            Some(7)
+        );
+        assert_eq!(
+            table.lookup(ip, 443, TransportProtocol::Udp).map(|p| p.pid),
+            Some(8)
+        );
+        assert!(table.lookup(ip, 80, TransportProtocol::Tcp).is_none());
+    }
+
+    #[test]
+    fn injected_records_support_ipv4_and_ipv6() {
+        let ipv4 = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let ipv6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let table = ProcTable::from_records([
+            record(ipv4, 8080, TransportProtocol::Tcp, 10, "/opt/server4"),
+            record(ipv6, 5353, TransportProtocol::Udp, 11, "/opt/server6"),
+        ]);
+
+        assert_eq!(
+            table
+                .lookup(ipv4, 8080, TransportProtocol::Tcp)
+                .map(|p| p.pid),
+            Some(10)
+        );
+        assert_eq!(
+            table
+                .lookup(ipv6, 5353, TransportProtocol::Udp)
+                .map(|p| p.pid),
+            Some(11)
         );
     }
 
     #[test]
-    fn parse_cmdline_single_arg() {
-        assert_eq!(
-            parse_cmdline_bytes(b"/usr/sbin/nginx\0"),
-            Some("/usr/sbin/nginx".to_string())
-        );
+    fn process_display_name_uses_executable_file_name() {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let table =
+            ProcTable::from_records([record(ip, 443, TransportProtocol::Tcp, 7, "/usr/bin/curl")]);
+
+        let process = table
+            .lookup(ip, 443, TransportProtocol::Tcp)
+            .expect("injected listener should match");
+        assert_eq!(process.name.as_deref(), Some("curl"));
     }
 
     #[test]
-    fn parse_cmdline_empty() {
-        // 内核线程无 cmdline，应返回 None 以触发 exe/comm 兜底
-        assert_eq!(parse_cmdline_bytes(b"\0\0"), None);
-        assert_eq!(parse_cmdline_bytes(b""), None);
+    fn missing_executable_path_has_no_display_name() {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let table = ProcTable::from_records([record(ip, 443, TransportProtocol::Tcp, 7, "")]);
+
+        let process = table
+            .lookup(ip, 443, TransportProtocol::Tcp)
+            .expect("PID attribution should survive a missing path");
+        assert!(process.name.is_none());
     }
 }
