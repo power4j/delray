@@ -17,11 +17,11 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction as LayoutDir, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table};
 
 use crate::pipeline::TrafficPipeline;
 use crate::report::{fmt_elapsed, hostname, human_bytes, truncate};
-use crate::stats::TrafficSnapshot;
+use crate::stats::{ProcessSnapshot, TrafficSnapshot};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -433,12 +433,11 @@ fn draw_overview(f: &mut ratatui::Frame, area: Rect, snapshot: &TrafficSnapshot)
         .iter()
         .take(5)
         .map(|process| {
-            let name = process.name.as_deref().unwrap_or("?");
-            ListItem::new(format!(
-                "{}  {}",
-                truncate(name, 18),
-                human_bytes(process.recv + process.sent)
-            ))
+            let name = process_name_span(process, 18);
+            ListItem::new(Line::from(vec![
+                name,
+                Span::raw(format!("  {}", human_bytes(process.total()))),
+            ]))
         })
         .collect();
     let process_block = preview_block("Top Processes", processes.len(), 5, 2);
@@ -481,6 +480,24 @@ fn bar(ratio: f64, width: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(empty))
 }
 
+fn process_name_span(process: &ProcessSnapshot, max_chars: usize) -> Span<'static> {
+    let name = if process.is_unattributed() {
+        process.display_name().to_string()
+    } else {
+        truncate(process.display_name(), max_chars)
+    };
+    if process.is_unattributed() {
+        Span::styled(
+            name,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::ITALIC),
+        )
+    } else {
+        Span::raw(name)
+    }
+}
+
 fn draw_processes(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -491,13 +508,18 @@ fn draw_processes(
     let rows: Vec<Row> = processes
         .iter()
         .map(|process| {
-            let name = process.name.as_deref().unwrap_or("?");
+            let name = Cell::from(process_name_span(process, 40));
             Row::new(vec![
-                truncate(name, 40).to_string(),
-                process.pid.to_string(),
-                human_bytes(process.recv),
-                human_bytes(process.sent),
-                human_bytes(process.recv + process.sent),
+                name,
+                Cell::from(
+                    process
+                        .pid()
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
+                Cell::from(human_bytes(process.recv)),
+                Cell::from(human_bytes(process.sent)),
+                Cell::from(human_bytes(process.total())),
             ])
         })
         .collect();
@@ -688,17 +710,31 @@ mod tests {
             .collect()
     }
 
+    fn assert_unattributed_style(terminal: &Terminal<TestBackend>) {
+        let rendered = rendered_lines(terminal).join("\n");
+        assert!(rendered.contains("<unattributed traffic>"));
+        let first_label_cell = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .find(|cell| cell.symbol() == "<")
+            .expect("unattributed label cell");
+        assert_eq!(first_label_cell.fg, Color::Yellow);
+        assert!(first_label_cell.modifier.contains(Modifier::ITALIC));
+    }
+
     #[test]
     fn processes_page_renders_from_snapshot() {
         let snapshot = TrafficSnapshot {
             in_bytes: 40,
             out_bytes: 60,
-            processes: vec![ProcessSnapshot {
-                pid: 7,
-                name: Some(Arc::from("curl --silent")),
-                recv: 40,
-                sent: 60,
-            }]
+            processes: vec![ProcessSnapshot::attributed(
+                7,
+                Some(Arc::from("curl --silent")),
+                40,
+                60,
+            )]
             .into(),
             ..TrafficSnapshot::default()
         };
@@ -724,16 +760,35 @@ mod tests {
     }
 
     #[test]
+    fn unattributed_process_row_uses_special_label_and_style() {
+        let snapshot = TrafficSnapshot {
+            processes: vec![ProcessSnapshot::unattributed(40, 60)].into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        state.page = Page::Processes;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now());
+            })
+            .unwrap();
+
+        assert_unattributed_style(&terminal);
+    }
+
+    #[test]
     fn overview_page_renders_from_snapshot() {
         let snapshot = TrafficSnapshot {
             in_bytes: 1024,
             out_bytes: 2048,
-            processes: vec![ProcessSnapshot {
-                pid: 7,
-                name: Some(Arc::from("curl --silent")),
-                recv: 1024,
-                sent: 2048,
-            }]
+            processes: vec![ProcessSnapshot::attributed(
+                7,
+                Some(Arc::from("curl --silent")),
+                1024,
+                2048,
+            )]
             .into(),
             inbound_ips: vec![IpSnapshot {
                 ip: "192.0.2.10".parse().unwrap(),
@@ -758,6 +813,24 @@ mod tests {
         assert!(rendered.contains("192.0.2.10"));
         assert!(rendered.contains("198.51.100.20"));
         assert!(rendered.contains("Top Processes"));
+    }
+
+    #[test]
+    fn overview_uses_special_style_for_unattributed_traffic() {
+        let snapshot = TrafficSnapshot {
+            processes: vec![ProcessSnapshot::unattributed(40, 60)].into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now());
+            })
+            .unwrap();
+
+        assert_unattributed_style(&terminal);
     }
 
     #[test]

@@ -11,8 +11,6 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 
 use capture::CaptureSource;
-use stats::Direction;
-
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_TOP_N: u64 = 10;
 const DEFAULT_PROC_REFRESH: u64 = 2;
@@ -151,18 +149,15 @@ fn drain(
     loop {
         match source.next() {
             Ok(Some(flow)) => {
-                match flow.direction {
-                    Direction::Inbound => stats.add_in(flow.peer, flow.bytes),
-                    Direction::Outbound => stats.add_out(flow.peer, flow.bytes),
-                }
-                if let Some((ip, port)) = flow.local_socket {
-                    if let Ok(table) = proc_table.read() {
-                        if let Some(pid) = table.lookup(ip, port) {
-                            let name = table.names.get(&pid).cloned();
-                            stats.add_proc(pid, name, flow.direction, flow.bytes);
-                        }
-                    }
-                }
+                let process = flow.local_socket.and_then(|(ip, port)| {
+                    let table = proc_table.read().ok()?;
+                    let pid = table.lookup(ip, port)?;
+                    Some(stats::ObservedProcess {
+                        pid,
+                        name: table.names.get(&pid).cloned(),
+                    })
+                });
+                stats.record_flow(flow, process);
             }
             Ok(None) => break,
             Err(e) => {
