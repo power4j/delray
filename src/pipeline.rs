@@ -271,8 +271,7 @@ mod tests {
     use super::*;
     use crate::capture::Flow;
     use crate::proc_table::ProcTable;
-    use crate::stats::Direction;
-    use crate::stats::TrafficSnapshot;
+    use crate::stats::{Direction, Stats, TrafficSnapshot};
 
     #[test]
     fn try_latest_returns_newest_queued_snapshot() {
@@ -470,6 +469,76 @@ mod tests {
     }
 
     #[test]
+    fn missing_and_ambiguous_candidates_are_unattributed() {
+        let local_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let mut table = ProcTable::default();
+        table.insert_for_test(
+            local_ip,
+            443,
+            crate::capture::TransportProtocol::Tcp,
+            7,
+            Arc::from("server-a"),
+        );
+        table.insert_for_test(
+            local_ip,
+            443,
+            crate::capture::TransportProtocol::Tcp,
+            8,
+            Arc::from("server-b"),
+        );
+        let proc_table = Arc::new(RwLock::new(table));
+        let mut stats = Stats::default();
+
+        for flow in [
+            socket_flow(local_ip, 443, 40),
+            socket_flow(local_ip, 80, 60),
+        ] {
+            let process = resolve_process(&flow, &proc_table);
+            stats.record_flow(flow, process);
+        }
+
+        let snapshot = stats.snapshot(10);
+        assert_eq!(snapshot.processes.len(), 1);
+        assert!(snapshot.processes[0].is_unattributed());
+        assert_eq!(snapshot.processes[0].sent, 100);
+    }
+
+    #[test]
+    fn recovered_resolution_does_not_reassign_historical_traffic() {
+        let local_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let proc_table = Arc::new(RwLock::new(ProcTable::default()));
+        let mut stats = Stats::default();
+        let unresolved = socket_flow(local_ip, 443, 40);
+        let process = resolve_process(&unresolved, &proc_table);
+        stats.record_flow(unresolved, process);
+
+        proc_table.write().unwrap().insert_for_test(
+            local_ip,
+            443,
+            crate::capture::TransportProtocol::Tcp,
+            7,
+            Arc::from("curl"),
+        );
+        let resolved = socket_flow(local_ip, 443, 60);
+        let process = resolve_process(&resolved, &proc_table);
+        stats.record_flow(resolved, process);
+
+        let snapshot = stats.snapshot(10);
+        let unattributed = snapshot
+            .processes
+            .iter()
+            .find(|process| process.is_unattributed())
+            .unwrap();
+        let attributed = snapshot
+            .processes
+            .iter()
+            .find(|process| process.pid() == Some(7))
+            .unwrap();
+        assert_eq!(unattributed.sent, 40);
+        assert_eq!(attributed.sent, 60);
+    }
+
+    #[test]
     fn spawn_makes_initial_snapshot_available_immediately() {
         let proc_table = Arc::new(RwLock::new(ProcTable::default()));
         let pipeline = TrafficPipeline::spawn_with_next(
@@ -534,6 +603,19 @@ mod tests {
             peer: IpAddr::V4(Ipv4Addr::LOCALHOST),
             bytes,
             local_socket: None,
+        }
+    }
+
+    fn socket_flow(local_ip: IpAddr, port: u16, bytes: u64) -> Flow {
+        Flow {
+            direction: Direction::Outbound,
+            peer: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5)),
+            bytes,
+            local_socket: Some(crate::capture::LocalSocket {
+                ip: local_ip,
+                port,
+                protocol: crate::capture::TransportProtocol::Tcp,
+            }),
         }
     }
 }
