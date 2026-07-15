@@ -124,16 +124,16 @@ impl AppState {
         let Some(detail) = self.process_detail.as_mut() else {
             return;
         };
-        if !snapshot.process_data_fresh {
-            detail.pause(TrackingPause::Stale);
-            return;
-        }
-        if let Some(process) = snapshot
+        let matching_process = snapshot
             .processes
             .iter()
-            .find(|process| process.same_identity_as(&detail.process))
-        {
+            .find(|process| process.same_identity_as(&detail.process));
+        if let Some(process) = matching_process {
             detail.process = process.clone();
+        }
+        if !snapshot.process_data_fresh {
+            detail.pause(TrackingPause::Stale);
+        } else if matching_process.is_some() {
             detail.paused = None;
             detail.pause_notice = None;
         } else {
@@ -1549,9 +1549,17 @@ mod tests {
 
         let detail = state.process_detail.as_ref().unwrap();
         assert_eq!(detail.paused, Some(TrackingPause::Stale));
-        assert_eq!((detail.process.recv, detail.process.sent), (40, 60));
+        assert_eq!((detail.process.recv, detail.process.sent), (140, 160));
+        assert_eq!(
+            detail.process.last_seen(),
+            "2026-07-15T08:01:00Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap()
+        );
         let rendered = rendered_lines(&terminal).join("\n");
         assert!(rendered.contains("Tracking paused: process data is stale."));
+        assert!(rendered.contains("Total: 300 B"));
+        assert!(rendered.contains("Last seen: 1m ago"));
         assert!(!rendered.contains("exited"));
     }
 
