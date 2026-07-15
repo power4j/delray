@@ -451,8 +451,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(snapshot.processes.len(), 1);
-        assert_eq!(snapshot.processes[0].pid, 7);
-        assert_eq!(snapshot.processes[0].name.as_deref(), Some("curl --silent"));
+        assert_eq!(snapshot.processes[0].pid(), Some(7));
+        assert_eq!(snapshot.processes[0].name(), Some("curl --silent"));
         assert_eq!(snapshot.processes[0].sent, 120);
         stop.store(true, Ordering::Release);
         drop(flow_tx);
