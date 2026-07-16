@@ -19,14 +19,15 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 
-use crate::pipeline::TrafficPipeline;
+use crate::capture::InterfaceInfo;
 use crate::report::{fmt_elapsed, hostname, human_bytes, truncate};
+use crate::session::{Activation, TrafficSession};
 use crate::stats::{IpSnapshot, ProcessSnapshot, TrafficSnapshot};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Which page is active.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Page {
     Overview,
     Processes,
@@ -54,7 +55,7 @@ enum IpFocus {
     Outbound,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KeyOutcome {
     Quit,
     Changed,
@@ -118,6 +119,13 @@ struct ProcessDetail {
     pause_notice: Option<TrackingPause>,
 }
 
+struct InterfaceSelector {
+    selected: usize,
+    can_cancel: bool,
+    activating: Option<String>,
+    error: Option<String>,
+}
+
 impl ProcessDetail {
     fn pause(&mut self, reason: TrackingPause) {
         if self.paused != Some(reason) {
@@ -139,6 +147,7 @@ struct AppState {
     proc_view_height: usize,
     ip_in_view_height: usize,
     ip_out_view_height: usize,
+    interface_selector: Option<InterfaceSelector>,
 }
 
 impl AppState {
@@ -153,7 +162,40 @@ impl AppState {
             proc_view_height: 1,
             ip_in_view_height: 1,
             ip_out_view_height: 1,
+            interface_selector: None,
         }
+    }
+
+    fn startup(interfaces: &[InterfaceInfo]) -> Self {
+        let mut state = Self::new();
+        state.open_interface_selector(interfaces, None, false);
+        state
+    }
+
+    fn open_interface_selector(
+        &mut self,
+        interfaces: &[InterfaceInfo],
+        active: Option<&str>,
+        can_cancel: bool,
+    ) {
+        let selected = active
+            .and_then(|active| {
+                interfaces
+                    .iter()
+                    .position(|interface| interface.name == active)
+            })
+            .or_else(|| {
+                interfaces
+                    .iter()
+                    .position(|interface| interface.is_default_route)
+            })
+            .unwrap_or(0);
+        self.interface_selector = Some(InterfaceSelector {
+            selected,
+            can_cancel,
+            activating: None,
+            error: None,
+        });
     }
 
     fn update_process_detail(&mut self, snapshot: &TrafficSnapshot) {
@@ -178,11 +220,104 @@ impl AppState {
     }
 }
 
+fn handle_tui_key<F>(
+    state: &mut AppState,
+    key: KeyEvent,
+    snapshot: &mut Arc<TrafficSnapshot>,
+    interfaces: &[InterfaceInfo],
+    active: Option<&str>,
+    mut activate: F,
+) -> KeyOutcome
+where
+    F: FnMut(&str) -> anyhow::Result<Activation>,
+{
+    if matches!(key.code, KeyCode::Char('q'))
+        || matches!(key.code, KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL))
+    {
+        return KeyOutcome::Quit;
+    }
+
+    if let Some(selector) = state.interface_selector.as_mut() {
+        if selector.activating.is_some() {
+            return KeyOutcome::Ignored;
+        }
+        match key.code {
+            KeyCode::Esc if selector.can_cancel => {
+                state.interface_selector = None;
+                KeyOutcome::Changed
+            }
+            KeyCode::Esc => KeyOutcome::Ignored,
+            KeyCode::Down | KeyCode::Char('j') => {
+                selector.selected = (selector.selected + 1).min(interfaces.len().saturating_sub(1));
+                selector.error = None;
+                KeyOutcome::Changed
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                selector.selected = selector.selected.saturating_sub(1);
+                selector.error = None;
+                KeyOutcome::Changed
+            }
+            KeyCode::Enter => {
+                let Some(interface) = interfaces.get(selector.selected) else {
+                    return KeyOutcome::Ignored;
+                };
+                let interface_name = interface.name.clone();
+                match activate(&interface_name) {
+                    Ok(Activation::Activated) => {
+                        *state = AppState::new();
+                        *snapshot = Arc::new(TrafficSnapshot::default());
+                    }
+                    Ok(Activation::Pending) => {
+                        selector.activating = Some(interface_name);
+                    }
+                    Ok(Activation::Unchanged) => state.interface_selector = None,
+                    Err(error) => {
+                        selector.error =
+                            Some(format!("Failed to activate {interface_name}: {error}"));
+                    }
+                }
+                KeyOutcome::Changed
+            }
+            _ => KeyOutcome::Ignored,
+        }
+    } else if key.code == KeyCode::Char('i') {
+        state.open_interface_selector(interfaces, active, true);
+        KeyOutcome::Changed
+    } else {
+        handle_key(state, key, snapshot)
+    }
+}
+
+fn finish_tui_activation(
+    state: &mut AppState,
+    snapshot: &mut Arc<TrafficSnapshot>,
+    result: anyhow::Result<Activation>,
+) {
+    let interface = state
+        .interface_selector
+        .as_mut()
+        .and_then(|selector| selector.activating.take())
+        .unwrap_or_else(|| "interface".to_string());
+    match result {
+        Ok(Activation::Activated) => {
+            *state = AppState::new();
+            *snapshot = Arc::new(TrafficSnapshot::default());
+        }
+        Ok(Activation::Unchanged) => state.interface_selector = None,
+        Ok(Activation::Pending) => {}
+        Err(error) => {
+            if let Some(selector) = state.interface_selector.as_mut() {
+                selector.error = Some(format!("Failed to activate {interface}: {error}"));
+            }
+        }
+    }
+}
+
 /// Run the TUI until the user quits.
-pub fn run(interface: &str, pipeline: &TrafficPipeline) -> io::Result<()> {
+pub fn run(session: &mut TrafficSession) -> io::Result<()> {
     let started_at = Instant::now();
     let host = hostname();
-    let mut snapshot = pipeline
+    let mut snapshot = session
         .try_latest()
         .map_err(io::Error::other)?
         .unwrap_or_else(|| Arc::new(TrafficSnapshot::default()));
@@ -193,15 +328,18 @@ pub fn run(interface: &str, pipeline: &TrafficPipeline) -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut state = AppState::new();
+    let mut state = if session.active_interface().is_some() {
+        AppState::new()
+    } else {
+        AppState::startup(session.interfaces())
+    };
     let result = tui_loop(
         &mut terminal,
         &mut state,
         &mut snapshot,
-        interface,
         &host,
         started_at,
-        pipeline,
+        session,
     );
 
     // Restore terminal regardless of how the event loop exited.
@@ -216,40 +354,91 @@ fn tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut AppState,
     snapshot: &mut Arc<TrafficSnapshot>,
-    interface: &str,
     host: &str,
     started_at: Instant,
-    pipeline: &TrafficPipeline,
+    session: &mut TrafficSession,
 ) -> io::Result<()> {
-    terminal.draw(|f| draw(f, state, snapshot, interface, host, started_at))?;
+    terminal.draw(|f| {
+        draw_with_interfaces(
+            f,
+            state,
+            snapshot,
+            session.active_interface(),
+            session.interfaces(),
+            host,
+            started_at,
+        )
+    })?;
 
     loop {
-        let key = if event::poll(EVENT_POLL_INTERVAL)? {
-            match event::read()? {
-                Event::Key(key) => Some(key),
-                _ => None,
-            }
+        let event = if event::poll(EVENT_POLL_INTERVAL)? {
+            Some(event::read()?)
         } else {
             None
         };
 
-        let quit = process_iteration(
-            state,
-            snapshot,
-            key,
-            |state, snapshot| {
-                terminal
-                    .draw(|f| draw(f, state, snapshot, interface, host, started_at))
-                    .map(|_| ())
-            },
-            || pipeline.try_latest().map_err(io::Error::other),
-        )?;
-        if quit {
-            return Ok(());
+        let mut changed = event.as_ref().is_some_and(event_requires_redraw);
+        if let Some(Event::Key(key)) = event {
+            let interfaces = session.interfaces().to_vec();
+            let active = session.active_interface().map(str::to_string);
+            match handle_tui_key(
+                state,
+                key,
+                snapshot,
+                &interfaces,
+                active.as_deref(),
+                |name| session.begin_activate(name),
+            ) {
+                KeyOutcome::Quit => return Ok(()),
+                KeyOutcome::Changed => changed = true,
+                KeyOutcome::Ignored => {}
+            }
+        }
+
+        if let Some(result) = session.poll_activation() {
+            finish_tui_activation(state, snapshot, result);
+            changed = true;
+        }
+
+        if let Some(result) = session.poll_capture_readiness()
+            && let Err(error) = result
+        {
+            state.open_interface_selector(session.interfaces(), session.active_interface(), true);
+            if let Some(selector) = state.interface_selector.as_mut() {
+                selector.error = Some(format!(
+                    "Capture failed; restored the previous interface: {error}"
+                ));
+            }
+            changed = true;
+        }
+
+        if let Some(latest) = session.try_latest().map_err(io::Error::other)? {
+            *snapshot = latest;
+            state.update_process_detail(snapshot);
+            changed = true;
+        }
+
+        if changed {
+            terminal.draw(|f| {
+                draw_with_interfaces(
+                    f,
+                    state,
+                    snapshot,
+                    session.active_interface(),
+                    session.interfaces(),
+                    host,
+                    started_at,
+                )
+            })?;
         }
     }
 }
 
+fn event_requires_redraw(event: &Event) -> bool {
+    matches!(event, Event::Resize(_, _))
+}
+
+#[cfg(test)]
 fn process_iteration<D, L, E>(
     state: &mut AppState,
     snapshot: &mut Arc<TrafficSnapshot>,
@@ -439,6 +628,7 @@ fn scroll_to_bottom(state: &mut AppState, snapshot: &TrafficSnapshot) {
 
 // ── drawing ──
 
+#[cfg(test)]
 fn draw(
     f: &mut ratatui::Frame,
     state: &mut AppState,
@@ -447,22 +637,59 @@ fn draw(
     host: &str,
     started_at: Instant,
 ) {
-    draw_at(
+    draw_with_interfaces(f, state, snapshot, Some(interface), &[], host, started_at);
+}
+
+fn draw_with_interfaces(
+    f: &mut ratatui::Frame,
+    state: &mut AppState,
+    snapshot: &TrafficSnapshot,
+    interface: Option<&str>,
+    interfaces: &[InterfaceInfo],
+    host: &str,
+    started_at: Instant,
+) {
+    draw_with_interfaces_at(
         f,
         state,
         snapshot,
         interface,
+        interfaces,
         host,
         started_at,
         chrono::Utc::now(),
     );
 }
 
+#[cfg(test)]
 fn draw_at(
     f: &mut ratatui::Frame,
     state: &mut AppState,
     snapshot: &TrafficSnapshot,
     interface: &str,
+    host: &str,
+    started_at: Instant,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    draw_with_interfaces_at(
+        f,
+        state,
+        snapshot,
+        Some(interface),
+        &[],
+        host,
+        started_at,
+        now,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_with_interfaces_at(
+    f: &mut ratatui::Frame,
+    state: &mut AppState,
+    snapshot: &TrafficSnapshot,
+    interface: Option<&str>,
+    interfaces: &[InterfaceInfo],
     host: &str,
     started_at: Instant,
     now: chrono::DateTime<chrono::Utc>,
@@ -478,6 +705,11 @@ fn draw_at(
         return;
     }
 
+    if let Some(selector) = state.interface_selector.as_ref() {
+        draw_interface_selector(f, area, selector, interfaces, interface);
+        return;
+    }
+
     let mode = LayoutMode::from_area(area);
     let chunks = Layout::default()
         .direction(LayoutDir::Vertical)
@@ -488,7 +720,15 @@ fn draw_at(
         ])
         .split(area);
 
-    draw_header(f, chunks[0], state.page, interface, host, started_at, mode);
+    draw_header(
+        f,
+        chunks[0],
+        state.page,
+        interface.unwrap_or("No interface"),
+        host,
+        started_at,
+        mode,
+    );
     let body = chunks[1].inner(Margin {
         horizontal: 1,
         vertical: 1,
@@ -503,6 +743,142 @@ fn draw_at(
         Page::About => draw_about(f, body),
     }
     draw_status_bar(f, chunks[2], state, mode);
+}
+
+fn draw_interface_selector(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    selector: &InterfaceSelector,
+    interfaces: &[InterfaceInfo],
+    active: Option<&str>,
+) {
+    let content = area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let chunks = Layout::default()
+        .direction(LayoutDir::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(4),
+            Constraint::Length(2),
+        ])
+        .split(content);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " delray ",
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Select an interface",
+                Style::default()
+                    .fg(COLOR_STRONG)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        chunks[0],
+    );
+
+    let compact = area.width < 100;
+    let rows = if interfaces.is_empty() {
+        vec![
+            Row::new(vec![Cell::from(""), Cell::from("No interfaces available")])
+                .style(Style::default().fg(COLOR_MUTED)),
+        ]
+    } else {
+        interfaces
+            .iter()
+            .enumerate()
+            .map(|(index, interface)| {
+                let mut markers = Vec::new();
+                if active == Some(interface.name.as_str()) {
+                    markers.push("current");
+                }
+                if interface.is_default_route {
+                    markers.push("default route");
+                }
+                let marker = if markers.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{}]", markers.join(", "))
+                };
+                if compact {
+                    Row::new(vec![
+                        Cell::from(format!("{}.", index + 1)),
+                        Cell::from(format!(
+                            "{}\n{}  {}",
+                            interface.name, interface.description, marker
+                        )),
+                    ])
+                    .height(2)
+                } else {
+                    Row::new(vec![
+                        Cell::from(format!("{}.", index + 1)),
+                        Cell::from(interface.name.clone()),
+                        Cell::from(interface.description.clone()),
+                        Cell::from(marker),
+                    ])
+                }
+            })
+            .collect()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_VIOLET_BORDER));
+    let table = if compact {
+        Table::new(rows, [Constraint::Length(3), Constraint::Min(1)])
+    } else {
+        Table::new(
+            rows,
+            [
+                Constraint::Length(3),
+                Constraint::Min(50),
+                Constraint::Min(18),
+                Constraint::Length(24),
+            ],
+        )
+    }
+    .column_spacing(1)
+    .block(block)
+    .row_highlight_style(
+        Style::default()
+            .fg(COLOR_STRONG)
+            .bg(COLOR_SELECTION)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("> ");
+    f.render_stateful_widget(
+        table,
+        chunks[1],
+        &mut ratatui_state(interfaces.len(), selector.selected),
+    );
+
+    let activation_hint = selector
+        .activating
+        .as_ref()
+        .map(|interface| format!("Activating {interface}...  q:quit"));
+    let hint = selector
+        .error
+        .as_deref()
+        .or(activation_hint.as_deref())
+        .unwrap_or(if selector.can_cancel {
+            "j/k:select  Enter:activate  Esc:cancel  q:quit"
+        } else {
+            "j/k:select  Enter:activate  q:quit"
+        });
+    f.render_widget(
+        Paragraph::new(hint)
+            .style(Style::default().fg(if selector.error.is_some() {
+                COLOR_CORAL
+            } else {
+                COLOR_MUTED
+            }))
+            .wrap(Wrap { trim: true }),
+        chunks[2],
+    );
 }
 
 fn draw_too_small(f: &mut ratatui::Frame, area: Rect) {
@@ -1239,6 +1615,7 @@ fn draw_status_bar(f: &mut ratatui::Frame, area: Rect, state: &mut AppState, mod
     }
 
     let mut spans = Vec::new();
+    push_hint(&mut spans, "i", "interface");
     push_hint(&mut spans, "1-4", "page");
     push_hint(&mut spans, "h/l", "switch");
     if state.page == Page::Ips {
@@ -1314,6 +1691,328 @@ mod tests {
 
     use super::*;
     use crate::stats::{IpSnapshot, ProcessSnapshot, TrafficSnapshot};
+
+    fn interfaces() -> Vec<crate::capture::InterfaceInfo> {
+        vec![
+            crate::capture::InterfaceInfo {
+                name: "eth0".to_string(),
+                description: "Wired Ethernet".to_string(),
+                is_default_route: true,
+            },
+            crate::capture::InterfaceInfo {
+                name: "wlan0".to_string(),
+                description: "Wireless Adapter".to_string(),
+                is_default_route: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn startup_selector_renders_structured_interfaces_and_cannot_cancel() {
+        let interfaces = interfaces();
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::startup(&interfaces);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_with_interfaces(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    None,
+                    &interfaces,
+                    "host",
+                    Instant::now(),
+                );
+            })
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("Select an interface"));
+        assert!(rendered.contains("eth0"));
+        assert!(rendered.contains("Wired Ethernet"));
+        assert!(rendered.contains("default route"));
+        assert_eq!(
+            handle_tui_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &mut Arc::new(TrafficSnapshot::default()),
+                &interfaces,
+                None,
+                |_| unreachable!(),
+            ),
+            KeyOutcome::Ignored
+        );
+        assert!(state.interface_selector.is_some());
+        assert_eq!(
+            handle_tui_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                &mut Arc::new(TrafficSnapshot::default()),
+                &interfaces,
+                None,
+                |_| unreachable!(),
+            ),
+            KeyOutcome::Quit
+        );
+    }
+
+    #[test]
+    fn active_interface_selector_cancels_and_successful_switch_resets_view() {
+        let interfaces = interfaces();
+        let mut state = AppState::new();
+        state.page = Page::About;
+        let mut snapshot = Arc::new(TrafficSnapshot {
+            in_bytes: 99,
+            ..TrafficSnapshot::default()
+        });
+
+        assert_eq!(
+            handle_tui_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+                &mut snapshot,
+                &interfaces,
+                Some("eth0"),
+                |_| unreachable!(),
+            ),
+            KeyOutcome::Changed
+        );
+        assert_eq!(
+            handle_tui_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &mut snapshot,
+                &interfaces,
+                Some("eth0"),
+                |_| unreachable!(),
+            ),
+            KeyOutcome::Changed
+        );
+        assert!(state.interface_selector.is_none());
+
+        handle_tui_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+            &mut snapshot,
+            &interfaces,
+            Some("eth0"),
+            |_| unreachable!(),
+        );
+        handle_tui_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut snapshot,
+            &interfaces,
+            Some("eth0"),
+            |_| unreachable!(),
+        );
+        let outcome = handle_tui_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut snapshot,
+            &interfaces,
+            Some("eth0"),
+            |_| Ok(crate::session::Activation::Activated),
+        );
+
+        assert_eq!(outcome, KeyOutcome::Changed);
+        assert_eq!(state.page, Page::Overview);
+        assert!(state.interface_selector.is_none());
+        assert_eq!(snapshot.in_bytes, 0);
+    }
+
+    #[test]
+    fn selector_error_keeps_current_view_and_traffic() {
+        let interfaces = interfaces();
+        let mut state = AppState::new();
+        state.page = Page::About;
+        let mut snapshot = Arc::new(TrafficSnapshot {
+            in_bytes: 99,
+            ..TrafficSnapshot::default()
+        });
+        handle_tui_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+            &mut snapshot,
+            &interfaces,
+            Some("eth0"),
+            |_| unreachable!(),
+        );
+        handle_tui_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut snapshot,
+            &interfaces,
+            Some("eth0"),
+            |_| unreachable!(),
+        );
+
+        handle_tui_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut snapshot,
+            &interfaces,
+            Some("eth0"),
+            |_| Err(anyhow::anyhow!("permission denied")),
+        );
+
+        assert_eq!(state.page, Page::About);
+        assert_eq!(snapshot.in_bytes, 99);
+        assert_eq!(
+            state.interface_selector.as_ref().unwrap().error.as_deref(),
+            Some("Failed to activate wlan0: permission denied")
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_with_interfaces(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    Some("eth0"),
+                    &interfaces,
+                    "host",
+                    Instant::now(),
+                );
+            })
+            .unwrap();
+        assert!(
+            rendered_lines(&terminal)
+                .join("\n")
+                .contains("Failed to activate wlan0: permission denied")
+        );
+    }
+
+    #[test]
+    fn pending_interface_activation_keeps_the_tui_responsive_until_completion() {
+        let interfaces = interfaces();
+        let mut state = AppState::new();
+        state.page = Page::About;
+        let mut snapshot = Arc::new(TrafficSnapshot {
+            in_bytes: 99,
+            ..TrafficSnapshot::default()
+        });
+        handle_tui_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+            &mut snapshot,
+            &interfaces,
+            Some("eth0"),
+            |_| unreachable!(),
+        );
+        handle_tui_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut snapshot,
+            &interfaces,
+            Some("eth0"),
+            |_| unreachable!(),
+        );
+
+        let outcome = handle_tui_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut snapshot,
+            &interfaces,
+            Some("eth0"),
+            |_| Ok(Activation::Pending),
+        );
+
+        assert_eq!(outcome, KeyOutcome::Changed);
+        assert_eq!(state.page, Page::About);
+        assert_eq!(snapshot.in_bytes, 99);
+        assert_eq!(
+            state
+                .interface_selector
+                .as_ref()
+                .unwrap()
+                .activating
+                .as_deref(),
+            Some("wlan0")
+        );
+        assert_eq!(
+            handle_tui_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                &mut snapshot,
+                &interfaces,
+                Some("eth0"),
+                |_| unreachable!(),
+            ),
+            KeyOutcome::Quit
+        );
+
+        finish_tui_activation(&mut state, &mut snapshot, Ok(Activation::Activated));
+
+        assert_eq!(state.page, Page::Overview);
+        assert!(state.interface_selector.is_none());
+        assert_eq!(snapshot.in_bytes, 0);
+    }
+
+    #[test]
+    fn interface_selector_is_usable_at_compact_minimum_size() {
+        let interfaces = interfaces();
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::startup(&interfaces);
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_with_interfaces(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    None,
+                    &interfaces,
+                    "host",
+                    Instant::now(),
+                );
+            })
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("Select an interface"));
+        assert!(rendered.contains("eth0"));
+        assert!(rendered.contains("Wired Ethernet"));
+        assert!(rendered.contains("Enter:activate"));
+    }
+
+    #[test]
+    fn compact_selector_keeps_a_long_pcap_name_visible() {
+        let pcap_name = r"\Device\NPF_{12345678-1234-1234-1234-123456789ABC}";
+        let interfaces = vec![crate::capture::InterfaceInfo {
+            name: pcap_name.to_string(),
+            description: "Npcap Adapter".to_string(),
+            is_default_route: false,
+        }];
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::startup(&interfaces);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_with_interfaces(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    None,
+                    &interfaces,
+                    "host",
+                    Instant::now(),
+                );
+            })
+            .unwrap();
+
+        assert!(rendered_lines(&terminal).join("\n").contains(pcap_name));
+    }
+
+    #[test]
+    fn resize_event_requests_a_redraw() {
+        assert!(event_requires_redraw(&Event::Resize(80, 24)));
+        assert!(!event_requires_redraw(&Event::FocusGained));
+    }
 
     fn rendered_lines(terminal: &Terminal<TestBackend>) -> Vec<String> {
         let buffer = terminal.backend().buffer();

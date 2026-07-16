@@ -2,6 +2,7 @@ mod capture;
 mod pipeline;
 mod proc_table;
 mod report;
+mod session;
 mod stats;
 mod tui;
 
@@ -15,22 +16,67 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_TOP_N: u64 = 10;
 const DEFAULT_PROC_REFRESH: u64 = 2;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DispatchMode {
+    InteractiveSelector,
+    ExplicitInterface,
+    MissingInterface,
+}
+
+fn dispatch_mode(cli: &Cli) -> DispatchMode {
+    if cli.interface.is_some() {
+        DispatchMode::ExplicitInterface
+    } else if cli.output.is_none() && cli.format == "plain" {
+        DispatchMode::InteractiveSelector
+    } else {
+        DispatchMode::MissingInterface
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let Some(interface_selector) = cli.interface else {
-        return match capture::list_interfaces() {
-            Ok(()) => ExitCode::SUCCESS,
+    if dispatch_mode(&cli) == DispatchMode::MissingInterface {
+        eprintln!("An explicit interface is required for JSON or background file output.");
+        if let Err(error) = capture::list_interfaces() {
+            eprintln!("Failed to enumerate interfaces: {error}");
+        }
+        return ExitCode::FAILURE;
+    }
+
+    let proc_table = proc_table::spawn(Duration::from_secs(cli.proc_refresh));
+    let top_n = cli.top_n as usize;
+    let is_json = cli.format == "json";
+
+    if cli.output.is_none() && !is_json {
+        let mut session = match session::TrafficSession::discover(proc_table, top_n) {
+            Ok(session) => session,
             Err(error) => {
                 eprintln!("Failed to enumerate interfaces: {error}");
-                ExitCode::FAILURE
+                return ExitCode::FAILURE;
             }
         };
-    };
+        if let Some(selector) = cli.interface.as_deref()
+            && let Err(error) = session.activate(selector)
+        {
+            eprintln!("Failed to open interface: {error}");
+            return ExitCode::FAILURE;
+        }
+        if let Err(error) = tui::run(&mut session) {
+            eprintln!("TUI error: {error}");
+            return ExitCode::FAILURE;
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let interface_selector = cli
+        .interface
+        .as_deref()
+        .expect("dispatch requires interface");
 
     let started_wall = chrono::Local::now();
     let started_at = Instant::now();
-    let mut source = match CaptureSource::open(&interface_selector) {
+    let mut source = match CaptureSource::open(interface_selector) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to open interface: {e}");
@@ -38,11 +84,6 @@ fn main() -> ExitCode {
         }
     };
     let interface = source.interface_name().to_string();
-
-    let proc_table = proc_table::spawn(Duration::from_secs(cli.proc_refresh));
-
-    let top_n = cli.top_n as usize;
-    let is_json = cli.format == "json";
 
     match &cli.output {
         Some(path) => {
@@ -74,20 +115,6 @@ fn main() -> ExitCode {
                     started_at,
                     top_n,
                 );
-            } else {
-                // Plain foreground = interactive TUI.
-                let pipeline =
-                    match pipeline::TrafficPipeline::spawn(source, proc_table.clone(), top_n) {
-                        Ok(pipeline) => pipeline,
-                        Err(e) => {
-                            eprintln!("Failed to start traffic pipeline: {e}");
-                            return ExitCode::FAILURE;
-                        }
-                    };
-                if let Err(e) = tui::run(&interface, &pipeline) {
-                    eprintln!("TUI error: {e}");
-                    return ExitCode::FAILURE;
-                }
             }
         }
     }
@@ -178,7 +205,7 @@ fn process_next<N, E>(
 #[derive(Parser)]
 #[command(name = "delray", version, about = "Network traffic analyzer")]
 struct Cli {
-    /// Network interface to capture on (omit to list available interfaces)
+    /// Network interface to capture on (omit to select interactively in plain foreground mode)
     interface: Option<String>,
     /// Process table refresh interval in seconds (must be > 0)
     #[arg(long, default_value_t = DEFAULT_PROC_REFRESH, value_parser = positive_u64)]
@@ -271,6 +298,17 @@ mod cli_tests {
     fn interface_optional() {
         let cli = Cli::try_parse_from(["delray"]).unwrap();
         assert!(cli.interface.is_none());
+    }
+
+    #[test]
+    fn missing_interface_starts_selector_only_for_plain_foreground_mode() {
+        let plain = Cli::try_parse_from(["delray"]).unwrap();
+        let json = Cli::try_parse_from(["delray", "--format", "json"]).unwrap();
+        let file = Cli::try_parse_from(["delray", "--output", "traffic.txt"]).unwrap();
+
+        assert_eq!(dispatch_mode(&plain), DispatchMode::InteractiveSelector);
+        assert_eq!(dispatch_mode(&json), DispatchMode::MissingInterface);
+        assert_eq!(dispatch_mode(&file), DispatchMode::MissingInterface);
     }
 
     #[test]

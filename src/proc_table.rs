@@ -32,6 +32,7 @@ struct ListenerRecord {
 }
 
 pub type SharedProcTable = Arc<RwLock<ProcTable>>;
+type ThreadTask = Box<dyn FnOnce() + Send + 'static>;
 
 impl ProcTable {
     pub(crate) fn is_fresh(&self) -> bool {
@@ -166,28 +167,64 @@ fn executable_name(path: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
-/// Start rebuilding the process table on a background thread.
+/// Build the initial process table synchronously, then refresh it in the background.
 pub fn spawn(refresh: Duration) -> SharedProcTable {
+    spawn_using(
+        refresh,
+        query,
+        |duration| {
+            thread::sleep(duration);
+            true
+        },
+        |task| {
+            thread::spawn(task);
+        },
+    )
+}
+
+fn spawn_using<Q, W, S>(
+    refresh: Duration,
+    mut query: Q,
+    mut wait: W,
+    spawn_thread: S,
+) -> SharedProcTable
+where
+    Q: FnMut() -> Result<Vec<ListenerRecord>, String> + Send + 'static,
+    W: FnMut(Duration) -> bool + Send + 'static,
+    S: FnOnce(ThreadTask),
+{
     let table: SharedProcTable = Arc::new(RwLock::new(ProcTable::default()));
+    refresh_table(&table, query(), refresh);
+
     let handle = table.clone();
-    thread::spawn(move || {
+    spawn_thread(Box::new(move || {
         loop {
+            if !wait(refresh) {
+                return;
+            }
             let result = query();
-            if let Err(error) = &result {
-                eprintln!("Failed to refresh process table: {error}");
-            }
-            match handle.write() {
-                Ok(mut table) => {
-                    let _ = table.refresh_at(result, Instant::now(), refresh);
-                }
-                Err(error) => {
-                    eprintln!("Failed to update process table: {error}");
-                }
-            }
-            thread::sleep(refresh);
+            refresh_table(&handle, result, refresh);
         }
-    });
+    }));
     table
+}
+
+fn refresh_table(
+    table: &SharedProcTable,
+    result: Result<Vec<ListenerRecord>, String>,
+    refresh: Duration,
+) {
+    if let Err(error) = &result {
+        eprintln!("Failed to refresh process table: {error}");
+    }
+    match table.write() {
+        Ok(mut table) => {
+            let _ = table.refresh_at(result, Instant::now(), refresh);
+        }
+        Err(error) => {
+            eprintln!("Failed to update process table: {error}");
+        }
+    }
 }
 
 fn query() -> Result<Vec<ListenerRecord>, String> {
@@ -199,6 +236,9 @@ fn query() -> Result<Vec<ListenerRecord>, String> {
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::sync_channel;
     use std::time::Instant;
 
     use super::*;
@@ -228,6 +268,99 @@ mod tests {
             _name: name.to_string(),
             path: path.to_string(),
         }
+    }
+
+    #[test]
+    fn initial_success_is_visible_when_startup_returns() {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let (task_tx, task_rx) = sync_channel(1);
+
+        let table = spawn_using(
+            Duration::from_secs(5),
+            move || {
+                Ok(vec![record(
+                    ip,
+                    443,
+                    TransportProtocol::Tcp,
+                    7,
+                    "/usr/bin/curl",
+                )])
+            },
+            |_| false,
+            move |task| task_tx.send(task).unwrap(),
+        );
+
+        assert_eq!(
+            table
+                .read()
+                .unwrap()
+                .lookup(ip, 443, TransportProtocol::Tcp)
+                .map(|process| process.pid),
+            Some(7)
+        );
+        drop(task_rx.recv().unwrap());
+    }
+
+    #[test]
+    fn startup_queries_once_before_the_first_refresh_interval() {
+        let queries = Arc::new(AtomicUsize::new(0));
+        let query_count = queries.clone();
+        let (task_tx, task_rx) = sync_channel(1);
+
+        let _table = spawn_using(
+            Duration::from_secs(5),
+            move || {
+                query_count.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            },
+            |_| false,
+            move |task| task_tx.send(task).unwrap(),
+        );
+        task_rx.recv().unwrap()();
+
+        assert_eq!(queries.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn initial_failure_allows_background_recovery() {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut results = vec![
+            Err("listeners unavailable".to_string()),
+            Ok(vec![record(
+                ip,
+                443,
+                TransportProtocol::Tcp,
+                7,
+                "/usr/bin/curl",
+            )]),
+        ]
+        .into_iter();
+        let mut first_wait = true;
+        let (task_tx, task_rx) = sync_channel(1);
+
+        let table = spawn_using(
+            Duration::from_secs(5),
+            move || results.next().expect("only two queries are expected"),
+            move |_| std::mem::replace(&mut first_wait, false),
+            move |task| task_tx.send(task).unwrap(),
+        );
+
+        {
+            let table = table.read().unwrap();
+            assert!(!table.is_fresh());
+            assert!(table.lookup(ip, 443, TransportProtocol::Tcp).is_none());
+        }
+
+        task_rx.recv().unwrap()();
+
+        let table = table.read().unwrap();
+        assert!(table.is_fresh());
+        assert_eq!(
+            table
+                .lookup(ip, 443, TransportProtocol::Tcp)
+                .map(|process| process.pid),
+            Some(7)
+        );
     }
 
     #[test]

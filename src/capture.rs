@@ -18,6 +18,13 @@ pub struct CaptureSource {
     local_ips: HashSet<IpAddr>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceInfo {
+    pub name: String,
+    pub description: String,
+    pub is_default_route: bool,
+}
+
 // rust-pcap exposes normalized LINKTYPE_RAW (101), while live Linux handles use DLT_RAW (12).
 const LINUX_DLT_RAW: pcap::Linktype = pcap::Linktype(12);
 
@@ -83,25 +90,43 @@ fn default_interface() -> Option<String> {
     None
 }
 
-/// Print available interfaces with the default-route interface highlighted.
-pub fn list_interfaces() -> Result<()> {
+/// Return available interfaces with the default-route interface highlighted.
+pub fn interface_catalog() -> Result<Vec<InterfaceInfo>> {
     let default = default_interface();
     let devices = Device::list()?;
-    print!("{}", format_interface_list(&devices, default.as_deref()));
+    Ok(interface_catalog_from_devices(devices, default.as_deref()))
+}
+
+fn interface_catalog_from_devices(
+    devices: Vec<Device>,
+    default: Option<&str>,
+) -> Vec<InterfaceInfo> {
+    devices
+        .into_iter()
+        .map(|device| InterfaceInfo {
+            is_default_route: default == Some(device.name.as_str()),
+            description: device.desc.unwrap_or_else(|| "No description".to_string()),
+            name: device.name,
+        })
+        .collect()
+}
+
+/// Print available interfaces with the default-route interface highlighted.
+pub fn list_interfaces() -> Result<()> {
+    print!("{}", format_interface_list(&interface_catalog()?));
     Ok(())
 }
 
-fn format_interface_list(devices: &[Device], default: Option<&str>) -> String {
+pub fn format_interface_list(interfaces: &[InterfaceInfo]) -> String {
     let mut output = String::from("Available interfaces:\n");
-    for (index, device) in devices.iter().enumerate() {
-        let description = device.desc.as_deref().unwrap_or("No description");
-        let marker = if default == Some(device.name.as_str()) {
+    for (index, interface) in interfaces.iter().enumerate() {
+        let marker = if interface.is_default_route {
             "  [default route]"
         } else {
             ""
         };
-        writeln!(output, "  {}. {description}{marker}", index + 1).unwrap();
-        writeln!(output, "     Name: {}", device.name).unwrap();
+        writeln!(output, "  {}. {}{marker}", index + 1, interface.description).unwrap();
+        writeln!(output, "     Name: {}", interface.name).unwrap();
     }
     output.push_str("\nUsage: delray <interface-or-number> [OPTIONS]\n");
     output.push_str("Run delray --help for full usage\n");
@@ -169,6 +194,10 @@ impl CaptureSource {
 
     pub fn interface_name(&self) -> &str {
         &self.interface_name
+    }
+
+    pub(crate) fn breakloop_handle(&mut self) -> pcap::BreakLoop {
+        self.cap.breakloop_handle()
     }
 
     /// 读取下一个包；无包（读超时）返回 Ok(None)。
@@ -366,10 +395,12 @@ fn ip_version_from_address_family(family: u32) -> Option<IpVersion> {
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
+    use std::sync::Arc;
 
     use pcap::{Address, DeviceFlags};
 
     use super::*;
+    use crate::stats::{ObservedProcess, Stats};
 
     struct ExpectedFlow {
         direction: Direction,
@@ -447,6 +478,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn parsed_packets_keep_network_direction_through_interface_and_process_stats() {
+        let local = [192, 0, 2, 10];
+        let inbound_peer = [198, 51, 100, 5];
+        let outbound_peer = [203, 0, 113, 9];
+        let inbound_transport = fixed_transport(TransportProtocol::Tcp, Direction::Inbound);
+        let outbound_transport = fixed_transport(TransportProtocol::Tcp, Direction::Outbound);
+        let inbound = add_link_header(
+            pcap::Linktype::ETHERNET,
+            IpVersion::V4,
+            ipv4_packet_between(
+                inbound_peer,
+                local,
+                ip_protocol(TransportProtocol::Tcp),
+                (20 + inbound_transport.len()) as u16,
+                &inbound_transport,
+            ),
+        );
+        let outbound = add_link_header(
+            pcap::Linktype::ETHERNET,
+            IpVersion::V4,
+            ipv4_packet_between(
+                local,
+                outbound_peer,
+                ip_protocol(TransportProtocol::Tcp),
+                (20 + outbound_transport.len()) as u16,
+                &outbound_transport,
+            ),
+        );
+        let local_ips = HashSet::from([IpAddr::V4(local.into())]);
+        let process = ObservedProcess {
+            pid: 7,
+            name: Some(Arc::from("wget")),
+            path: Some(Arc::from("/usr/bin/wget")),
+        };
+        let mut stats = Stats::default();
+
+        let inbound_flow = parse(pcap::Linktype::ETHERNET, &inbound, &local_ips)
+            .unwrap()
+            .unwrap();
+        let outbound_flow = parse(pcap::Linktype::ETHERNET, &outbound, &local_ips)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(inbound_flow.direction, Direction::Inbound));
+        assert!(matches!(outbound_flow.direction, Direction::Outbound));
+
+        let inbound_bytes = inbound_flow.bytes;
+        let outbound_bytes = outbound_flow.bytes;
+        stats.record_flow(inbound_flow, Some(process.clone()));
+        stats.record_flow(outbound_flow, Some(process));
+        let snapshot = stats.snapshot(10);
+        let wget = snapshot
+            .processes
+            .iter()
+            .find(|process| process.pid() == Some(7))
+            .unwrap();
+
+        assert_eq!(snapshot.in_bytes, inbound_bytes);
+        assert_eq!(snapshot.out_bytes, outbound_bytes);
+        assert_eq!(snapshot.inbound_ips[0].ip, IpAddr::V4(inbound_peer.into()));
+        assert_eq!(
+            snapshot.outbound_ips[0].ip,
+            IpAddr::V4(outbound_peer.into())
+        );
+        assert_eq!((wget.recv, wget.sent), (inbound_bytes, outbound_bytes));
     }
 
     #[test]
@@ -541,7 +639,8 @@ mod tests {
             device(r"\Device\NPF_{1234}", None),
         ];
 
-        let rendered = format_interface_list(&devices, Some("eth0"));
+        let rendered =
+            format_interface_list(&interface_catalog_from_devices(devices, Some("eth0")));
 
         assert_eq!(
             rendered,
@@ -555,6 +654,21 @@ mod tests {
                 "Run delray --help for full usage\n",
             )
         );
+    }
+
+    #[test]
+    fn interface_catalog_keeps_names_descriptions_and_default_marker() {
+        let catalog = interface_catalog_from_devices(
+            vec![device("eth0", Some("Wired Ethernet")), device("lo", None)],
+            Some("eth0"),
+        );
+
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog[0].name, "eth0");
+        assert_eq!(catalog[0].description, "Wired Ethernet");
+        assert!(catalog[0].is_default_route);
+        assert_eq!(catalog[1].description, "No description");
+        assert!(!catalog[1].is_default_route);
     }
 
     #[test]

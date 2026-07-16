@@ -14,8 +14,10 @@ const STOP_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
 const FLOW_CHANNEL_CAPACITY: usize = 8192;
 const SNAPSHOT_CHANNEL_CAPACITY: usize = 2;
+const CAPTURE_EARLY_FAILURE_WINDOW: Duration = Duration::from_millis(50);
 
 type ThreadTask = Box<dyn FnOnce() + Send + 'static>;
+type CaptureWakeup = Box<dyn Fn() + Send + Sync>;
 
 fn spawn_named_thread(name: &'static str, task: ThreadTask) -> io::Result<thread::JoinHandle<()>> {
     thread::Builder::new().name(name.to_string()).spawn(task)
@@ -25,6 +27,12 @@ fn spawn_named_thread(name: &'static str, task: ThreadTask) -> io::Result<thread
 pub enum PipelineError {
     Capture(String),
     WorkerStopped(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CaptureReadiness {
+    Ready,
+    Waiting,
 }
 
 impl fmt::Display for PipelineError {
@@ -45,20 +53,43 @@ fn capture_loop<N, E>(
     flow_tx: SyncSender<Flow>,
     stop: Arc<AtomicBool>,
     failure: Arc<OnceLock<PipelineError>>,
+    mut ready_tx: Option<SyncSender<Result<(), PipelineError>>>,
 ) where
     N: FnMut() -> Result<Option<Flow>, E>,
     E: fmt::Display,
 {
     while !stop.load(Ordering::Acquire) {
         match next_flow() {
-            Ok(Some(flow)) => {
-                if flow_tx.send(flow).is_err() {
-                    return;
+            Ok(flow) => {
+                if let Some(ready_tx) = ready_tx.take() {
+                    let _ = ready_tx.send(Ok(()));
+                }
+                let Some(flow) = flow else {
+                    continue;
+                };
+                let mut pending = flow;
+                loop {
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    match flow_tx.try_send(pending) {
+                        Ok(()) => break,
+                        Err(TrySendError::Full(flow)) => {
+                            pending = flow;
+                            thread::sleep(STOP_CHECK_INTERVAL);
+                        }
+                        Err(TrySendError::Disconnected(_)) => return,
+                    }
                 }
             }
-            Ok(None) => {}
             Err(error) => {
-                let _ = failure.set(PipelineError::Capture(error.to_string()));
+                let error = PipelineError::Capture(error.to_string());
+                if let Some(ready_tx) = ready_tx.take() {
+                    let _ = ready_tx.send(Err(error.clone()));
+                }
+                if !stop.load(Ordering::Acquire) {
+                    let _ = failure.set(error);
+                }
                 return;
             }
         }
@@ -132,8 +163,13 @@ fn resolve_process(flow: &Flow, proc_table: &SharedProcTable) -> Option<Observed
 
 pub struct TrafficPipeline {
     snapshot_rx: Receiver<Arc<TrafficSnapshot>>,
+    capture_ready_rx: Receiver<Result<(), PipelineError>>,
     failure: Arc<OnceLock<PipelineError>>,
     stop: Arc<AtomicBool>,
+    capture_wakeup: Option<CaptureWakeup>,
+    workers: Vec<thread::JoinHandle<()>>,
+    #[cfg(test)]
+    _snapshot_keepalive: Option<SyncSender<Arc<TrafficSnapshot>>>,
 }
 
 impl TrafficPipeline {
@@ -142,9 +178,17 @@ impl TrafficPipeline {
         proc_table: SharedProcTable,
         top_n: usize,
     ) -> io::Result<Self> {
-        Self::spawn_with_next(move || source.next(), proc_table, top_n)
+        let breakloop = source.breakloop_handle();
+        Self::spawn_with_next_using(
+            move || source.next(),
+            proc_table,
+            top_n,
+            Some(Box::new(move || breakloop.breakloop())),
+            spawn_named_thread,
+        )
     }
 
+    #[cfg(test)]
     fn spawn_with_next<N, E>(
         next_flow: N,
         proc_table: SharedProcTable,
@@ -154,13 +198,35 @@ impl TrafficPipeline {
         N: FnMut() -> Result<Option<Flow>, E> + Send + 'static,
         E: fmt::Display + Send + 'static,
     {
-        Self::spawn_with_next_using(next_flow, proc_table, top_n, spawn_named_thread)
+        Self::spawn_with_next_using(next_flow, proc_table, top_n, None, spawn_named_thread)
+    }
+
+    #[cfg(test)]
+    fn spawn_with_next_and_wakeup<N, E, W>(
+        next_flow: N,
+        proc_table: SharedProcTable,
+        top_n: usize,
+        wake_capture: W,
+    ) -> io::Result<Self>
+    where
+        N: FnMut() -> Result<Option<Flow>, E> + Send + 'static,
+        E: fmt::Display + Send + 'static,
+        W: Fn() + Send + Sync + 'static,
+    {
+        Self::spawn_with_next_using(
+            next_flow,
+            proc_table,
+            top_n,
+            Some(Box::new(wake_capture)),
+            spawn_named_thread,
+        )
     }
 
     fn spawn_with_next_using<N, E, S>(
         next_flow: N,
         proc_table: SharedProcTable,
         top_n: usize,
+        capture_wakeup: Option<CaptureWakeup>,
         mut spawn_thread: S,
     ) -> io::Result<Self>
     where
@@ -170,6 +236,7 @@ impl TrafficPipeline {
     {
         let (flow_tx, flow_rx) = std::sync::mpsc::sync_channel(FLOW_CHANNEL_CAPACITY);
         let (snapshot_tx, snapshot_rx) = std::sync::mpsc::sync_channel(SNAPSHOT_CHANNEL_CAPACITY);
+        let (capture_ready_tx, capture_ready_rx) = std::sync::mpsc::sync_channel(1);
         snapshot_tx
             .try_send(Arc::new(TrafficSnapshot::default()))
             .expect("new snapshot channel has capacity");
@@ -178,7 +245,7 @@ impl TrafficPipeline {
         let failure = Arc::new(OnceLock::new());
         let aggregate_stop = stop.clone();
         let aggregate_failure = failure.clone();
-        let _aggregate_thread = spawn_thread(
+        let aggregate_thread = spawn_thread(
             "delray-aggregate",
             Box::new(move || {
                 aggregate_loop(
@@ -195,19 +262,69 @@ impl TrafficPipeline {
 
         let capture_stop = stop.clone();
         let capture_failure = failure.clone();
-        if let Err(error) = spawn_thread(
+        let capture_thread = match spawn_thread(
             "delray-capture",
-            Box::new(move || capture_loop(next_flow, flow_tx, capture_stop, capture_failure)),
+            Box::new(move || {
+                capture_loop(
+                    next_flow,
+                    flow_tx,
+                    capture_stop,
+                    capture_failure,
+                    Some(capture_ready_tx),
+                )
+            }),
         ) {
-            stop.store(true, Ordering::Release);
-            return Err(error);
-        }
+            Ok(thread) => thread,
+            Err(error) => {
+                stop.store(true, Ordering::Release);
+                let _ = aggregate_thread.join();
+                return Err(error);
+            }
+        };
 
         Ok(Self {
             snapshot_rx,
+            capture_ready_rx,
             failure,
             stop,
+            capture_wakeup,
+            workers: vec![capture_thread, aggregate_thread],
+            #[cfg(test)]
+            _snapshot_keepalive: None,
         })
+    }
+
+    #[cfg(test)]
+    pub fn stop(&mut self) {
+        self.signal_stop();
+        Self::join_workers(self.workers.drain(..));
+    }
+
+    fn signal_stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(wake_capture) = self.capture_wakeup.take() {
+            wake_capture();
+        }
+        for worker in &self.workers {
+            worker.thread().unpark();
+        }
+    }
+
+    fn join_workers(workers: impl IntoIterator<Item = thread::JoinHandle<()>>) {
+        for worker in workers {
+            let _ = worker.join();
+        }
+    }
+
+    fn stop_in_background(&mut self) {
+        self.signal_stop();
+        let workers: Vec<_> = self.workers.drain(..).collect();
+        if workers.is_empty() {
+            return;
+        }
+        let _ = thread::Builder::new()
+            .name("delray-pipeline-reaper".to_string())
+            .spawn(move || Self::join_workers(workers));
     }
 
     pub fn try_latest(&self) -> Result<Option<Arc<TrafficSnapshot>>, PipelineError> {
@@ -232,31 +349,118 @@ impl TrafficPipeline {
         }
     }
 
-    #[cfg(test)]
-    fn from_snapshot_receiver(snapshot_rx: Receiver<Arc<TrafficSnapshot>>) -> Self {
-        Self {
-            snapshot_rx,
-            failure: Arc::new(OnceLock::new()),
-            stop: Arc::new(AtomicBool::new(false)),
+    pub(crate) fn observe_early_capture_failure(&self) -> Result<CaptureReadiness, PipelineError> {
+        match self
+            .capture_ready_rx
+            .recv_timeout(CAPTURE_EARLY_FAILURE_WINDOW)
+        {
+            Ok(Ok(())) => Ok(CaptureReadiness::Ready),
+            Ok(Err(error)) => Err(error),
+            Err(RecvTimeoutError::Timeout) => Ok(CaptureReadiness::Waiting),
+            Err(RecvTimeoutError::Disconnected) => Err(self
+                .failure
+                .get()
+                .cloned()
+                .unwrap_or(PipelineError::WorkerStopped("capture"))),
+        }
+    }
+
+    pub(crate) fn poll_capture_readiness(&self) -> Option<Result<CaptureReadiness, PipelineError>> {
+        match self.capture_ready_rx.try_recv() {
+            Ok(Ok(())) => Some(Ok(CaptureReadiness::Ready)),
+            Ok(Err(error)) => Some(Err(error)),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(self
+                .failure
+                .get()
+                .cloned()
+                .unwrap_or(PipelineError::WorkerStopped("capture")))),
         }
     }
 
     #[cfg(test)]
-    fn from_parts(
+    pub(crate) fn from_snapshot_receiver(snapshot_rx: Receiver<Arc<TrafficSnapshot>>) -> Self {
+        let (ready_tx, capture_ready_rx) = std::sync::mpsc::sync_channel(1);
+        ready_tx.send(Ok(())).unwrap();
+        Self {
+            snapshot_rx,
+            capture_ready_rx,
+            failure: Arc::new(OnceLock::new()),
+            stop: Arc::new(AtomicBool::new(false)),
+            capture_wakeup: None,
+            workers: Vec::new(),
+            _snapshot_keepalive: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_snapshot_for_test(snapshot: Arc<TrafficSnapshot>) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (ready_tx, capture_ready_rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(snapshot)
+            .expect("new snapshot receiver is connected");
+        ready_tx.send(Ok(())).unwrap();
+        Self {
+            snapshot_rx: rx,
+            capture_ready_rx,
+            failure: Arc::new(OnceLock::new()),
+            stop: Arc::new(AtomicBool::new(false)),
+            capture_wakeup: None,
+            workers: Vec::new(),
+            _snapshot_keepalive: Some(tx),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts(
         snapshot_rx: Receiver<Arc<TrafficSnapshot>>,
         failure: Arc<OnceLock<PipelineError>>,
     ) -> Self {
+        let (ready_tx, capture_ready_rx) = std::sync::mpsc::sync_channel(1);
+        ready_tx
+            .send(Err(failure
+                .get()
+                .cloned()
+                .unwrap_or(PipelineError::WorkerStopped("capture"))))
+            .unwrap();
         Self {
             snapshot_rx,
+            capture_ready_rx,
             failure,
             stop: Arc::new(AtomicBool::new(false)),
+            capture_wakeup: None,
+            workers: Vec::new(),
+            _snapshot_keepalive: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_delayed_failure_for_test(delay: Duration, message: &str) -> Self {
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::sync_channel(1);
+        snapshot_tx
+            .send(Arc::new(TrafficSnapshot::default()))
+            .unwrap();
+        let (ready_tx, capture_ready_rx) = std::sync::mpsc::sync_channel(1);
+        let message = message.to_string();
+        thread::spawn(move || {
+            thread::sleep(delay);
+            let _ = ready_tx.send(Err(PipelineError::Capture(message)));
+        });
+        Self {
+            snapshot_rx,
+            capture_ready_rx,
+            failure: Arc::new(OnceLock::new()),
+            stop: Arc::new(AtomicBool::new(false)),
+            capture_wakeup: None,
+            workers: Vec::new(),
+            _snapshot_keepalive: Some(snapshot_tx),
         }
     }
 }
 
 impl Drop for TrafficPipeline {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.stop_in_background();
     }
 }
 
@@ -345,6 +549,7 @@ mod tests {
             tx,
             stop,
             failure,
+            None,
         );
 
         assert_eq!(calls, 3);
@@ -635,6 +840,79 @@ mod tests {
     }
 
     #[test]
+    fn stop_joins_capture_and_aggregate_workers() {
+        let proc_table = Arc::new(RwLock::new(ProcTable::default()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source_calls = calls.clone();
+        let (started_tx, started_rx) = sync_channel(1);
+        let mut pipeline = TrafficPipeline::spawn_with_next(
+            move || -> anyhow::Result<Option<Flow>> {
+                source_calls.fetch_add(1, Ordering::Relaxed);
+                let _ = started_tx.try_send(());
+                thread::sleep(Duration::from_millis(5));
+                Ok(None)
+            },
+            proc_table,
+            10,
+        )
+        .unwrap();
+
+        started_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        pipeline.stop();
+        let calls_after_stop = calls.load(Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(20));
+
+        assert!(calls_after_stop > 0);
+        assert_eq!(calls.load(Ordering::Relaxed), calls_after_stop);
+    }
+
+    #[test]
+    fn stop_interrupts_a_blocked_capture_before_joining_workers() {
+        let proc_table = Arc::new(RwLock::new(ProcTable::default()));
+        let (started_tx, started_rx) = sync_channel(1);
+        let (wake_tx, wake_rx) = sync_channel(1);
+        let mut pipeline = TrafficPipeline::spawn_with_next_and_wakeup(
+            move || -> anyhow::Result<Option<Flow>> {
+                started_tx.send(()).unwrap();
+                wake_rx.recv().unwrap();
+                Ok(None)
+            },
+            proc_table,
+            10,
+            move || wake_tx.send(()).unwrap(),
+        )
+        .unwrap();
+
+        started_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        let stopped_at = Instant::now();
+        pipeline.stop();
+
+        assert!(stopped_at.elapsed() < STOP_CHECK_INTERVAL);
+    }
+
+    #[test]
+    fn dropping_a_pipeline_does_not_join_blocked_workers_on_the_caller_thread() {
+        let proc_table = Arc::new(RwLock::new(ProcTable::default()));
+        let (started_tx, started_rx) = sync_channel(1);
+        let pipeline = TrafficPipeline::spawn_with_next(
+            move || -> anyhow::Result<Option<Flow>> {
+                let _ = started_tx.try_send(());
+                thread::sleep(Duration::from_millis(250));
+                Ok(None)
+            },
+            proc_table,
+            10,
+        )
+        .unwrap();
+
+        started_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        let dropped_at = Instant::now();
+        drop(pipeline);
+
+        assert!(dropped_at.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
     fn capture_spawn_failure_stops_started_aggregate_worker() {
         let proc_table = Arc::new(RwLock::new(ProcTable::default()));
         let (aggregate_stopped_tx, aggregate_stopped_rx) = sync_channel(1);
@@ -643,6 +921,7 @@ mod tests {
             || Ok::<_, io::Error>(None),
             proc_table,
             10,
+            None,
             move |name, task| {
                 if name == "delray-capture" {
                     return Err(io::Error::other("capture thread refused"));
