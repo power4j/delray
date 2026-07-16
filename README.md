@@ -68,7 +68,7 @@ Arguments:
   [INTERFACE]  Network interface to capture on (omit to list available interfaces)
 
 Options:
-      --proc-refresh <SECONDS>  /proc inode-table rebuild interval (must be > 0) [default: 2]
+      --proc-refresh <SECONDS>  Process table refresh interval (must be > 0) [default: 2]
       --output <FILE>           Output file for background mode (omit for foreground display)
   -f, --format <FORMAT>         Output format: plain (default) or json [default: plain]
   -n, --top-n <N>               Entries per top-N list (min: 1) [default: 10]
