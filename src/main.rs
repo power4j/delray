@@ -110,7 +110,7 @@ fn background_loop(
     let mut stats = stats::Stats::default();
     let mut next_refresh = Instant::now() + REFRESH_INTERVAL;
     loop {
-        drain(source, proc_table, &mut stats);
+        process_next(|| source.next(), proc_table, &mut stats);
         if Instant::now() >= next_refresh {
             let res = if is_json {
                 report::render_file_json(path, interface, started_wall, started_at, &stats, top_n)
@@ -138,7 +138,7 @@ fn json_stdout_loop(
     let mut stats = stats::Stats::default();
     let mut next_refresh = Instant::now() + REFRESH_INTERVAL;
     loop {
-        drain(source, proc_table, &mut stats);
+        process_next(|| source.next(), proc_table, &mut stats);
         if Instant::now() >= next_refresh {
             report::render_jsonl(interface, started_wall, started_at, &stats, top_n);
             next_refresh = Instant::now() + REFRESH_INTERVAL;
@@ -146,31 +146,30 @@ fn json_stdout_loop(
     }
 }
 
-/// Drain available packets from the capture source into stats.
-fn drain(
-    source: &mut CaptureSource,
+fn process_next<N, E>(
+    mut next_flow: N,
     proc_table: &proc_table::SharedProcTable,
     stats: &mut stats::Stats,
-) {
-    loop {
-        match source.next() {
-            Ok(Some(flow)) => {
-                let process = flow.local_socket.and_then(|socket| {
-                    let table = proc_table.read().ok()?;
-                    let process = table.lookup(socket.ip, socket.port, socket.protocol)?;
-                    Some(stats::ObservedProcess {
-                        pid: process.pid,
-                        name: process.name.clone(),
-                        path: process.path.clone(),
-                    })
-                });
-                stats.record_flow(flow, process);
-            }
-            Ok(None) => break,
-            Err(e) => {
-                eprintln!("Capture error: {e}");
-                break;
-            }
+) where
+    N: FnMut() -> Result<Option<capture::Flow>, E>,
+    E: std::fmt::Display,
+{
+    match next_flow() {
+        Ok(Some(flow)) => {
+            let process = flow.local_socket.and_then(|socket| {
+                let table = proc_table.read().ok()?;
+                let process = table.lookup(socket.ip, socket.port, socket.protocol)?;
+                Some(stats::ObservedProcess {
+                    pid: process.pid,
+                    name: process.name.clone(),
+                    path: process.path.clone(),
+                })
+            });
+            stats.record_flow(flow, process);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("Capture error: {e}");
         }
     }
 }
@@ -200,6 +199,38 @@ fn positive_u64(s: &str) -> Result<u64, String> {
         Ok(v) if v > 0 => Ok(v),
         Ok(_) => Err(String::from("value must be greater than 0")),
         Err(_) => Err(String::from("value must be a positive integer")),
+    }
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::{Arc, RwLock};
+
+    use super::*;
+
+    #[test]
+    fn continuous_traffic_yields_after_one_flow() {
+        let proc_table = Arc::new(RwLock::new(proc_table::ProcTable::default()));
+        let mut stats = stats::Stats::default();
+        let mut calls = 0;
+
+        process_next(
+            || {
+                calls += 1;
+                Ok::<_, &'static str>(Some(capture::Flow {
+                    direction: stats::Direction::Inbound,
+                    peer: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+                    bytes: 64,
+                    local_socket: None,
+                }))
+            },
+            &proc_table,
+            &mut stats,
+        );
+
+        assert_eq!(calls, 1);
+        assert_eq!(stats.snapshot(10).in_bytes, 64);
     }
 }
 
