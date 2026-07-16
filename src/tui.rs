@@ -14,14 +14,14 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction as LayoutDir, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction as LayoutDir, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 
 use crate::pipeline::TrafficPipeline;
 use crate::report::{fmt_elapsed, hostname, human_bytes, truncate};
-use crate::stats::{ProcessSnapshot, TrafficSnapshot};
+use crate::stats::{IpSnapshot, ProcessSnapshot, TrafficSnapshot};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -60,6 +60,42 @@ enum KeyOutcome {
     Changed,
     Ignored,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutMode {
+    Compact,
+    Standard,
+    Wide,
+}
+
+impl LayoutMode {
+    fn from_area(area: Rect) -> Self {
+        match area.width {
+            120.. => Self::Wide,
+            80.. => Self::Standard,
+            _ => Self::Compact,
+        }
+    }
+}
+
+const COLOR_BG: Color = Color::Rgb(9, 13, 20);
+const COLOR_TEXT: Color = Color::Rgb(216, 224, 232);
+const COLOR_STRONG: Color = Color::Rgb(244, 247, 250);
+const COLOR_MUTED: Color = Color::Rgb(116, 129, 145);
+const COLOR_BORDER: Color = Color::Rgb(37, 53, 68);
+const COLOR_ACCENT: Color = Color::Rgb(255, 183, 3);
+const COLOR_ACCENT_DIM: Color = Color::Rgb(154, 111, 8);
+const COLOR_INBOUND: Color = Color::Rgb(255, 191, 36);
+const COLOR_OUTBOUND: Color = Color::Rgb(41, 197, 246);
+const COLOR_VIOLET: Color = Color::Rgb(167, 139, 250);
+const COLOR_CORAL: Color = Color::Rgb(251, 113, 133);
+const COLOR_SELECTION: Color = Color::Rgb(23, 43, 60);
+const COLOR_INBOUND_BORDER: Color = Color::Rgb(102, 80, 30);
+const COLOR_OUTBOUND_BORDER: Color = Color::Rgb(29, 86, 108);
+const COLOR_VIOLET_BORDER: Color = Color::Rgb(76, 65, 111);
+
+const MIN_TERMINAL_WIDTH: u16 = 60;
+const MIN_TERMINAL_HEIGHT: u16 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TrackingPause {
@@ -431,151 +467,327 @@ fn draw_at(
     started_at: Instant,
     now: chrono::DateTime<chrono::Utc>,
 ) {
+    let area = f.area();
+    f.render_widget(
+        Block::default().style(Style::default().fg(COLOR_TEXT).bg(COLOR_BG)),
+        area,
+    );
+
+    if area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT {
+        draw_too_small(f, area);
+        return;
+    }
+
+    let mode = LayoutMode::from_area(area);
     let chunks = Layout::default()
         .direction(LayoutDir::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
-        .split(f.area());
+        .split(area);
 
-    draw_title_bar(f, chunks[0], snapshot, interface, host, started_at);
+    draw_header(f, chunks[0], state.page, interface, host, started_at, mode);
+    let body = chunks[1].inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
     match state.page {
-        Page::Overview => draw_overview(f, chunks[1], snapshot),
+        Page::Overview => draw_overview(f, body, snapshot, mode),
         Page::Processes => match state.process_detail.as_ref() {
-            Some(detail) => draw_process_detail(f, chunks[1], detail, now),
-            None => draw_processes(f, chunks[1], state, snapshot),
+            Some(detail) => draw_process_detail(f, body, detail, now),
+            None => draw_processes(f, body, state, snapshot, mode),
         },
-        Page::Ips => draw_ips(f, chunks[1], state, snapshot),
-        Page::About => draw_about(f, chunks[1]),
+        Page::Ips => draw_ips(f, body, state, snapshot, mode),
+        Page::About => draw_about(f, body),
     }
-    draw_status_bar(f, chunks[2], state);
+    draw_status_bar(f, chunks[2], state, mode);
 }
 
-fn draw_title_bar(
+fn draw_too_small(f: &mut ratatui::Frame, area: Rect) {
+    let message_area = Layout::default()
+        .direction(LayoutDir::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(3),
+            Constraint::Fill(1),
+        ])
+        .split(area)[1];
+    let lines = vec![
+        Line::from(Span::styled(
+            "delray",
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("Terminal too small (minimum {MIN_TERMINAL_WIDTH}x{MIN_TERMINAL_HEIGHT})"),
+            Style::default().fg(COLOR_MUTED),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        message_area,
+    );
+}
+
+fn draw_header(
     f: &mut ratatui::Frame,
     area: Rect,
-    snapshot: &TrafficSnapshot,
+    page: Page,
     interface: &str,
     host: &str,
     started_at: Instant,
+    mode: LayoutMode,
 ) {
-    let now = chrono::Local::now();
-    let title = format!(
-        " delray | {} | host: {} | uptime: {} | In: {} Out: {} | {} ",
-        interface,
-        host,
-        fmt_elapsed(started_at.elapsed()),
-        human_bytes(snapshot.in_bytes),
-        human_bytes(snapshot.out_bytes),
-        now.format("%Y-%m-%d %H:%M:%S")
-    );
-    let para = Paragraph::new(title).style(
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    );
-    f.render_widget(para, area);
-}
+    let navigation = navigation_line(page, mode);
+    if page == Page::About {
+        f.render_widget(Paragraph::new(navigation), area);
+        return;
+    }
 
-fn draw_overview(f: &mut ratatui::Frame, area: Rect, snapshot: &TrafficSnapshot) {
+    let runtime = runtime_line(interface, host, started_at, mode);
+    let runtime_width = (runtime.width() as u16).min(area.width / 2);
     let chunks = Layout::default()
-        .direction(LayoutDir::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(0)])
-        .split(area);
-
-    // In/Out bars
-    let total = snapshot.in_bytes + snapshot.out_bytes;
-    let in_ratio = if total > 0 {
-        snapshot.in_bytes as f64 / total as f64
-    } else {
-        0.0
-    };
-    let out_ratio = if total > 0 {
-        snapshot.out_bytes as f64 / total as f64
-    } else {
-        0.0
-    };
-    let bars = vec![
-        Line::from(format!(
-            "  Inbound  {}  ({:.1}%)",
-            bar(in_ratio, 30),
-            in_ratio * 100.0
-        )),
-        Line::from(format!(
-            " Outbound  {}  ({:.1}%)",
-            bar(out_ratio, 30),
-            out_ratio * 100.0
-        )),
-        Line::from(format!(
-            "   In: {}   Out: {}",
-            human_bytes(snapshot.in_bytes),
-            human_bytes(snapshot.out_bytes)
-        )),
-    ];
-    f.render_widget(Paragraph::new(bars), chunks[0]);
-
-    // Three preview columns
-    let cols = Layout::default()
         .direction(LayoutDir::Horizontal)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
-        .split(chunks[1]);
-
-    let processes = snapshot.processes.as_ref();
-    let process_items: Vec<ListItem> = processes
-        .iter()
-        .take(5)
-        .map(|process| {
-            let name = process_name_span(process, 18);
-            ListItem::new(Line::from(vec![
-                name,
-                Span::raw(format!("  {}", human_bytes(process.total()))),
-            ]))
-        })
-        .collect();
-    let process_block = preview_block("Top Processes", processes.len(), 5, 2);
-    f.render_widget(List::new(process_items).block(process_block), cols[0]);
-
-    let inbound_ips = snapshot.inbound_ips.as_ref();
-    let inbound_items: Vec<ListItem> = inbound_ips
-        .iter()
-        .take(5)
-        .map(|entry| ListItem::new(format!("{}  {}", entry.ip, human_bytes(entry.bytes))))
-        .collect();
-    let inbound_block = preview_block("Top Inbound IPs", inbound_ips.len(), 5, 3);
-    f.render_widget(List::new(inbound_items).block(inbound_block), cols[1]);
-
-    let outbound_ips = snapshot.outbound_ips.as_ref();
-    let outbound_items: Vec<ListItem> = outbound_ips
-        .iter()
-        .take(5)
-        .map(|entry| ListItem::new(format!("{}  {}", entry.ip, human_bytes(entry.bytes))))
-        .collect();
-    let outbound_block = preview_block("Top Outbound IPs", outbound_ips.len(), 5, 3);
-    f.render_widget(List::new(outbound_items).block(outbound_block), cols[2]);
+        .constraints([Constraint::Min(0), Constraint::Length(runtime_width)])
+        .split(area);
+    f.render_widget(Paragraph::new(navigation), chunks[0]);
+    f.render_widget(
+        Paragraph::new(runtime).alignment(Alignment::Right),
+        chunks[1],
+    );
 }
 
-fn preview_block(title: &str, total: usize, shown: usize, goto: usize) -> Block<'_> {
-    let footer = if total > shown {
-        format!("+{} more (press {})", total - shown, goto)
+fn navigation_line(page: Page, mode: LayoutMode) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        " delray ",
+        Style::default()
+            .fg(COLOR_ACCENT)
+            .add_modifier(Modifier::BOLD),
+    )];
+    for candidate in Page::ALL {
+        let label = match (candidate, mode) {
+            (Page::Overview, LayoutMode::Compact) => " 1 ".to_string(),
+            (Page::Processes, LayoutMode::Compact) => " 2 ".to_string(),
+            (Page::Ips, LayoutMode::Compact) => " 3 ".to_string(),
+            (Page::About, LayoutMode::Compact) => " 4 ".to_string(),
+            (Page::Overview, _) => " 1 Overview ".to_string(),
+            (Page::Processes, _) => " 2 Processes ".to_string(),
+            (Page::Ips, _) => " 3 IPs ".to_string(),
+            (Page::About, _) => " 4 About ".to_string(),
+        };
+        let style = if candidate == page {
+            Style::default()
+                .fg(COLOR_STRONG)
+                .bg(Color::Rgb(43, 37, 15))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLOR_MUTED)
+        };
+        spans.push(Span::styled(label, style));
+    }
+    Line::from(spans)
+}
+
+fn runtime_line(
+    interface: &str,
+    host: &str,
+    started_at: Instant,
+    mode: LayoutMode,
+) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(" ", Style::default()),
+        Span::styled(interface.to_string(), Style::default().fg(COLOR_STRONG)),
+    ];
+    if mode == LayoutMode::Wide {
+        spans.push(Span::styled("  ", Style::default()));
+        spans.push(Span::styled(
+            host.to_string(),
+            Style::default().fg(COLOR_STRONG),
+        ));
+    }
+    spans.push(Span::styled("  up ", Style::default().fg(COLOR_MUTED)));
+    spans.push(Span::styled(
+        fmt_elapsed(started_at.elapsed()),
+        Style::default().fg(COLOR_STRONG),
+    ));
+    if mode != LayoutMode::Compact {
+        spans.push(Span::styled(
+            format!("  {}", chrono::Local::now().format("%H:%M:%S")),
+            Style::default().fg(COLOR_MUTED),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn draw_overview(f: &mut ratatui::Frame, area: Rect, snapshot: &TrafficSnapshot, mode: LayoutMode) {
+    match mode {
+        LayoutMode::Wide => {
+            let columns = Layout::default()
+                .direction(LayoutDir::Horizontal)
+                .constraints([
+                    Constraint::Percentage(42),
+                    Constraint::Length(1),
+                    Constraint::Percentage(58),
+                ])
+                .split(area);
+            let left = Layout::default()
+                .direction(LayoutDir::Vertical)
+                .constraints([
+                    Constraint::Length(6),
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                ])
+                .split(columns[0]);
+            draw_traffic(f, left[0], snapshot);
+            draw_ip_preview(f, left[2], snapshot, true);
+            draw_ip_preview(f, left[4], snapshot, false);
+            draw_process_preview(f, columns[2], snapshot, mode);
+        }
+        LayoutMode::Standard | LayoutMode::Compact => {
+            let rows = Layout::default()
+                .direction(LayoutDir::Vertical)
+                .constraints([
+                    Constraint::Length(6),
+                    Constraint::Length(1),
+                    Constraint::Fill(2),
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                ])
+                .split(area);
+            draw_traffic(f, rows[0], snapshot);
+            draw_process_preview(f, rows[2], snapshot, mode);
+            if mode == LayoutMode::Compact {
+                draw_ip_preview(f, rows[4], snapshot, true);
+            } else {
+                let ips = Layout::default()
+                    .direction(LayoutDir::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(50),
+                        Constraint::Length(1),
+                        Constraint::Percentage(50),
+                    ])
+                    .split(rows[4]);
+                draw_ip_preview(f, ips[0], snapshot, true);
+                draw_ip_preview(f, ips[2], snapshot, false);
+            }
+        }
+    }
+}
+
+fn draw_traffic(f: &mut ratatui::Frame, area: Rect, snapshot: &TrafficSnapshot) {
+    let block = panel_block(
+        "net",
+        "Traffic",
+        None,
+        COLOR_VIOLET,
+        COLOR_VIOLET_BORDER,
+        None,
+    );
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let total = snapshot.in_bytes.saturating_add(snapshot.out_bytes);
+    let lines = vec![
+        traffic_line(
+            "IN total",
+            COLOR_INBOUND,
+            ratio(snapshot.in_bytes, total),
+            &human_bytes(snapshot.in_bytes),
+            inner.width,
+        ),
+        traffic_line(
+            "OUT total",
+            COLOR_OUTBOUND,
+            ratio(snapshot.out_bytes, total),
+            &human_bytes(snapshot.out_bytes),
+            inner.width,
+        ),
+        traffic_line(
+            "Combined",
+            COLOR_ACCENT_DIM,
+            if total > 0 { 1.0 } else { 0.0 },
+            &human_bytes(total),
+            inner.width,
+        ),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn ratio(value: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
     } else {
-        String::new()
-    };
-    Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {title} "))
-        .title_bottom(Line::from(format!(" {footer} ")).alignment(Alignment::Center))
+        value as f64 / total as f64
+    }
 }
 
-fn bar(ratio: f64, width: usize) -> String {
-    let filled = ((ratio * width as f64).round() as usize).min(width);
-    let empty = width - filled;
-    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+fn traffic_line(label: &str, color: Color, ratio: f64, value: &str, width: u16) -> Line<'static> {
+    const LABEL_WIDTH: usize = 10;
+    let value_width = value.chars().count();
+    let bar_width = (width as usize).saturating_sub(LABEL_WIDTH + value_width + 2);
+    let filled = ((bar_width as f64 * ratio).round() as usize).min(bar_width);
+    Line::from(vec![
+        Span::styled(format!("{label:<LABEL_WIDTH$}"), Style::default().fg(color)),
+        Span::styled("█".repeat(filled), Style::default().fg(color)),
+        Span::styled(
+            "─".repeat(bar_width.saturating_sub(filled)),
+            Style::default().fg(COLOR_BORDER),
+        ),
+        Span::styled(format!("  {value}"), Style::default().fg(COLOR_STRONG)),
+    ])
+}
+
+fn panel_block(
+    prefix: &str,
+    title: &str,
+    count: Option<usize>,
+    prefix_color: Color,
+    border_color: Color,
+    footer: Option<String>,
+) -> Block<'static> {
+    let mut title_spans = vec![
+        Span::styled(
+            format!(" {prefix} "),
+            Style::default()
+                .fg(prefix_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(COLOR_STRONG)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(count) = count {
+        title_spans.push(Span::styled(
+            format!(" {count} "),
+            Style::default().fg(COLOR_MUTED),
+        ));
+    } else {
+        title_spans.push(Span::raw(" "));
+    }
+
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(Line::from(title_spans));
+    if let Some(footer) = footer {
+        block = block.title_bottom(
+            Line::from(Span::styled(
+                format!(" {footer} "),
+                Style::default().fg(COLOR_MUTED),
+            ))
+            .alignment(Alignment::Right),
+        );
+    }
+    block
 }
 
 fn process_name_span(process: &ProcessSnapshot, max_chars: usize) -> Span<'static> {
@@ -596,65 +808,168 @@ fn process_name_span(process: &ProcessSnapshot, max_chars: usize) -> Span<'stati
     }
 }
 
+fn draw_process_preview(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    snapshot: &TrafficSnapshot,
+    mode: LayoutMode,
+) {
+    let footer = preview_position(snapshot.processes.len(), area.height);
+    let block = panel_block(
+        "proc",
+        "Top Processes",
+        Some(snapshot.processes.len()),
+        COLOR_CORAL,
+        COLOR_CORAL,
+        Some(footer),
+    );
+    let table = process_table(snapshot, mode, block)
+        .row_highlight_style(
+            Style::default()
+                .bg(COLOR_SELECTION)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+    f.render_stateful_widget(table, area, &mut ratatui_state(snapshot.processes.len(), 0));
+}
+
+fn process_table(
+    snapshot: &TrafficSnapshot,
+    mode: LayoutMode,
+    block: Block<'static>,
+) -> Table<'static> {
+    let compact = mode == LayoutMode::Compact;
+    let rows = process_rows(snapshot, compact);
+    let header_style = Style::default().fg(COLOR_MUTED);
+    let table = if compact {
+        Table::new(
+            rows,
+            [
+                Constraint::Min(18),
+                Constraint::Length(12),
+                Constraint::Length(12),
+            ],
+        )
+        .header(Row::new(vec!["Process", "Sent", "Total"]).style(header_style))
+    } else {
+        Table::new(
+            rows,
+            [
+                Constraint::Min(20),
+                Constraint::Length(10),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Length(12),
+            ],
+        )
+        .header(Row::new(vec!["Process", "PID", "Recv", "Sent", "Total"]).style(header_style))
+    };
+    table.column_spacing(1).block(block)
+}
+
+fn process_rows(snapshot: &TrafficSnapshot, compact: bool) -> Vec<Row<'static>> {
+    if snapshot.processes.is_empty() {
+        let cells = if compact {
+            vec![
+                Cell::from("No traffic observed"),
+                Cell::from(""),
+                Cell::from(""),
+            ]
+        } else {
+            vec![
+                Cell::from("No traffic observed"),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+            ]
+        };
+        return vec![Row::new(cells).style(Style::default().fg(COLOR_MUTED))];
+    }
+
+    snapshot
+        .processes
+        .iter()
+        .map(|process| {
+            let name = Cell::from(process_name_span(process, 40));
+            if compact {
+                Row::new(vec![
+                    name,
+                    Cell::from(human_bytes(process.sent))
+                        .style(Style::default().fg(COLOR_OUTBOUND)),
+                    Cell::from(human_bytes(process.total()))
+                        .style(Style::default().fg(COLOR_STRONG)),
+                ])
+            } else {
+                Row::new(vec![
+                    name,
+                    Cell::from(
+                        process
+                            .pid()
+                            .map(|pid| pid.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                    ),
+                    Cell::from(human_bytes(process.recv)).style(Style::default().fg(COLOR_INBOUND)),
+                    Cell::from(human_bytes(process.sent))
+                        .style(Style::default().fg(COLOR_OUTBOUND)),
+                    Cell::from(human_bytes(process.total()))
+                        .style(Style::default().fg(COLOR_STRONG)),
+                ])
+            }
+        })
+        .collect()
+}
+
+fn selected_position(selected: usize, len: usize) -> String {
+    if len == 0 {
+        "0/0".to_string()
+    } else {
+        format!("{}/{}", selected.min(len - 1) + 1, len)
+    }
+}
+
+fn preview_position(len: usize, height: u16) -> String {
+    if len == 0 {
+        return "0/0".to_string();
+    }
+    let shown = len.min(height.saturating_sub(3) as usize);
+    format!("1-{shown}/{len}")
+}
+
 fn draw_processes(
     f: &mut ratatui::Frame,
     area: Rect,
     state: &mut AppState,
     snapshot: &TrafficSnapshot,
+    mode: LayoutMode,
 ) {
-    let processes = snapshot.processes.as_ref();
-    let rows: Vec<Row> = processes
-        .iter()
-        .map(|process| {
-            let name = Cell::from(process_name_span(process, 40));
-            Row::new(vec![
-                name,
-                Cell::from(
-                    process
-                        .pid()
-                        .map(|pid| pid.to_string())
-                        .unwrap_or_else(|| "-".to_string()),
-                ),
-                Cell::from(human_bytes(process.recv)),
-                Cell::from(human_bytes(process.sent)),
-                Cell::from(human_bytes(process.total())),
-            ])
-        })
-        .collect();
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Min(20),
-            Constraint::Length(10),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(12),
-        ],
-    )
-    .header(
-        Row::new(vec!["Process", "PID", "Recv", "Sent", "Total"]).style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-    )
-    .row_highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED))
-    .highlight_symbol("> ")
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" Processes ({}) ", processes.len())),
-    );
-
-    let view_h = area.height.saturating_sub(4) as usize;
+    let view_h = area.height.saturating_sub(3) as usize;
     state.proc_view_height = view_h.max(1);
-    state.proc_scroll = state.proc_scroll.min(processes.len().saturating_sub(1));
+    state.proc_scroll = state
+        .proc_scroll
+        .min(snapshot.processes.len().saturating_sub(1));
+
+    let footer = selected_position(state.proc_scroll, snapshot.processes.len());
+    let block = panel_block(
+        "proc",
+        "Processes",
+        Some(snapshot.processes.len()),
+        COLOR_CORAL,
+        COLOR_CORAL,
+        Some(footer),
+    );
+    let table = process_table(snapshot, mode, block)
+        .row_highlight_style(
+            Style::default()
+                .bg(COLOR_SELECTION)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
 
     f.render_stateful_widget(
         table,
         area,
-        &mut ratatui_state(processes.len(), state.proc_scroll),
+        &mut ratatui_state(snapshot.processes.len(), state.proc_scroll),
     );
 }
 
@@ -696,12 +1011,16 @@ fn draw_process_detail(
                 .add_modifier(Modifier::BOLD),
         )));
     }
+    let block = panel_block(
+        "proc",
+        "Process Details",
+        None,
+        COLOR_CORAL,
+        COLOR_CORAL,
+        None,
+    );
     let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Process Details "),
-        )
+        .block(block)
         .wrap(Wrap { trim: false });
     f.render_widget(paragraph, area);
 }
@@ -722,136 +1041,257 @@ fn relative_last_seen(
     }
 }
 
-fn draw_ips(f: &mut ratatui::Frame, area: Rect, state: &mut AppState, snapshot: &TrafficSnapshot) {
-    let cols = Layout::default()
-        .direction(LayoutDir::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-
-    let inbound_ips = snapshot.inbound_ips.as_ref();
-    let outbound_ips = snapshot.outbound_ips.as_ref();
-
-    let inbound_block_style = if state.ip_focus == IpFocus::Inbound {
-        Style::default().fg(Color::Yellow)
+fn draw_ip_preview(f: &mut ratatui::Frame, area: Rect, snapshot: &TrafficSnapshot, inbound: bool) {
+    let entries = if inbound {
+        snapshot.inbound_ips.as_ref()
     } else {
-        Style::default()
+        snapshot.outbound_ips.as_ref()
     };
-    let outbound_block_style = if state.ip_focus == IpFocus::Outbound {
-        Style::default().fg(Color::Yellow)
+    let (prefix, title, color, border) = ip_theme(inbound);
+    let block = panel_block(
+        prefix,
+        title,
+        Some(entries.len()),
+        color,
+        border,
+        Some(preview_position(entries.len(), area.height)),
+    );
+    let table = ip_table(entries, color, block);
+    f.render_widget(table, area);
+}
+
+fn ip_theme(inbound: bool) -> (&'static str, &'static str, Color, Color) {
+    if inbound {
+        ("in", "Inbound IPs", COLOR_INBOUND, COLOR_INBOUND_BORDER)
     } else {
-        Style::default()
+        ("out", "Outbound IPs", COLOR_OUTBOUND, COLOR_OUTBOUND_BORDER)
+    }
+}
+
+fn ip_table(entries: &[IpSnapshot], color: Color, block: Block<'static>) -> Table<'static> {
+    let rows = if entries.is_empty() {
+        vec![Row::new(vec!["No traffic observed", ""]).style(Style::default().fg(COLOR_MUTED))]
+    } else {
+        entries
+            .iter()
+            .map(|entry| {
+                Row::new(vec![
+                    Cell::from(entry.ip.to_string()),
+                    Cell::from(human_bytes(entry.bytes)).style(Style::default().fg(color)),
+                ])
+            })
+            .collect()
+    };
+    Table::new(rows, [Constraint::Min(20), Constraint::Length(14)])
+        .header(Row::new(vec!["Remote address", "Bytes"]).style(Style::default().fg(COLOR_MUTED)))
+        .column_spacing(1)
+        .block(block)
+}
+
+fn draw_ips(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    state: &mut AppState,
+    snapshot: &TrafficSnapshot,
+    mode: LayoutMode,
+) {
+    let panes = if mode == LayoutMode::Compact {
+        Layout::default()
+            .direction(LayoutDir::Vertical)
+            .constraints([
+                Constraint::Percentage(50),
+                Constraint::Length(1),
+                Constraint::Percentage(50),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(LayoutDir::Horizontal)
+            .constraints([
+                Constraint::Percentage(50),
+                Constraint::Length(1),
+                Constraint::Percentage(50),
+            ])
+            .split(area)
     };
 
-    let inbound_rows: Vec<Row> = inbound_ips
-        .iter()
-        .map(|entry| Row::new(vec![entry.ip.to_string(), human_bytes(entry.bytes)]))
-        .collect();
-    let inbound_table = Table::new(inbound_rows, [Constraint::Min(20), Constraint::Length(14)])
-        .header(
-            Row::new(vec!["IP", "Bytes"]).style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Inbound IPs ({}) ", inbound_ips.len()))
-                .border_style(inbound_block_style),
-        );
-
-    let outbound_rows: Vec<Row> = outbound_ips
-        .iter()
-        .map(|entry| Row::new(vec![entry.ip.to_string(), human_bytes(entry.bytes)]))
-        .collect();
-    let outbound_table = Table::new(outbound_rows, [Constraint::Min(20), Constraint::Length(14)])
-        .header(
-            Row::new(vec!["IP", "Bytes"]).style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Outbound IPs ({}) ", outbound_ips.len()))
-                .border_style(outbound_block_style),
-        );
-
-    let inbound_view_height = cols[0].height.saturating_sub(4) as usize;
-    let outbound_view_height = cols[1].height.saturating_sub(4) as usize;
-    state.ip_in_view_height = inbound_view_height.max(1);
-    state.ip_out_view_height = outbound_view_height.max(1);
-    state.ip_in_scroll = state.ip_in_scroll.min(inbound_ips.len().saturating_sub(1));
+    let inbound_area = panes[0];
+    let outbound_area = panes[2];
+    state.ip_in_view_height = (inbound_area.height.saturating_sub(3) as usize).max(1);
+    state.ip_out_view_height = (outbound_area.height.saturating_sub(3) as usize).max(1);
+    state.ip_in_scroll = state
+        .ip_in_scroll
+        .min(snapshot.inbound_ips.len().saturating_sub(1));
     state.ip_out_scroll = state
         .ip_out_scroll
-        .min(outbound_ips.len().saturating_sub(1));
+        .min(snapshot.outbound_ips.len().saturating_sub(1));
 
-    f.render_stateful_widget(
-        inbound_table,
-        cols[0],
-        &mut ratatui_state(inbound_ips.len(), state.ip_in_scroll),
+    draw_ip_table(
+        f,
+        inbound_area,
+        snapshot.inbound_ips.as_ref(),
+        true,
+        state.ip_focus == IpFocus::Inbound,
+        state.ip_in_scroll,
     );
-    f.render_stateful_widget(
-        outbound_table,
-        cols[1],
-        &mut ratatui_state(outbound_ips.len(), state.ip_out_scroll),
+    draw_ip_table(
+        f,
+        outbound_area,
+        snapshot.outbound_ips.as_ref(),
+        false,
+        state.ip_focus == IpFocus::Outbound,
+        state.ip_out_scroll,
     );
+}
+
+fn draw_ip_table(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    entries: &[IpSnapshot],
+    inbound: bool,
+    focused: bool,
+    selected: usize,
+) {
+    let (prefix, title, color, border) = ip_theme(inbound);
+    let block = panel_block(
+        prefix,
+        title,
+        Some(entries.len()),
+        color,
+        if focused { COLOR_CORAL } else { border },
+        Some(selected_position(selected, entries.len())),
+    );
+    let table = ip_table(entries, color, block)
+        .row_highlight_style(if focused {
+            Style::default()
+                .fg(COLOR_STRONG)
+                .bg(COLOR_SELECTION)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        })
+        .highlight_symbol(if focused { "> " } else { "  " });
+    f.render_stateful_widget(table, area, &mut ratatui_state(entries.len(), selected));
 }
 
 fn draw_about(f: &mut ratatui::Frame, area: Rect) {
     let version = env!("CARGO_PKG_VERSION");
+    let frame_width = area.width.saturating_sub(4).min(62);
+    let horizontal = Layout::default()
+        .direction(LayoutDir::Horizontal)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(frame_width),
+            Constraint::Fill(1),
+        ])
+        .split(area)[1];
+    let frame_area = Layout::default()
+        .direction(LayoutDir::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(7),
+            Constraint::Fill(1),
+        ])
+        .split(horizontal)[1];
+    let frame = Block::default()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::default().fg(COLOR_BORDER));
+    let content_area = frame.inner(frame_area);
+    f.render_widget(frame, frame_area);
+
     let lines = vec![
-        Line::from(""),
-        Line::from(""),
         Line::from(Span::styled(
             "delray",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(COLOR_ACCENT)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("Network Traffic Analyzer"),
-        Line::from(""),
-        Line::from(format!("Version {version}")),
-        Line::from(""),
-        Line::from(""),
         Line::from(Span::styled(
-            "─────────────────────────────",
-            Style::default().fg(Color::DarkGray),
+            "Network Traffic Analyzer",
+            Style::default().fg(COLOR_STRONG),
         )),
         Line::from(""),
-        Line::from("capture · analyze · locate"),
-        Line::from("which process and IP consumes"),
-        Line::from("your server's bandwidth"),
+        Line::from(Span::styled(
+            format!("Version {version}"),
+            Style::default().fg(COLOR_MUTED),
+        )),
     ];
     let para = Paragraph::new(lines).alignment(Alignment::Center);
-    f.render_widget(para, area);
+    f.render_widget(para, content_area);
 }
 
-fn draw_status_bar(f: &mut ratatui::Frame, area: Rect, state: &mut AppState) {
-    let hint = if let Some(detail) = state.process_detail.as_ref() {
-        match (detail.pause_notice, detail.paused) {
+fn draw_status_bar(f: &mut ratatui::Frame, area: Rect, state: &mut AppState, mode: LayoutMode) {
+    if let Some(detail) = state.process_detail.as_ref() {
+        let hint = match (detail.pause_notice, detail.paused) {
             (Some(reason), _) => format!("{}  Esc:back  q:quit", reason.message()),
             (None, Some(_)) => "Tracking paused  Esc:back  q:quit".to_string(),
             (None, None) => "Esc:back  q:quit".to_string(),
+        };
+        f.render_widget(
+            Paragraph::new(format!(" {hint} ")).style(Style::default().fg(COLOR_MUTED)),
+            area,
+        );
+        if let Some(detail) = state.process_detail.as_mut() {
+            detail.pause_notice = None;
         }
-    } else {
-        match state.page {
-            Page::Overview => "1-4:page  ←→/hl:switch  q:quit",
-            Page::Processes => "Enter:details  1-4:page  ←→/hl:switch  ↑↓/jk:select  q:quit",
-            Page::Ips => "1-4:page  ←→/hl:switch  Tab:panel  ↑↓/jk:scroll  PgUp/Dn:page  q:quit",
-            Page::About => "1-4:page  ←→/hl:switch  q:quit",
-        }
-        .to_string()
-    };
-    let para = Paragraph::new(format!(" {hint} ")).style(Style::default().fg(Color::DarkGray));
-    f.render_widget(para, area);
-    if let Some(detail) = state.process_detail.as_mut() {
-        detail.pause_notice = None;
+        return;
     }
+
+    let mut spans = Vec::new();
+    push_hint(&mut spans, "1-4", "page");
+    push_hint(&mut spans, "h/l", "switch");
+    if state.page == Page::Ips {
+        push_hint(&mut spans, "Tab", "panel");
+    }
+    if matches!(state.page, Page::Processes | Page::Ips) {
+        if state.page == Page::Processes {
+            push_hint(&mut spans, "Enter", ":details");
+        }
+        push_hint(&mut spans, "j/k", "scroll");
+        if mode != LayoutMode::Compact {
+            push_hint(&mut spans, "PgUp/PgDn", "page");
+            push_hint(&mut spans, "Home/End", "jump");
+        }
+    }
+
+    let chunks = Layout::default()
+        .direction(LayoutDir::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(8)])
+        .split(area);
+    f.render_widget(Paragraph::new(Line::from(spans)), chunks[0]);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "q",
+                Style::default()
+                    .fg(COLOR_CORAL)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":quit ", Style::default().fg(COLOR_MUTED)),
+        ]))
+        .alignment(Alignment::Right),
+        chunks[1],
+    );
+}
+
+fn push_hint(spans: &mut Vec<Span<'static>>, key: &str, action: &str) {
+    if !spans.is_empty() {
+        spans.push(Span::raw("  "));
+    } else {
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled(
+        key.to_string(),
+        Style::default()
+            .fg(COLOR_ACCENT)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let separator = if action.starts_with(':') { "" } else { " " };
+    spans.push(Span::styled(
+        format!("{separator}{action}"),
+        Style::default().fg(COLOR_MUTED),
+    ));
 }
 
 /// Build a ratatui TableState at the given offset.
@@ -898,6 +1338,197 @@ mod tests {
             .expect("unattributed label cell");
         assert_eq!(first_label_cell.fg, Color::Yellow);
         assert!(first_label_cell.modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn top_navigation_renders_page_tabs_with_the_active_page_selected() {
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::new();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let first_line = rendered_lines(&terminal)[0].clone();
+        assert!(first_line.contains("delray  1 Overview  2 Processes  3 IPs  4 About"));
+        let overview_cell = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .find(|cell| cell.symbol() == "O")
+            .expect("Overview tab cell");
+        assert_eq!(overview_cell.bg, Color::Rgb(43, 37, 15));
+        assert!(overview_cell.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn wide_overview_uses_the_legacy_panel_grid_and_palette() {
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::new();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let lines = rendered_lines(&terminal);
+        let position = |label: &str| {
+            lines
+                .iter()
+                .enumerate()
+                .find_map(|(y, line)| {
+                    line.find(label)
+                        .map(|byte_offset| (line[..byte_offset].chars().count(), y))
+                })
+                .unwrap_or_else(|| panic!("missing panel label: {label}"))
+        };
+        let traffic = position("Traffic");
+        let inbound = position("Inbound IPs");
+        let outbound = position("Outbound IPs");
+        let processes = position("Top Processes");
+        assert!(traffic.0 < 50 && inbound.0 < 50 && outbound.0 < 50);
+        assert!(traffic.1 < inbound.1 && inbound.1 < outbound.1);
+        assert!(processes.0 > 50 && processes.1 < inbound.1);
+
+        let net_cell = &terminal.backend().buffer()[(traffic.0 as u16 - 4, traffic.1 as u16)];
+        assert_eq!(net_cell.symbol(), "n");
+        assert_eq!(net_cell.fg, Color::Rgb(167, 139, 250));
+        assert_eq!(net_cell.bg, Color::Rgb(9, 13, 20));
+    }
+
+    #[test]
+    fn eighty_column_processes_keep_full_columns_and_a_visible_selection() {
+        let snapshot = TrafficSnapshot {
+            process_data_fresh: true,
+            processes: vec![ProcessSnapshot::attributed(
+                7,
+                Some(Arc::from("curl")),
+                Some(Arc::from("/usr/bin/curl")),
+                chrono::Utc::now(),
+                40,
+                60,
+            )]
+            .into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        state.page = Page::Processes;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("proc Processes 1"));
+        assert!(rendered.contains("Process"));
+        assert!(rendered.contains("PID"));
+        assert!(rendered.contains("Recv"));
+        assert!(rendered.contains("Sent"));
+        assert!(rendered.contains("Total"));
+        assert!(rendered.contains("1/1"));
+        let selected = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .find(|cell| cell.symbol() == "c" && cell.bg == Color::Rgb(23, 43, 60))
+            .expect("selected process row");
+        assert!(selected.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn undersized_terminal_shows_only_the_minimum_size_message() {
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::new();
+        let mut terminal = Terminal::new(TestBackend::new(59, 15)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    "private-interface",
+                    "private-host",
+                    Instant::now(),
+                )
+            })
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("Terminal too small (minimum 60x16)"));
+        assert!(!rendered.contains("private-interface"));
+        assert!(!rendered.contains("private-host"));
+        assert!(!rendered.contains("Traffic"));
+    }
+
+    #[test]
+    fn compact_ips_stack_themed_panels_vertically() {
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::new();
+        state.page = Page::Ips;
+        let mut terminal = Terminal::new(TestBackend::new(72, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let lines = rendered_lines(&terminal);
+        let inbound_y = lines
+            .iter()
+            .position(|line| line.contains("in Inbound IPs"))
+            .expect("inbound panel");
+        let outbound_y = lines
+            .iter()
+            .position(|line| line.contains("out Outbound IPs"))
+            .expect("outbound panel");
+        assert!(inbound_y < outbound_y);
+        assert!(outbound_y - inbound_y >= 8);
+    }
+
+    #[test]
+    fn about_page_frames_identity_and_hides_capture_context() {
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::new();
+        state.page = Page::About;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    "private-interface",
+                    "private-host",
+                    Instant::now(),
+                )
+            })
+            .unwrap();
+
+        let lines = rendered_lines(&terminal);
+        let identity_row = lines
+            .iter()
+            .rposition(|line| line.contains("delray"))
+            .expect("about identity");
+        assert!(
+            lines[..identity_row]
+                .iter()
+                .any(|line| line.contains("────────"))
+        );
+        assert!(
+            lines[identity_row + 1..]
+                .iter()
+                .any(|line| line.contains("────────"))
+        );
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("Network Traffic Analyzer"));
+        assert!(rendered.contains("Version"));
+        assert!(!rendered.contains("private-interface"));
+        assert!(!rendered.contains("private-host"));
     }
 
     #[test]
@@ -1263,7 +1894,7 @@ mod tests {
         assert!(rendered.contains("Esc:back"));
         let inner_lines = lines
             .iter()
-            .map(|line| line.chars().skip(1).take(78).collect::<String>())
+            .map(|line| line.chars().skip(2).take(76).collect::<String>())
             .collect::<Vec<_>>();
         let path_line = inner_lines
             .iter()
