@@ -106,3 +106,13 @@
 `delray.exe 11 --output target\manual-validation\physical-ethernet.txt --diagnostics` 在同一设备上完成 plain 文件验证。输出包含接口流量、`Process	PID	Recv	Sent	Total	Path	Last Seen` 列和 ISO 8601 `Last Seen` 值，文件大小为 1,653 bytes。
 
 该记录只确认连接中的物理 Ethernet 设备能够抓取实际 IPv4 TCP/UDP 流量并写入 JSON 与 plain 文件。物理 IPv6、管理员权限差异、权限拒绝、TUI 终端交互、终端恢复和长期运行仍未验收。
+
+### 2026-07-17 Windows TUI 输入与接口标签回归修复
+
+普通用户使用 `target\release\delray.exe` 反馈三个 Windows TUI 问题：启动时接口选择器会自动确认；切换接口时一次方向键移动两行；顶部显示底层 Npcap 设备路径而非设备描述。
+
+原因是 TUI 将 Windows 的 `KeyEventKind::Release` 当作普通按键处理，因此方向键的 Press 和 Release 都会移动选择项，`Enter` 的 Release 也可能确认选择器。标题直接使用活动接口的 pcap 名称，未通过当前 `InterfaceInfo` 目录解析描述。
+
+修复后，TUI 忽略 `KeyEventKind::Release`，保留 Press 和 Repeat；顶部优先显示匹配 `InterfaceInfo.name` 的 `description`，缺少描述时回退到设备名。新增 `selector_ignores_key_release_events` 和 `header_uses_interface_description_instead_of_pcap_device_name` 回归测试。
+
+验证结果：`cargo +1.88.0 test --locked tui::tests::` 通过 31 项；`cargo +1.88.0 test --locked` 通过 124 项；格式检查、Clippy 和 release 构建均通过。新的 `target\release\delray.exe` 已生成，等待 Windows 终端人工复测。

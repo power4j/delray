@@ -7,7 +7,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -231,6 +231,10 @@ fn handle_tui_key<F>(
 where
     F: FnMut(&str) -> anyhow::Result<Activation>,
 {
+    if key.kind == KeyEventKind::Release {
+        return KeyOutcome::Ignored;
+    }
+
     if matches!(key.code, KeyCode::Char('q'))
         || matches!(key.code, KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL))
     {
@@ -720,11 +724,18 @@ fn draw_with_interfaces_at(
         ])
         .split(area);
 
+    let interface_name = interface.unwrap_or("No interface");
+    let interface_label = interfaces
+        .iter()
+        .find(|candidate| candidate.name == interface_name)
+        .map(|candidate| candidate.description.as_str())
+        .filter(|description| !description.is_empty() && *description != "No description")
+        .unwrap_or(interface_name);
     draw_header(
         f,
         chunks[0],
         state.page,
-        interface.unwrap_or("No interface"),
+        interface_label,
         host,
         started_at,
         mode,
@@ -1756,6 +1767,77 @@ mod tests {
             ),
             KeyOutcome::Quit
         );
+    }
+
+    #[test]
+    fn selector_ignores_key_release_events() {
+        let interfaces = interfaces();
+        let mut state = AppState::startup(&interfaces);
+        let mut snapshot = Arc::new(TrafficSnapshot::default());
+
+        assert_eq!(
+            handle_tui_key(
+                &mut state,
+                KeyEvent::new_with_kind(
+                    KeyCode::Down,
+                    KeyModifiers::NONE,
+                    crossterm::event::KeyEventKind::Release,
+                ),
+                &mut snapshot,
+                &interfaces,
+                None,
+                |_| unreachable!(),
+            ),
+            KeyOutcome::Ignored
+        );
+        assert_eq!(state.interface_selector.as_ref().unwrap().selected, 0);
+
+        assert_eq!(
+            handle_tui_key(
+                &mut state,
+                KeyEvent::new_with_kind(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                    crossterm::event::KeyEventKind::Release,
+                ),
+                &mut snapshot,
+                &interfaces,
+                None,
+                |_| unreachable!(),
+            ),
+            KeyOutcome::Ignored
+        );
+        assert!(state.interface_selector.is_some());
+    }
+
+    #[test]
+    fn header_uses_interface_description_instead_of_pcap_device_name() {
+        let interfaces = vec![crate::capture::InterfaceInfo {
+            name: r"\Device\NPF_{A1B2C3D4}".to_string(),
+            description: "Intel Ethernet Controller".to_string(),
+            is_default_route: true,
+        }];
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::new();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_with_interfaces(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    Some(r"\Device\NPF_{A1B2C3D4}"),
+                    &interfaces,
+                    "host",
+                    Instant::now(),
+                );
+            })
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("Intel Ethernet Controller"));
+        assert!(!rendered.contains(r"\Device\NPF_{A1B2C3D4}"));
     }
 
     #[test]
