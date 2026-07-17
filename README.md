@@ -65,21 +65,25 @@ Network traffic analyzer
 Usage: delray [OPTIONS] [INTERFACE]
 
 Arguments:
-  [INTERFACE]  Network interface to capture on (omit to list available interfaces)
+  [INTERFACE]  Network interface to capture on (omit to select interactively in plain foreground mode)
 
 Options:
-      --proc-refresh <SECONDS>  Process table refresh interval (must be > 0) [default: 2]
-      --output <FILE>           Output file for background mode (omit for foreground display)
-  -f, --format <FORMAT>         Output format: plain (default) or json [default: plain]
-  -n, --top-n <N>               Entries per top-N list (min: 1) [default: 10]
-  -h, --help                    Print help
-  -V, --version                 Print version
+      --proc-refresh <PROC_REFRESH>  Process table refresh interval in seconds (must be > 0) [default: 2]
+      --output <OUTPUT>              Output file for background mode (omit for foreground terminal display)
+  -f, --format <FORMAT>              Output format: plain (default) or json [default: plain] [possible values: plain, json]
+  -n, --top-n <TOP_N>                Number of entries per top-N list (default: 10, min: 1) [default: 10]
+      --diagnostics                  Emit process attribution diagnostics to stderr on each output refresh
+  -h, --help                         Print help
+  -V, --version                      Print version
 ```
 
 示例：
 
 ```bash
-# 前台 TUI 交互（多页：概览/进程/IP/关于）
+# 前台 TUI 交互。未指定网卡时先进入网卡选择界面
+./delray
+
+# 前台 TUI 交互，并直接打开 eth0
 ./delray eth0
 
 # 后台写文件（tab 排版，无样式）
@@ -93,4 +97,21 @@ Options:
 
 # 只显 top 3
 ./delray eth0 -n 3
+
+# 输出 JSONL，同时把进程归属诊断写到 stderr
+./delray eth0 -f json --diagnostics
 ```
+
+### 前台 TUI
+
+前台模式提供概览、进程、IP 和关于页面。启动时未指定 `INTERFACE` 会先显示网卡选择界面；运行中按 `i` 可重新打开网卡选择界面并切换抓包网卡。
+
+进程列表显示进程名、PID、路径身份对应的流量累计、`Last seen` 和未归属流量。进程详情页会保留所选进程的最后一份数据；当进程离开当前 top-N 或进程快照过期时，详情页显示 `Tracking paused` 状态，而不是自动退出。
+
+### 统计边界
+
+接口总流量在捕获到数据包时立即累计。进程归属是 best-effort：权限、网络命名空间、容器、WSL 代理路径、端口复用和系统快照时序都可能导致部分流量进入 `<unattributed traffic>`。
+
+TCP/UDP 本机 socket 查询未命中时，Delray 会把近期流量放入一个短窗口待归属队列。新进程表发布后，只有找到唯一 PID 时才提交到对应进程；超时、歧义、查询失败、陈旧进程表或队列溢出时提交到未归属流量。已经提交到进程或未归属流量的历史数据不会被后续查询追溯修改。
+
+loopback 设备可能同时看到同一传输的入站帧和出站帧。例如本机下载 10 MB 数据时，`lo` 或 WSL 的 loopback 路径可能显示约 10 MB In 和 10 MB Out，合计接近 20 MB。这是系统抓包语义，不表示公网实际下载了两倍数据。
