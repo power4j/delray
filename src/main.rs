@@ -102,6 +102,7 @@ fn main() -> ExitCode {
                 started_at,
                 top_n,
                 is_json,
+                cli.diagnostics,
             );
         }
         None => {
@@ -115,6 +116,7 @@ fn main() -> ExitCode {
                     &started_wall,
                     started_at,
                     top_n,
+                    cli.diagnostics,
                 );
             }
         }
@@ -134,6 +136,7 @@ fn background_loop(
     started_at: Instant,
     top_n: usize,
     is_json: bool,
+    diagnostics: bool,
 ) {
     let mut stats = stats::Stats::default();
     let mut attributor = attribution::PendingAttributor::default();
@@ -150,6 +153,9 @@ fn background_loop(
             if let Err(e) = res {
                 eprintln!("Failed to write output file: {e}");
             }
+            if diagnostics {
+                emit_diagnostics(proc_table, &attributor);
+            }
             next_refresh = Instant::now() + REFRESH_INTERVAL;
         }
     }
@@ -164,6 +170,7 @@ fn json_stdout_loop(
     started_wall: &chrono::DateTime<chrono::Local>,
     started_at: Instant,
     top_n: usize,
+    diagnostics: bool,
 ) {
     let mut stats = stats::Stats::default();
     let mut attributor = attribution::PendingAttributor::default();
@@ -173,9 +180,40 @@ fn json_stdout_loop(
         if Instant::now() >= next_refresh {
             attributor.advance(&mut stats, proc_table, Instant::now());
             report::render_jsonl(interface, started_wall, started_at, &stats, top_n);
+            if diagnostics {
+                emit_diagnostics(proc_table, &attributor);
+            }
             next_refresh = Instant::now() + REFRESH_INTERVAL;
         }
     }
+}
+
+fn emit_diagnostics(
+    proc_table: &proc_table::SharedProcTable,
+    attributor: &attribution::PendingAttributor,
+) {
+    let Some(proc) = proc_table::diagnostics_snapshot(proc_table) else {
+        eprintln!("diagnostics: process table unavailable");
+        return;
+    };
+    let pending = attributor.snapshot();
+    eprintln!(
+        concat!(
+            "diagnostics: lookup_hits={} lookup_misses={} no_local_socket={} ",
+            "refresh_requests={} refresh_actual={} refresh_success={} refresh_failure={} ",
+            "last_refresh_ms={} pending_records={} pending_bytes={}"
+        ),
+        proc.lookup_hits,
+        proc.lookup_misses,
+        proc.no_local_socket,
+        proc.refresh_requests,
+        proc.refresh_actual,
+        proc.refresh_success,
+        proc.refresh_failure,
+        proc.last_refresh_duration.as_millis(),
+        pending.records,
+        pending.bytes,
+    );
 }
 
 fn process_next<N, E>(
@@ -220,6 +258,9 @@ struct Cli {
     /// Number of entries per top-N list (default: 10, min: 1)
     #[arg(long = "top-n", short = 'n', default_value_t = DEFAULT_TOP_N, value_parser = clap::value_parser!(u64).range(1..))]
     top_n: u64,
+    /// Emit process attribution diagnostics to stderr on each output refresh
+    #[arg(long)]
+    diagnostics: bool,
 }
 
 fn positive_u64(s: &str) -> Result<u64, String> {
@@ -286,6 +327,15 @@ mod cli_tests {
         assert_eq!(cli.interface.as_deref(), Some("eth0"));
         assert_eq!(cli.proc_refresh, 5);
         assert_eq!(cli.output.as_deref(), Some("out.txt"));
+        assert!(!cli.diagnostics);
+    }
+
+    #[test]
+    fn diagnostics_flag_is_available_for_linux_validation() {
+        let cli =
+            Cli::try_parse_from(["delray", "eth0", "--format", "json", "--diagnostics"]).unwrap();
+
+        assert!(cli.diagnostics);
     }
 
     #[test]

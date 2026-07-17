@@ -11,6 +11,12 @@ use crate::stats::{Direction, ObservedProcess, Stats};
 pub(crate) const PENDING_ATTRIBUTION_WINDOW: Duration = Duration::from_secs(1);
 pub(crate) const PENDING_ATTRIBUTION_CAPACITY: usize = 1_024;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PendingAttributionSnapshot {
+    pub records: usize,
+    pub bytes: u64,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ConnectionKey {
     local_socket: LocalSocket,
@@ -141,7 +147,14 @@ impl PendingAttributor {
 
     #[cfg(test)]
     fn pending_bytes(&self) -> u64 {
-        self.pending.iter().map(|pending| pending.bytes).sum()
+        self.snapshot().bytes
+    }
+
+    pub(crate) fn snapshot(&self) -> PendingAttributionSnapshot {
+        PendingAttributionSnapshot {
+            records: self.pending.len(),
+            bytes: self.pending.iter().map(|pending| pending.bytes).sum(),
+        }
     }
 
     fn record_endpoint(

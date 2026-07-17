@@ -53,7 +53,6 @@ struct ProcDiagnostics {
     last_refresh_duration_nanos: AtomicU64,
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProcDiagnosticsSnapshot {
     pub lookup_hits: u64,
@@ -161,7 +160,6 @@ impl ProcTable {
             .store(nanos, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
     fn diagnostics_snapshot(&self) -> ProcDiagnosticsSnapshot {
         ProcDiagnosticsSnapshot {
             lookup_hits: self.diagnostics.lookup_hits.load(Ordering::Relaxed),
@@ -299,7 +297,6 @@ pub(crate) fn request_refresh(table: &SharedProcTable) -> bool {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn diagnostics_snapshot(table: &SharedProcTable) -> Option<ProcDiagnosticsSnapshot> {
     table.read().ok().map(|table| table.diagnostics_snapshot())
 }
