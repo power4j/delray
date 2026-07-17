@@ -96,3 +96,13 @@
 结果：stdout 产生 1 行 JSONL；最后一帧 `interface` 为 `\Device\NPF_Loopback`，`totals.in_bytes=1577893`，`totals.out_bytes=1578017`，`top_processes` 包含 9 条记录，至少一条进程记录包含 `path` 和 `last_seen`。stderr 输出 diagnostics，例如 `lookup_hits=2663`、`lookup_misses=2158`、`refresh_success=5`、`refresh_failure=0`、`pending_records=8`。
 
 本轮未修改 Rust 源码。Windows 构建问题来自 SDK 链接环境，后续 Windows 验证也未发现需要复制或分叉统计、报告或 TUI 业务逻辑的问题。
+
+### 2026-07-17 物理 Ethernet 输出后续验证
+
+`ipconfig /all` 显示当前连接的默认链路为 ASIX USB to Gigabit Ethernet Family Adapter，IPv4 地址为 `192.168.100.102`。Npcap 设备列表中的编号 `11` 对应该适配器；编号 `10` 的 Intel Wi-Fi 适配器已断开，因此其零流量观察不作为物理网卡验证。
+
+在同一普通用户会话中，`delray.exe 11 --format json --output target\manual-validation\physical-ethernet.json --diagnostics` 运行期间，对 `192.168.0.1` 和 `61.139.2.69` 完成 DNS 查询，并尝试 TCP 连接 `192.168.0.1:80`。最后的 JSON 文件记录 `interface` 为 `\Device\NPF_{CFC6B06D-F53F-4FD8-94DB-50405A44A5A7}`，`totals.in_bytes=216538`，`totals.out_bytes=1720308`，包含 10 条进程记录、1 条未归属流量、至少 3 条带 `path` 的进程记录、带 `last_seen` 的进程记录以及入站和出站 IP 统计。stderr 的最后两次 diagnostics 均为 `refresh_success` 非零、`refresh_failure=0`。
+
+`delray.exe 11 --output target\manual-validation\physical-ethernet.txt --diagnostics` 在同一设备上完成 plain 文件验证。输出包含接口流量、`Process	PID	Recv	Sent	Total	Path	Last Seen` 列和 ISO 8601 `Last Seen` 值，文件大小为 1,653 bytes。
+
+该记录只确认连接中的物理 Ethernet 设备能够抓取实际 IPv4 TCP/UDP 流量并写入 JSON 与 plain 文件。物理 IPv6、管理员权限差异、权限拒绝、TUI 终端交互、终端恢复和长期运行仍未验收。
