@@ -113,6 +113,6 @@
 
 原因是 TUI 将 Windows 的 `KeyEventKind::Release` 当作普通按键处理，因此方向键的 Press 和 Release 都会移动选择项，`Enter` 的 Release 也可能确认选择器。标题直接使用活动接口的 pcap 名称，未通过当前 `InterfaceInfo` 目录解析描述。
 
-修复后，TUI 忽略 `KeyEventKind::Release`，保留 Press 和 Repeat；顶部优先显示匹配 `InterfaceInfo.name` 的 `description`，缺少描述时回退到设备名。新增 `selector_ignores_key_release_events` 和 `header_uses_interface_description_instead_of_pcap_device_name` 回归测试。
+修复后，TUI 忽略 `KeyEventKind::Release`，保留 Press 和 Repeat；顶部优先显示匹配 `InterfaceInfo.name` 的 `description`，缺少描述时回退到设备名。新增 `selector_ignores_releases_and_handles_press_and_repeat`、`header_uses_interface_description_instead_of_pcap_device_name` 和 `interface_label_falls_back_to_pcap_name_without_a_description` 回归测试。
 
-验证结果：`cargo +1.88.0 test --locked tui::tests::` 通过 31 项；`cargo +1.88.0 test --locked` 通过 124 项；格式检查、Clippy 和 release 构建均通过。新的 `target\release\delray.exe` 已生成，等待 Windows 终端人工复测。
+验证结果：`cargo +1.88.0 test --locked tui::tests::` 通过 32 项；`cargo +1.88.0 test --locked` 通过 125 项；格式检查、Clippy 和 release 构建均通过。新的 `target\release\delray.exe` 已生成，等待 Windows 终端人工复测。
