@@ -7,10 +7,10 @@
 **Status:** ready-for-human
 
 - [x] 从已经合并 Linux 共享改造的最新主干创建 `windows-support` 短期分支。
-- [ ] 记录 Windows、Rust 1.88、Npcap SDK 和 Npcap 运行时版本。
-- [ ] 在 Windows `x86_64` 完成锁定依赖的测试、格式检查、Clippy 和 release 构建。
-- [ ] 生成能够启动并列出 Npcap 设备的 `delray.exe`。
-- [ ] 数字编号和完整 Npcap 设备名都能够选择网卡。
+- [x] 记录 Windows、Rust 1.88、Npcap SDK 和 Npcap 运行时版本。
+- [x] 在 Windows `x86_64` 完成锁定依赖的测试、格式检查、Clippy 和 release 构建。
+- [x] 生成能够启动并列出 Npcap 设备的 `delray.exe`。
+- [x] 数字编号和完整 Npcap 设备名都能够选择网卡。
 - [ ] 缺少 Npcap、设备不存在和权限不足时显示明确英文错误。
 - [ ] 普通用户可以运行；管理员权限只提高受保护进程的归属完整度。
 - [ ] Windows 修正复用共享模块，不复制统计、报告或 TUI 业务逻辑。
@@ -47,3 +47,36 @@
 本轮没有伪造 `wpcap.lib`、下载 Npcap SDK，或针对环境问题修改、复制统计、报告和 TUI 业务逻辑。release build、`delray.exe` 启动、设备列表、真实设备选择、缺少 Npcap、权限不足，以及普通用户和管理员权限差异均未完成。由于 release build 受阻，本轮未进入 ticket 08 的输出模式和 TUI 人工验收，也未复跑 ticket 06 的 Linux 真机验收。
 
 下一步需要安装官方 Npcap SDK，将其 x64 `Lib` 目录配置到 `LIBPCAP_LIBDIR`，然后重新运行上述命令和 `cargo +1.88.0 build --release --locked`。release build 成功后，再继续 `delray.exe` 启动、Npcap 设备、错误和权限的人工验证。
+
+## Comments
+
+### 2026-07-17 SDK 1.16 后续验证记录
+
+### 环境
+
+- Npcap SDK：1.16，路径为 `D:\runtime\npcap\npcap-sdk-1.16`；其 `Lib\x64` 包含 `wpcap.lib` 和 `Packet.lib`。
+- SDK 随附的 `SDK_CHANGELOG.md` 标明其 libpcap 版本为 1.10.6，与已安装的 `wpcap.dll` 1.10.6 一致；`Packet.dll` 版本为 1.88。
+- 构建进程仅设置 `LIBPCAP_LIBDIR=D:\runtime\npcap\npcap-sdk-1.16\Lib\x64`，未设置 `LIBPCAP_VER`，也未修改机器级环境变量。
+- 当前验证会话为 Medium integrity，属于 `BUILTIN\Users`，未提升为管理员。
+
+### 命令与结果
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo +1.88.0 check --locked` | 通过。`pcap 2.4.0` 和 Delray 均完成 Windows 编译。 |
+| `cargo +1.88.0 test --locked` | 通过：122 项测试通过，0 项失败。 |
+| `cargo +1.88.0 fmt --all -- --check` | 通过。 |
+| `cargo +1.88.0 clippy --locked --all-targets --all-features -- -D warnings` | 通过。 |
+| `cargo +1.88.0 build --release --locked` | 通过，生成 `target\release\delray.exe`。 |
+| `delray.exe --format json` | 按预期因缺少显式网卡以失败状态退出，并列出 14 个 Npcap 设备，其中包括 `\Device\NPF_Loopback`。 |
+| `delray.exe 13 --format json` | 在 Npcap Loopback 上运行 7 秒后主动停止；输出 JSON，`interface` 为 `\Device\NPF_Loopback`。 |
+| `delray.exe \Device\NPF_Loopback --format json` | 在同一设备上运行 7 秒后主动停止；输出 JSON，确认完整 Npcap 设备名可用。 |
+| `delray.exe missing-interface --format json` | 按预期以失败状态退出，并显示英文错误：`Failed to open interface: Interface not found: missing-interface`。 |
+
+两个有界运行都在普通用户会话中完成，并产生 Loopback 的真实流量统计。它们仅用于确认 release 可执行文件能够启动、打开设备和接受两种选择形式；不构成 ticket 08 的完整流量、进程归属或输出模式验收。
+
+### 结论与遗留问题
+
+本机 SDK 缺失导致的 `LNK1181` 已解除，无需设置 `LIBPCAP_VER`，也未发现需要修改 Windows 源码或复制共享业务逻辑的问题。已有自动化测试同时覆盖数字编号、完整设备名和无效选择；本次 Windows 测试二进制也已实际运行。
+
+缺少 Npcap 的错误未通过卸载或破坏运行时验证。权限不足、管理员与普通用户的归属差异、物理网卡、TCP/UDP、IPv4/IPv6 的完整组合，以及 plain、JSON/JSONL、TUI、终端恢复和持续运行仍属于 ticket 08 的人工验收，相关 checklist 保持未勾选。README 支持平台声明未改动；未下载、复制或提交 Npcap、`delray.exe`、构建产物、安装包或签名文件。
