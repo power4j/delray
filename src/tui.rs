@@ -826,15 +826,15 @@ fn draw_interface_selector(
                         Cell::from(format!("{}.", index + 1)),
                         Cell::from(format!(
                             "{}\n{}  {}",
-                            interface.name, interface.description, marker
+                            interface.description, interface.name, marker
                         )),
                     ])
                     .height(2)
                 } else {
                     Row::new(vec![
                         Cell::from(format!("{}.", index + 1)),
-                        Cell::from(interface.name.clone()),
                         Cell::from(interface.description.clone()),
+                        Cell::from(interface.name.clone()),
                         Cell::from(marker),
                     ])
                 }
@@ -851,8 +851,8 @@ fn draw_interface_selector(
             rows,
             [
                 Constraint::Length(3),
-                Constraint::Min(50),
                 Constraint::Min(18),
+                Constraint::Min(50),
                 Constraint::Length(24),
             ],
         )
@@ -2141,7 +2141,41 @@ mod tests {
             })
             .unwrap();
 
-        assert!(rendered_lines(&terminal).join("\n").contains(pcap_name));
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains(pcap_name));
+        assert!(rendered.find("Npcap Adapter").unwrap() < rendered.find(pcap_name).unwrap());
+    }
+
+    #[test]
+    fn selector_renders_friendly_name_before_pcap_name() {
+        let pcap_name = r"\Device\NPF_{12345678-1234-1234-1234-123456789ABC}";
+        let interfaces = vec![crate::capture::InterfaceInfo {
+            name: pcap_name.to_string(),
+            description: "Intel Ethernet Controller".to_string(),
+            is_default_route: false,
+        }];
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::startup(&interfaces);
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_with_interfaces(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    None,
+                    &interfaces,
+                    "host",
+                    Instant::now(),
+                );
+            })
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(
+            rendered.find("Intel Ethernet Controller").unwrap() < rendered.find(pcap_name).unwrap()
+        );
     }
 
     #[test]

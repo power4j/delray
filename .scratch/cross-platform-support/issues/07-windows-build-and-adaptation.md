@@ -116,3 +116,13 @@
 修复后，TUI 忽略 `KeyEventKind::Release`，保留 Press 和 Repeat；顶部优先显示匹配 `InterfaceInfo.name` 的 `description`，缺少描述时回退到设备名。新增 `selector_ignores_releases_and_handles_press_and_repeat`、`header_uses_interface_description_instead_of_pcap_device_name` 和 `interface_label_falls_back_to_pcap_name_without_a_description` 回归测试。
 
 验证结果：`cargo +1.88.0 test --locked tui::tests::` 通过 32 项；`cargo +1.88.0 test --locked` 通过 125 项；格式检查、Clippy 和 release 构建均通过。新的 `target\release\delray.exe` 已生成，等待 Windows 终端人工复测。
+
+### 2026-07-17 Windows 网卡名称与进程名回退修复
+
+Windows 网卡选择器调整为先显示 `InterfaceInfo.description`，再显示完整 Npcap 设备名；宽屏和紧凑布局均保留编号、完整设备名和标记。新增 `selector_renders_friendly_name_before_pcap_name` 渲染测试。
+
+进程表此前丢弃 `listeners::Process.name`，只从进程路径提取显示名。Windows 的 `listeners 0.6` 在路径查询失败时仍通过 Toolhelp 返回稳定的可执行文件名，因此路径为空会被错误显示为 `?`。修复后优先使用路径 basename；路径为空时使用非空的 `listeners::Process.name`。PID + 可选路径统计身份、历史流量和未归属流量语义保持不变；名称和路径都不可用时仍显示 `?`。
+
+新 release 在连接中的 Ethernet 设备 `11` 上进行 JSON 验证：9 条进程记录中，已归属 PID 的 `name: null` 为 0；其中 5 条记录保留 `path: null`，但显示 `GameViewerServer.exe`、`tailscaled.exe`、`cloudflared.exe` 等名称；未归属流量仍为单独记录。新增 `missing_executable_path_uses_listener_process_name` 测试。
+
+验证结果：`cargo +1.88.0 test --locked` 通过 126 项；格式检查、Clippy 和 release 构建均通过。新的 `target\release\delray.exe` 已生成，等待 Windows TUI 人工复测。
