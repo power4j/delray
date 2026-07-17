@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::capture::{CaptureSource, Flow};
-use crate::proc_table::SharedProcTable;
+use crate::proc_table::{self, SharedProcTable};
 use crate::stats::{ObservedProcess, Stats, TrafficSnapshot};
 
 const STOP_CHECK_INTERVAL: Duration = Duration::from_millis(100);
@@ -159,14 +159,26 @@ fn resolve_process(
     socket: Option<crate::capture::LocalSocket>,
     proc_table: &SharedProcTable,
 ) -> Option<ObservedProcess> {
-    let socket = socket?;
+    let Some(socket) = socket else {
+        proc_table::record_no_local_socket(proc_table);
+        return None;
+    };
     let table = proc_table.read().ok()?;
-    let process = table.lookup(socket.ip, socket.port, socket.protocol)?;
-    Some(ObservedProcess {
-        pid: process.pid,
-        name: process.name.clone(),
-        path: process.path.clone(),
-    })
+    let process = table
+        .lookup(socket.ip, socket.port, socket.protocol)
+        .map(|process| ObservedProcess {
+            pid: process.pid,
+            name: process.name.clone(),
+            path: process.path.clone(),
+        });
+    if process.is_some() {
+        table.record_lookup_hit();
+        return process;
+    }
+    table.record_lookup_miss();
+    drop(table);
+    proc_table::request_refresh(proc_table);
+    None
 }
 
 pub struct TrafficPipeline {
@@ -710,6 +722,7 @@ mod tests {
             Some(Arc::from("/usr/bin/curl")),
         );
         let proc_table = Arc::new(RwLock::new(table));
+        let diagnostics_table = proc_table.clone();
         let (flow_tx, flow_rx) = sync_channel(1);
         let (snapshot_tx, snapshot_rx) = sync_channel(2);
         flow_tx
@@ -751,6 +764,9 @@ mod tests {
         assert_eq!(snapshot.processes[0].path(), Some("/usr/bin/curl"));
         assert_eq!(snapshot.processes[0].sent, 120);
         assert!(snapshot.process_data_fresh);
+        let diagnostics = proc_table::diagnostics_snapshot(&diagnostics_table).unwrap();
+        assert_eq!(diagnostics.lookup_hits, 1);
+        assert_eq!(diagnostics.lookup_misses, 0);
         stop.store(true, Ordering::Release);
         drop(flow_tx);
         worker.join().unwrap();
@@ -777,6 +793,7 @@ mod tests {
             Some(Arc::from("/usr/bin/curl")),
         );
         let proc_table = Arc::new(RwLock::new(table));
+        let diagnostics_table = proc_table.clone();
         let (flow_tx, flow_rx) = sync_channel(1);
         let (snapshot_tx, snapshot_rx) = sync_channel(2);
         flow_tx
@@ -830,6 +847,9 @@ mod tests {
         assert_eq!(snapshot.out_bytes, 120);
         assert_eq!((server.recv, server.sent), (0, 120));
         assert_eq!((client.recv, client.sent), (120, 0));
+        let diagnostics = proc_table::diagnostics_snapshot(&diagnostics_table).unwrap();
+        assert_eq!(diagnostics.lookup_hits, 2);
+        assert_eq!(diagnostics.lookup_misses, 0);
         stop.store(true, Ordering::Release);
         drop(flow_tx);
         worker.join().unwrap();
@@ -870,6 +890,10 @@ mod tests {
         assert_eq!(snapshot.processes.len(), 1);
         assert!(snapshot.processes[0].is_unattributed());
         assert_eq!(snapshot.processes[0].sent, 100);
+        let diagnostics = proc_table::diagnostics_snapshot(&proc_table).unwrap();
+        assert_eq!(diagnostics.lookup_hits, 0);
+        assert_eq!(diagnostics.lookup_misses, 2);
+        assert_eq!(diagnostics.refresh_requests, 2);
     }
 
     #[test]
@@ -906,6 +930,23 @@ mod tests {
             .unwrap();
         assert_eq!(unattributed.sent, 40);
         assert_eq!(attributed.sent, 60);
+        let diagnostics = proc_table::diagnostics_snapshot(&proc_table).unwrap();
+        assert_eq!(diagnostics.lookup_hits, 1);
+        assert_eq!(diagnostics.lookup_misses, 1);
+        assert_eq!(diagnostics.refresh_requests, 1);
+    }
+
+    #[test]
+    fn resolve_process_records_flows_without_local_sockets() {
+        let proc_table = Arc::new(RwLock::new(ProcTable::default()));
+
+        let process = resolve_process(None, &proc_table);
+
+        assert!(process.is_none());
+        let diagnostics = proc_table::diagnostics_snapshot(&proc_table).unwrap();
+        assert_eq!(diagnostics.no_local_socket, 1);
+        assert_eq!(diagnostics.lookup_hits, 0);
+        assert_eq!(diagnostics.lookup_misses, 0);
     }
 
     #[test]

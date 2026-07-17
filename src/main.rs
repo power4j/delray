@@ -183,13 +183,9 @@ fn process_next<N, E>(
 {
     match next_flow() {
         Ok(Some(flow)) => {
-            let process = flow
-                .local_socket
-                .and_then(|socket| lookup_process(proc_table, socket));
+            let process = lookup_optional_process(proc_table, flow.local_socket);
             if flow.peer_local_socket.is_some() {
-                let peer_process = flow
-                    .peer_local_socket
-                    .and_then(|socket| lookup_process(proc_table, socket));
+                let peer_process = lookup_optional_process(proc_table, flow.peer_local_socket);
                 stats.record_flow_processes(flow, process, peer_process);
             } else {
                 stats.record_flow(flow, process);
@@ -202,17 +198,37 @@ fn process_next<N, E>(
     }
 }
 
+fn lookup_optional_process(
+    proc_table: &proc_table::SharedProcTable,
+    socket: Option<capture::LocalSocket>,
+) -> Option<stats::ObservedProcess> {
+    let Some(socket) = socket else {
+        proc_table::record_no_local_socket(proc_table);
+        return None;
+    };
+    lookup_process(proc_table, socket)
+}
+
 fn lookup_process(
     proc_table: &proc_table::SharedProcTable,
     socket: capture::LocalSocket,
 ) -> Option<stats::ObservedProcess> {
     let table = proc_table.read().ok()?;
-    let process = table.lookup(socket.ip, socket.port, socket.protocol)?;
-    Some(stats::ObservedProcess {
-        pid: process.pid,
-        name: process.name.clone(),
-        path: process.path.clone(),
-    })
+    let process = table
+        .lookup(socket.ip, socket.port, socket.protocol)
+        .map(|process| stats::ObservedProcess {
+            pid: process.pid,
+            name: process.name.clone(),
+            path: process.path.clone(),
+        });
+    if process.is_some() {
+        table.record_lookup_hit();
+        return process;
+    }
+    table.record_lookup_miss();
+    drop(table);
+    proc_table::request_refresh(proc_table);
+    None
 }
 
 /// CLI arguments.
@@ -273,6 +289,8 @@ mod scheduling_tests {
 
         assert_eq!(calls, 1);
         assert_eq!(stats.snapshot(10).in_bytes, 64);
+        let diagnostics = proc_table::diagnostics_snapshot(&proc_table).unwrap();
+        assert_eq!(diagnostics.no_local_socket, 1);
     }
 }
 

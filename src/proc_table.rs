@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,6 +17,8 @@ pub struct ProcTable {
     entries: HashMap<SocketKey, HashMap<u32, ProcInfo>>,
     refreshed_at: Option<Instant>,
     max_age: Duration,
+    refresh_tx: Option<SyncSender<RefreshRequest>>,
+    diagnostics: Arc<ProcDiagnostics>,
 }
 
 pub struct ProcInfo {
@@ -33,6 +37,40 @@ struct ListenerRecord {
 
 pub type SharedProcTable = Arc<RwLock<ProcTable>>;
 type ThreadTask = Box<dyn FnOnce() + Send + 'static>;
+type RefreshRequest = ();
+
+#[derive(Default)]
+struct ProcDiagnostics {
+    lookup_hits: AtomicU64,
+    lookup_misses: AtomicU64,
+    no_local_socket: AtomicU64,
+    refresh_requests: AtomicU64,
+    refresh_actual: AtomicU64,
+    refresh_success: AtomicU64,
+    refresh_failure: AtomicU64,
+    refresh_duration_nanos: AtomicU64,
+    last_refresh_duration_nanos: AtomicU64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProcDiagnosticsSnapshot {
+    pub lookup_hits: u64,
+    pub lookup_misses: u64,
+    pub no_local_socket: u64,
+    pub refresh_requests: u64,
+    pub refresh_actual: u64,
+    pub refresh_success: u64,
+    pub refresh_failure: u64,
+    pub refresh_duration: Duration,
+    pub last_refresh_duration: Duration,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RefreshWake {
+    Periodic,
+    Requested,
+}
 
 impl ProcTable {
     pub(crate) fn is_fresh(&self) -> bool {
@@ -71,6 +109,76 @@ impl ProcTable {
             .flatten()
     }
 
+    pub(crate) fn record_lookup_hit(&self) {
+        self.diagnostics.lookup_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_lookup_miss(&self) {
+        self.diagnostics
+            .lookup_misses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_no_local_socket(&self) {
+        self.diagnostics
+            .no_local_socket
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_refresh_request(&self) {
+        self.diagnostics
+            .refresh_requests
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_refresh_start(&self) {
+        self.diagnostics
+            .refresh_actual
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_refresh_result(&self, success: bool, duration: Duration) {
+        if success {
+            self.diagnostics
+                .refresh_success
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.diagnostics
+                .refresh_failure
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let nanos = duration.as_nanos().min(u128::from(u64::MAX)) as u64;
+        self.diagnostics
+            .refresh_duration_nanos
+            .fetch_add(nanos, Ordering::Relaxed);
+        self.diagnostics
+            .last_refresh_duration_nanos
+            .store(nanos, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn diagnostics_snapshot(&self) -> ProcDiagnosticsSnapshot {
+        ProcDiagnosticsSnapshot {
+            lookup_hits: self.diagnostics.lookup_hits.load(Ordering::Relaxed),
+            lookup_misses: self.diagnostics.lookup_misses.load(Ordering::Relaxed),
+            no_local_socket: self.diagnostics.no_local_socket.load(Ordering::Relaxed),
+            refresh_requests: self.diagnostics.refresh_requests.load(Ordering::Relaxed),
+            refresh_actual: self.diagnostics.refresh_actual.load(Ordering::Relaxed),
+            refresh_success: self.diagnostics.refresh_success.load(Ordering::Relaxed),
+            refresh_failure: self.diagnostics.refresh_failure.load(Ordering::Relaxed),
+            refresh_duration: Duration::from_nanos(
+                self.diagnostics
+                    .refresh_duration_nanos
+                    .load(Ordering::Relaxed),
+            ),
+            last_refresh_duration: Duration::from_nanos(
+                self.diagnostics
+                    .last_refresh_duration_nanos
+                    .load(Ordering::Relaxed),
+            ),
+        }
+    }
+
     fn from_records(records: impl IntoIterator<Item = ListenerRecord>) -> Self {
         let mut entries: HashMap<SocketKey, HashMap<u32, ProcInfo>> = HashMap::new();
         for record in records {
@@ -89,6 +197,8 @@ impl ProcTable {
             entries,
             refreshed_at: None,
             max_age: Duration::ZERO,
+            refresh_tx: None,
+            diagnostics: Arc::new(ProcDiagnostics::default()),
         }
     }
 
@@ -98,10 +208,14 @@ impl ProcTable {
         refreshed_at: Instant,
         refresh: Duration,
     ) -> Result<(), String> {
+        let refresh_tx = self.refresh_tx.clone();
+        let diagnostics = self.diagnostics.clone();
         let records = result?;
         let mut next = Self::from_records(records);
         next.refreshed_at = Some(refreshed_at);
         next.max_age = refresh.saturating_mul(2);
+        next.refresh_tx = refresh_tx;
+        next.diagnostics = diagnostics;
         *self = next;
         Ok(())
     }
@@ -130,6 +244,41 @@ impl ProcTable {
                 },
             );
     }
+}
+
+pub(crate) fn record_no_local_socket(table: &SharedProcTable) {
+    if let Ok(table) = table.read() {
+        table.record_no_local_socket();
+    }
+}
+
+pub(crate) fn request_refresh(table: &SharedProcTable) -> bool {
+    let (refresh_tx, requested) = match table.read() {
+        Ok(table) => {
+            table.record_refresh_request();
+            (table.refresh_tx.clone(), true)
+        }
+        Err(error) => {
+            eprintln!("Failed to request process table refresh: {error}");
+            (None, false)
+        }
+    };
+    if !requested {
+        return false;
+    }
+    let Some(refresh_tx) = refresh_tx else {
+        return false;
+    };
+    match refresh_tx.try_send(()) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => false,
+        Err(TrySendError::Disconnected(_)) => false,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn diagnostics_snapshot(table: &SharedProcTable) -> Option<ProcDiagnosticsSnapshot> {
+    table.read().ok().map(|table| table.diagnostics_snapshot())
 }
 
 fn wildcard_for(ip: IpAddr) -> IpAddr {
@@ -169,13 +318,12 @@ fn executable_name(path: &str) -> Option<&str> {
 
 /// Build the initial process table synchronously, then refresh it in the background.
 pub fn spawn(refresh: Duration) -> SharedProcTable {
+    let min_request_interval = request_refresh_min_interval(refresh);
     spawn_using(
         refresh,
+        min_request_interval,
         query,
-        |duration| {
-            thread::sleep(duration);
-            true
-        },
+        wait_for_refresh,
         |task| {
             thread::spawn(task);
         },
@@ -184,38 +332,97 @@ pub fn spawn(refresh: Duration) -> SharedProcTable {
 
 fn spawn_using<Q, W, S>(
     refresh: Duration,
+    min_request_interval: Duration,
     mut query: Q,
     mut wait: W,
     spawn_thread: S,
 ) -> SharedProcTable
 where
     Q: FnMut() -> Result<Vec<ListenerRecord>, String> + Send + 'static,
-    W: FnMut(Duration) -> bool + Send + 'static,
+    W: FnMut(Duration, &Receiver<RefreshRequest>) -> Option<RefreshWake> + Send + 'static,
     S: FnOnce(ThreadTask),
 {
     let table: SharedProcTable = Arc::new(RwLock::new(ProcTable::default()));
-    refresh_table(&table, query(), refresh);
+    let (refresh_tx, refresh_rx) = std::sync::mpsc::sync_channel(1);
+    if let Ok(mut table) = table.write() {
+        table.refresh_tx = Some(refresh_tx);
+    }
+    run_refresh(&table, &mut query, refresh);
 
     let handle = table.clone();
     spawn_thread(Box::new(move || {
+        let mut last_requested_refresh = None;
         loop {
-            if !wait(refresh) {
+            let Some(wake) = wait(refresh, &refresh_rx) else {
                 return;
+            };
+            if wake == RefreshWake::Requested {
+                let now = Instant::now();
+                if last_requested_refresh
+                    .is_some_and(|last| now.saturating_duration_since(last) < min_request_interval)
+                {
+                    drain_refresh_requests(&refresh_rx);
+                    continue;
+                }
+                last_requested_refresh = Some(now);
             }
-            let result = query();
-            refresh_table(&handle, result, refresh);
+            run_refresh(&handle, &mut query, refresh);
+            drain_refresh_requests(&refresh_rx);
         }
     }));
     table
+}
+
+fn wait_for_refresh(
+    duration: Duration,
+    refresh_rx: &Receiver<RefreshRequest>,
+) -> Option<RefreshWake> {
+    match refresh_rx.recv_timeout(duration) {
+        Ok(()) => Some(RefreshWake::Requested),
+        Err(RecvTimeoutError::Timeout) => Some(RefreshWake::Periodic),
+        Err(RecvTimeoutError::Disconnected) => None,
+    }
+}
+
+fn request_refresh_min_interval(refresh: Duration) -> Duration {
+    refresh.min(Duration::from_secs(1))
+}
+
+fn drain_refresh_requests(refresh_rx: &Receiver<RefreshRequest>) {
+    loop {
+        match refresh_rx.try_recv() {
+            Ok(()) => {}
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => return,
+        }
+    }
+}
+
+fn run_refresh<Q>(table: &SharedProcTable, query: &mut Q, refresh: Duration)
+where
+    Q: FnMut() -> Result<Vec<ListenerRecord>, String>,
+{
+    if let Ok(table) = table.read() {
+        table.record_refresh_start();
+    }
+    let started_at = Instant::now();
+    let result = query();
+    let duration = started_at.elapsed();
+    let success = result.is_ok();
+    refresh_table(table, result, refresh, duration);
+    if let Ok(table) = table.read() {
+        table.record_refresh_result(success, duration);
+    }
 }
 
 fn refresh_table(
     table: &SharedProcTable,
     result: Result<Vec<ListenerRecord>, String>,
     refresh: Duration,
+    duration: Duration,
 ) {
     if let Err(error) = &result {
-        eprintln!("Failed to refresh process table: {error}");
+        eprintln!("Failed to refresh process table after {duration:?}: {error}");
     }
     match table.write() {
         Ok(mut table) => {
@@ -277,6 +484,7 @@ mod tests {
 
         let table = spawn_using(
             Duration::from_secs(5),
+            Duration::from_secs(1),
             move || {
                 Ok(vec![record(
                     ip,
@@ -286,7 +494,7 @@ mod tests {
                     "/usr/bin/curl",
                 )])
             },
-            |_| false,
+            |_, _| None,
             move |task| task_tx.send(task).unwrap(),
         );
 
@@ -309,11 +517,12 @@ mod tests {
 
         let _table = spawn_using(
             Duration::from_secs(5),
+            Duration::from_secs(1),
             move || {
                 query_count.fetch_add(1, Ordering::SeqCst);
                 Ok(Vec::new())
             },
-            |_| false,
+            |_, _| None,
             move |task| task_tx.send(task).unwrap(),
         );
         task_rx.recv().unwrap()();
@@ -340,8 +549,9 @@ mod tests {
 
         let table = spawn_using(
             Duration::from_secs(5),
+            Duration::from_secs(1),
             move || results.next().expect("only two queries are expected"),
-            move |_| std::mem::replace(&mut first_wait, false),
+            move |_, _| std::mem::replace(&mut first_wait, false).then_some(RefreshWake::Periodic),
             move |task| task_tx.send(task).unwrap(),
         );
 
@@ -361,6 +571,167 @@ mod tests {
                 .map(|process| process.pid),
             Some(7)
         );
+    }
+
+    #[test]
+    fn refresh_request_triggers_one_background_refresh() {
+        let queries = Arc::new(AtomicUsize::new(0));
+        let query_count = queries.clone();
+        let (task_tx, task_rx) = sync_channel(1);
+        let table = spawn_using(
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            move || {
+                query_count.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            },
+            |_, refresh_rx| match refresh_rx.try_recv() {
+                Ok(()) => Some(RefreshWake::Requested),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => None,
+            },
+            move |task| task_tx.send(task).unwrap(),
+        );
+
+        assert!(request_refresh(&table));
+        task_rx.recv().unwrap()();
+
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
+        let diagnostics = diagnostics_snapshot(&table).unwrap();
+        assert_eq!(diagnostics.refresh_requests, 1);
+        assert_eq!(diagnostics.refresh_actual, 2);
+        assert_eq!(diagnostics.refresh_success, 2);
+        assert_eq!(diagnostics.refresh_failure, 0);
+    }
+
+    #[test]
+    fn burst_refresh_requests_are_coalesced() {
+        let queries = Arc::new(AtomicUsize::new(0));
+        let query_count = queries.clone();
+        let (task_tx, task_rx) = sync_channel(1);
+        let table = spawn_using(
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            move || {
+                query_count.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            },
+            |_, refresh_rx| match refresh_rx.try_recv() {
+                Ok(()) => Some(RefreshWake::Requested),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => None,
+            },
+            move |task| task_tx.send(task).unwrap(),
+        );
+
+        assert!(request_refresh(&table));
+        assert!(!request_refresh(&table));
+        task_rx.recv().unwrap()();
+
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
+        let diagnostics = diagnostics_snapshot(&table).unwrap();
+        assert_eq!(diagnostics.refresh_requests, 2);
+        assert_eq!(diagnostics.refresh_actual, 2);
+    }
+
+    #[test]
+    fn requested_refreshes_are_rate_limited() {
+        let queries = Arc::new(AtomicUsize::new(0));
+        let query_count = queries.clone();
+        let mut wakes = vec![
+            Some(RefreshWake::Requested),
+            Some(RefreshWake::Requested),
+            None,
+        ]
+        .into_iter();
+        let (task_tx, task_rx) = sync_channel(1);
+        let _table = spawn_using(
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            move || {
+                query_count.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            },
+            move |_, _| wakes.next().unwrap(),
+            move |task| task_tx.send(task).unwrap(),
+        );
+        task_rx.recv().unwrap()();
+
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn periodic_refresh_continues_after_requested_refresh() {
+        let queries = Arc::new(AtomicUsize::new(0));
+        let query_count = queries.clone();
+        let mut wakes = vec![
+            Some(RefreshWake::Requested),
+            Some(RefreshWake::Periodic),
+            None,
+        ]
+        .into_iter();
+        let (task_tx, task_rx) = sync_channel(1);
+        let _table = spawn_using(
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            move || {
+                query_count.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            },
+            move |_, _| wakes.next().unwrap(),
+            move |task| task_tx.send(task).unwrap(),
+        );
+        task_rx.recv().unwrap()();
+
+        assert_eq!(queries.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn refresh_failure_keeps_snapshot_and_records_failure_duration() {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut results = vec![
+            Ok(vec![record(
+                ip,
+                443,
+                TransportProtocol::Tcp,
+                7,
+                "/usr/bin/curl",
+            )]),
+            Err("listeners unavailable".to_string()),
+        ]
+        .into_iter();
+        let (task_tx, task_rx) = sync_channel(1);
+        let table = spawn_using(
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            move || {
+                std::thread::sleep(Duration::from_millis(1));
+                results.next().expect("only two queries are expected")
+            },
+            |_, refresh_rx| match refresh_rx.try_recv() {
+                Ok(()) => Some(RefreshWake::Requested),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => None,
+            },
+            move |task| task_tx.send(task).unwrap(),
+        );
+
+        assert!(request_refresh(&table));
+        task_rx.recv().unwrap()();
+
+        let table_read = table.read().unwrap();
+        assert_eq!(
+            table_read
+                .lookup(ip, 443, TransportProtocol::Tcp)
+                .map(|process| process.pid),
+            Some(7)
+        );
+        let diagnostics = table_read.diagnostics_snapshot();
+        assert_eq!(diagnostics.refresh_actual, 2);
+        assert_eq!(diagnostics.refresh_success, 1);
+        assert_eq!(diagnostics.refresh_failure, 1);
+        assert!(diagnostics.refresh_duration >= diagnostics.last_refresh_duration);
+        assert!(diagnostics.last_refresh_duration > Duration::ZERO);
     }
 
     #[test]
