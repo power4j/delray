@@ -1,39 +1,48 @@
-# 设置换行符规则
-# Unix/Linux 脚本使用 LF 换行符
+# Default text handling.
+* text=auto
+
+# Source code and Rust package files use LF on every platform.
+*.rs text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+
+# Unix/Linux scripts use LF.
 *.sh text eol=lf
 *.service text eol=lf
+
+# Windows command scripts use CRLF.
 *.bat text eol=crlf
 *.cmd text eol=crlf
 
-# 构建脚本和配置
+# Build scripts and configuration.
 Makefile text eol=lf
 *.mk text eol=lf
 
-# 包管理配置
+# Package metadata.
 spec text eol=lf
 *.spec text eol=lf
 debian/** text eol=lf
 
-# 规则文件
+# Rule files.
 *.rules text eol=lf
 
-# 文本文件默认使用 LF
+# Text documentation and data files.
 *.md text eol=lf
 *.txt text eol=lf
+*.json text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
 
-# 配置文件保持原有换行符
+# Configuration files.
+.gitattributes text eol=lf
 *.properties text eol=lf
-
-# IDE 文件
 .editorconfig text eol=lf
+.gitignore text eol=lf
 
-# CI/CD 配置
-*.yml text eol=lf
+# CI/CD configuration.
 .gitlab-ci.yml text eol=lf
 
-# 二进制文件
+# Binary files.
 *.doc filter=lfs diff=lfs merge=lfs -text
 *.docx filter=lfs diff=lfs merge=lfs -text
 *.pdf filter=lfs diff=lfs merge=lfs -text
