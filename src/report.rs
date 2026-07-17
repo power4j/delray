@@ -367,6 +367,7 @@ mod tests {
             peer: IpAddr::V4(Ipv4Addr::LOCALHOST),
             bytes,
             local_socket: None,
+            peer_local_socket: None,
         }
     }
 }

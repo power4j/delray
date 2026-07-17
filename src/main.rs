@@ -183,22 +183,36 @@ fn process_next<N, E>(
 {
     match next_flow() {
         Ok(Some(flow)) => {
-            let process = flow.local_socket.and_then(|socket| {
-                let table = proc_table.read().ok()?;
-                let process = table.lookup(socket.ip, socket.port, socket.protocol)?;
-                Some(stats::ObservedProcess {
-                    pid: process.pid,
-                    name: process.name.clone(),
-                    path: process.path.clone(),
-                })
-            });
-            stats.record_flow(flow, process);
+            let process = flow
+                .local_socket
+                .and_then(|socket| lookup_process(proc_table, socket));
+            if flow.peer_local_socket.is_some() {
+                let peer_process = flow
+                    .peer_local_socket
+                    .and_then(|socket| lookup_process(proc_table, socket));
+                stats.record_flow_processes(flow, process, peer_process);
+            } else {
+                stats.record_flow(flow, process);
+            }
         }
         Ok(None) => {}
         Err(e) => {
             eprintln!("Capture error: {e}");
         }
     }
+}
+
+fn lookup_process(
+    proc_table: &proc_table::SharedProcTable,
+    socket: capture::LocalSocket,
+) -> Option<stats::ObservedProcess> {
+    let table = proc_table.read().ok()?;
+    let process = table.lookup(socket.ip, socket.port, socket.protocol)?;
+    Some(stats::ObservedProcess {
+        pid: process.pid,
+        name: process.name.clone(),
+        path: process.path.clone(),
+    })
 }
 
 /// CLI arguments.
@@ -250,6 +264,7 @@ mod scheduling_tests {
                     peer: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
                     bytes: 64,
                     local_socket: None,
+                    peer_local_socket: None,
                 }))
             },
             &proc_table,

@@ -136,8 +136,13 @@ fn aggregate_loop(
             .min(STOP_CHECK_INTERVAL);
         match flow_rx.recv_timeout(wait) {
             Ok(flow) => {
-                let process = resolve_process(&flow, &proc_table);
-                stats.record_flow(flow, process);
+                let process = resolve_process(flow.local_socket, &proc_table);
+                if flow.peer_local_socket.is_some() {
+                    let peer_process = resolve_process(flow.peer_local_socket, &proc_table);
+                    stats.record_flow_processes(flow, process, peer_process);
+                } else {
+                    stats.record_flow(flow, process);
+                }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
@@ -150,8 +155,11 @@ fn aggregate_loop(
     }
 }
 
-fn resolve_process(flow: &Flow, proc_table: &SharedProcTable) -> Option<ObservedProcess> {
-    let socket = flow.local_socket?;
+fn resolve_process(
+    socket: Option<crate::capture::LocalSocket>,
+    proc_table: &SharedProcTable,
+) -> Option<ObservedProcess> {
+    let socket = socket?;
     let table = proc_table.read().ok()?;
     let process = table.lookup(socket.ip, socket.port, socket.protocol)?;
     Some(ObservedProcess {
@@ -714,6 +722,7 @@ mod tests {
                     port: 443,
                     protocol: crate::capture::TransportProtocol::Tcp,
                 }),
+                peer_local_socket: None,
             })
             .unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -748,6 +757,85 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_loop_resolves_both_local_endpoints_for_loopback_flow() {
+        let local_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut table = ProcTable::default();
+        table.insert_for_test(
+            local_ip,
+            18_765,
+            crate::capture::TransportProtocol::Tcp,
+            18765,
+            Arc::from("python"),
+            Some(Arc::from("/usr/bin/python")),
+        );
+        table.insert_for_test(
+            local_ip,
+            49_152,
+            crate::capture::TransportProtocol::Tcp,
+            49152,
+            Arc::from("curl"),
+            Some(Arc::from("/usr/bin/curl")),
+        );
+        let proc_table = Arc::new(RwLock::new(table));
+        let (flow_tx, flow_rx) = sync_channel(1);
+        let (snapshot_tx, snapshot_rx) = sync_channel(2);
+        flow_tx
+            .send(Flow {
+                direction: Direction::Outbound,
+                peer: local_ip,
+                bytes: 120,
+                local_socket: Some(crate::capture::LocalSocket {
+                    ip: local_ip,
+                    port: 18_765,
+                    protocol: crate::capture::TransportProtocol::Tcp,
+                }),
+                peer_local_socket: Some(crate::capture::LocalSocket {
+                    ip: local_ip,
+                    port: 49_152,
+                    protocol: crate::capture::TransportProtocol::Tcp,
+                }),
+            })
+            .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let failure = Arc::new(OnceLock::new());
+        let worker_stop = stop.clone();
+        let worker_failure = failure.clone();
+        let worker = thread::spawn(move || {
+            aggregate_loop(
+                flow_rx,
+                snapshot_tx,
+                proc_table,
+                10,
+                Duration::from_millis(10),
+                worker_stop,
+                worker_failure,
+            );
+        });
+
+        let snapshot = snapshot_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap();
+        let server = snapshot
+            .processes
+            .iter()
+            .find(|process| process.pid() == Some(18765))
+            .unwrap();
+        let client = snapshot
+            .processes
+            .iter()
+            .find(|process| process.pid() == Some(49152))
+            .unwrap();
+
+        assert_eq!(snapshot.in_bytes, 120);
+        assert_eq!(snapshot.out_bytes, 120);
+        assert_eq!((server.recv, server.sent), (0, 120));
+        assert_eq!((client.recv, client.sent), (120, 0));
+        stop.store(true, Ordering::Release);
+        drop(flow_tx);
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn missing_and_ambiguous_candidates_are_unattributed() {
         let local_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
         let mut table = ProcTable::default();
@@ -774,7 +862,7 @@ mod tests {
             socket_flow(local_ip, 443, 40),
             socket_flow(local_ip, 80, 60),
         ] {
-            let process = resolve_process(&flow, &proc_table);
+            let process = resolve_process(flow.local_socket, &proc_table);
             stats.record_flow(flow, process);
         }
 
@@ -790,7 +878,7 @@ mod tests {
         let proc_table = Arc::new(RwLock::new(ProcTable::default()));
         let mut stats = Stats::default();
         let unresolved = socket_flow(local_ip, 443, 40);
-        let process = resolve_process(&unresolved, &proc_table);
+        let process = resolve_process(unresolved.local_socket, &proc_table);
         stats.record_flow(unresolved, process);
 
         proc_table.write().unwrap().insert_for_test(
@@ -802,7 +890,7 @@ mod tests {
             None,
         );
         let resolved = socket_flow(local_ip, 443, 60);
-        let process = resolve_process(&resolved, &proc_table);
+        let process = resolve_process(resolved.local_socket, &proc_table);
         stats.record_flow(resolved, process);
 
         let snapshot = stats.snapshot(10);
@@ -959,6 +1047,7 @@ mod tests {
             peer: IpAddr::V4(Ipv4Addr::LOCALHOST),
             bytes,
             local_socket: None,
+            peer_local_socket: None,
         }
     }
 
@@ -972,6 +1061,7 @@ mod tests {
                 port,
                 protocol: crate::capture::TransportProtocol::Tcp,
             }),
+            peer_local_socket: None,
         }
     }
 }

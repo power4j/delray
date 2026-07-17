@@ -28,7 +28,7 @@ pub struct InterfaceInfo {
 // rust-pcap exposes normalized LINKTYPE_RAW (101), while live Linux handles use DLT_RAW (12).
 const LINUX_DLT_RAW: pcap::Linktype = pcap::Linktype(12);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum PacketFormat {
     Ethernet,
     Raw,
@@ -46,6 +46,20 @@ enum IpVersion {
     V6,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SllPacketType {
+    Host,
+    Outgoing,
+    Other,
+}
+
+struct IpPayload<'a> {
+    packet: &'a [u8],
+    expected_version: Option<IpVersion>,
+    link_len: u64,
+    sll_packet_type: Option<SllPacketType>,
+}
+
 /// 解析后的单向流量记录。
 pub struct Flow {
     pub direction: Direction,
@@ -54,6 +68,8 @@ pub struct Flow {
     pub bytes: u64,
     /// 本机 socket，仅 TCP/UDP 有；用于进程关联。
     pub local_socket: Option<LocalSocket>,
+    /// 第二个本机 socket，仅当源和目标都属于本机时存在。
+    pub peer_local_socket: Option<LocalSocket>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -175,12 +191,16 @@ impl CaptureSource {
         let device = select_device(selector, devices)?;
         let interface_name = device.name.clone();
 
+        let is_loopback = device.flags.is_loopback();
         let cap = Capture::from_device(device)?
             .timeout(150)
             .snaplen(65535)
             .buffer_size(2_000_000)
             .promisc(false)
             .open()?;
+        if is_loopback {
+            let _ = cap.direction(pcap::Direction::In);
+        }
         let link_type = cap.get_datalink();
         packet_format(link_type)?;
 
@@ -216,14 +236,26 @@ fn parse(
     data: &[u8],
     local_ips: &HashSet<IpAddr>,
 ) -> Result<Option<Flow>> {
-    let headers = match packet_format(link_type)? {
-        PacketFormat::Ethernet => PacketHeaders::from_ethernet_slice(data).ok(),
-        format => ip_payload(format, data).and_then(|(packet, expected_version)| {
-            if expected_version.is_some_and(|expected| ip_version(packet) != Some(expected)) {
-                return None;
+    let format = packet_format(link_type)?;
+    let (headers, link_len, sll_packet_type) = match format {
+        PacketFormat::Ethernet => (PacketHeaders::from_ethernet_slice(data).ok(), 14, None),
+        format => {
+            let payload = match ip_payload(format, data) {
+                Some(payload) => payload,
+                None => return Ok(None),
+            };
+            if payload
+                .expected_version
+                .is_some_and(|expected| ip_version(payload.packet) != Some(expected))
+            {
+                return Ok(None);
             }
-            PacketHeaders::from_ip_slice(packet).ok()
-        }),
+            (
+                PacketHeaders::from_ip_slice(payload.packet).ok(),
+                payload.link_len,
+                payload.sll_packet_type,
+            )
+        }
     };
 
     let Some(headers) = headers else {
@@ -232,40 +264,62 @@ fn parse(
     let Some(net) = headers.net else {
         return Ok(None);
     };
-    let (src, dst) = match net {
+    let (src, dst, ip_bytes) = match net {
         NetHeaders::Ipv4(ip, _) => (
             IpAddr::V4(ip.source.into()),
             IpAddr::V4(ip.destination.into()),
+            u64::from(ip.total_len),
         ),
         NetHeaders::Ipv6(ip, _) => (
             IpAddr::V6(ip.source.into()),
             IpAddr::V6(ip.destination.into()),
+            u64::from(ip.payload_length) + 40,
         ),
         _ => return Ok(None),
     };
 
-    let bytes = data.len() as u64;
+    let link_ext_len = if format == PacketFormat::Ethernet {
+        headers
+            .link_exts
+            .iter()
+            .map(|header| header.header_len() as u64)
+            .sum()
+    } else {
+        0
+    };
+    let bytes = link_len + link_ext_len + ip_bytes;
 
-    let (direction, local_ip, peer) = if local_ips.contains(&src) {
+    let src_local = local_ips.contains(&src);
+    let dst_local = local_ips.contains(&dst);
+    if src_local && dst_local && sll_packet_type == Some(SllPacketType::Outgoing) {
+        return Ok(None);
+    }
+    let (direction, local_ip, peer) = if src_local {
         (Direction::Outbound, src, dst)
-    } else if local_ips.contains(&dst) {
+    } else if dst_local {
         (Direction::Inbound, dst, src)
     } else {
         return Ok(None);
     };
 
-    let local_socket = match &headers.transport {
+    let (local_socket, peer_local_socket) = match &headers.transport {
         Some(TransportHeader::Tcp(tcp)) => {
             let port = if direction == Direction::Outbound {
                 tcp.source_port
             } else {
                 tcp.destination_port
             };
-            Some(LocalSocket {
+            let local_socket = LocalSocket {
                 ip: local_ip,
                 port,
                 protocol: TransportProtocol::Tcp,
-            })
+            };
+            let peer_local_socket = (src_local && dst_local).then_some(LocalSocket {
+                ip: dst,
+                port: tcp.destination_port,
+                protocol: TransportProtocol::Tcp,
+            });
+            (Some(local_socket), peer_local_socket)
         }
         Some(TransportHeader::Udp(udp)) => {
             let port = if direction == Direction::Outbound {
@@ -273,13 +327,19 @@ fn parse(
             } else {
                 udp.destination_port
             };
-            Some(LocalSocket {
+            let local_socket = LocalSocket {
                 ip: local_ip,
                 port,
                 protocol: TransportProtocol::Udp,
-            })
+            };
+            let peer_local_socket = (src_local && dst_local).then_some(LocalSocket {
+                ip: dst,
+                port: udp.destination_port,
+                protocol: TransportProtocol::Udp,
+            });
+            (Some(local_socket), peer_local_socket)
         }
-        _ => None,
+        _ => (None, None),
     };
 
     Ok(Some(Flow {
@@ -287,6 +347,7 @@ fn parse(
         peer,
         bytes,
         local_socket,
+        peer_local_socket,
     }))
 }
 
@@ -312,40 +373,73 @@ fn packet_format(link_type: pcap::Linktype) -> Result<PacketFormat> {
     }
 }
 
-fn ip_payload(format: PacketFormat, data: &[u8]) -> Option<(&[u8], Option<IpVersion>)> {
+fn ip_payload(format: PacketFormat, data: &[u8]) -> Option<IpPayload<'_>> {
     match format {
-        PacketFormat::Raw => Some((data, None)),
-        PacketFormat::Ipv4 => Some((data, Some(IpVersion::V4))),
-        PacketFormat::Ipv6 => Some((data, Some(IpVersion::V6))),
+        PacketFormat::Raw => Some(IpPayload {
+            packet: data,
+            expected_version: None,
+            link_len: 0,
+            sll_packet_type: None,
+        }),
+        PacketFormat::Ipv4 => Some(IpPayload {
+            packet: data,
+            expected_version: Some(IpVersion::V4),
+            link_len: 0,
+            sll_packet_type: None,
+        }),
+        PacketFormat::Ipv6 => Some(IpPayload {
+            packet: data,
+            expected_version: Some(IpVersion::V6),
+            link_len: 0,
+            sll_packet_type: None,
+        }),
         PacketFormat::Null => {
-            let family = u32::from_ne_bytes(data.get(..4)?.try_into().ok()?);
-            Some((
-                data.get(4..)?,
-                Some(ip_version_from_address_family(family)?),
-            ))
+            let family = ip_version_from_family_header(data.get(..4)?.try_into().ok()?)?;
+            Some(IpPayload {
+                packet: data.get(4..)?,
+                expected_version: Some(family),
+                link_len: 4,
+                sll_packet_type: None,
+            })
         }
         PacketFormat::Loop => {
-            let family = u32::from_be_bytes(data.get(..4)?.try_into().ok()?);
-            Some((
-                data.get(4..)?,
-                Some(ip_version_from_address_family(family)?),
-            ))
+            let family = ip_version_from_family_header(data.get(..4)?.try_into().ok()?)?;
+            Some(IpPayload {
+                packet: data.get(4..)?,
+                expected_version: Some(family),
+                link_len: 4,
+                sll_packet_type: None,
+            })
         }
         PacketFormat::LinuxSll => {
+            let packet_type = u16::from_be_bytes(data.get(..2)?.try_into().ok()?);
             let ether_type = u16::from_be_bytes(data.get(14..16)?.try_into().ok()?);
-            Some((
-                data.get(16..)?,
-                Some(ip_version_from_ether_type(ether_type)?),
-            ))
+            Some(IpPayload {
+                packet: data.get(16..)?,
+                expected_version: Some(ip_version_from_ether_type(ether_type)?),
+                link_len: 16,
+                sll_packet_type: Some(sll_packet_type(packet_type)),
+            })
         }
         PacketFormat::LinuxSll2 => {
             let ether_type = u16::from_be_bytes(data.get(..2)?.try_into().ok()?);
-            Some((
-                data.get(20..)?,
-                Some(ip_version_from_ether_type(ether_type)?),
-            ))
+            let packet_type = *data.get(10)?;
+            Some(IpPayload {
+                packet: data.get(20..)?,
+                expected_version: Some(ip_version_from_ether_type(ether_type)?),
+                link_len: 20,
+                sll_packet_type: Some(sll_packet_type(u16::from(packet_type))),
+            })
         }
         PacketFormat::Ethernet => None,
+    }
+}
+
+fn sll_packet_type(packet_type: u16) -> SllPacketType {
+    match packet_type {
+        0 => SllPacketType::Host,
+        4 => SllPacketType::Outgoing,
+        _ => SllPacketType::Other,
     }
 }
 
@@ -365,29 +459,15 @@ fn ip_version_from_ether_type(ether_type: u16) -> Option<IpVersion> {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn ip_version_from_address_family(family: u32) -> Option<IpVersion> {
-    match family {
-        2 => Some(IpVersion::V4),
-        10 => Some(IpVersion::V6),
-        _ => None,
-    }
+fn ip_version_from_family_header(header: [u8; 4]) -> Option<IpVersion> {
+    ip_version_from_address_family(u32::from_be_bytes(header))
+        .or_else(|| ip_version_from_address_family(u32::from_le_bytes(header)))
 }
 
-#[cfg(target_os = "windows")]
 fn ip_version_from_address_family(family: u32) -> Option<IpVersion> {
     match family {
         2 => Some(IpVersion::V4),
-        23 => Some(IpVersion::V6),
-        _ => None,
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-fn ip_version_from_address_family(family: u32) -> Option<IpVersion> {
-    match family {
-        2 => Some(IpVersion::V4),
-        24 | 28 | 30 => Some(IpVersion::V6),
+        10 | 23 | 24 | 28 | 30 => Some(IpVersion::V6),
         _ => None,
     }
 }
@@ -402,6 +482,7 @@ mod tests {
     use super::*;
     use crate::stats::{ObservedProcess, Stats};
 
+    #[derive(Clone, Copy)]
     struct ExpectedFlow {
         direction: Direction,
         peer: IpAddr,
@@ -548,6 +629,72 @@ mod tests {
     }
 
     #[test]
+    fn local_tcp_response_accounts_source_as_sent_and_destination_as_recv() {
+        let local = [127, 0, 0, 1];
+        let server_port = 18_765_u16;
+        let client_port = 49_152_u16;
+        let mut transport = Vec::new();
+        transport.extend_from_slice(&server_port.to_be_bytes());
+        transport.extend_from_slice(&client_port.to_be_bytes());
+        transport.extend_from_slice(&[0; 8]);
+        transport.extend_from_slice(&[0x50, 0x10, 0, 0, 0, 0, 0, 0]);
+        let packet = add_link_header(
+            pcap::Linktype::ETHERNET,
+            IpVersion::V4,
+            ipv4_packet_between(
+                local,
+                local,
+                ip_protocol(TransportProtocol::Tcp),
+                (20 + transport.len()) as u16,
+                &transport,
+            ),
+        );
+        let local_ips = HashSet::from([IpAddr::V4(local.into())]);
+
+        let flow = parse(pcap::Linktype::ETHERNET, &packet, &local_ips)
+            .unwrap()
+            .expect("local loopback flow");
+        let source = flow.local_socket.expect("source local socket");
+        let destination = flow.peer_local_socket.expect("destination local socket");
+        assert_eq!(source.port, server_port);
+        assert_eq!(destination.port, client_port);
+
+        let bytes = flow.bytes;
+        let mut stats = Stats::default();
+        stats.record_flow_processes_at(
+            flow,
+            Some(ObservedProcess {
+                pid: 18765,
+                name: Some(Arc::from("python")),
+                path: Some(Arc::from("/usr/bin/python")),
+            }),
+            Some(ObservedProcess {
+                pid: 49152,
+                name: Some(Arc::from("curl")),
+                path: Some(Arc::from("/usr/bin/curl")),
+            }),
+            "2026-07-15T08:00:00Z".parse().unwrap(),
+        );
+
+        let snapshot = stats.snapshot(10);
+        let server = snapshot
+            .processes
+            .iter()
+            .find(|process| process.pid() == Some(18765))
+            .unwrap();
+        let client = snapshot
+            .processes
+            .iter()
+            .find(|process| process.pid() == Some(49152))
+            .unwrap();
+
+        assert_eq!(snapshot.in_bytes, bytes);
+        assert_eq!(snapshot.out_bytes, bytes);
+        assert_eq!((server.recv, server.sent), (0, bytes));
+        assert_eq!((client.recv, client.sent), (bytes, 0));
+    }
+
+    #[test]
     fn linux_dlt_raw_12_parses_raw_ip() {
         let (packet, mut expected) = fixed_ip_packet(IpVersion::V4, TransportProtocol::Udp);
         expected.bytes = packet.len() as u64;
@@ -556,6 +703,92 @@ mod tests {
         let flow = parse(pcap::Linktype(12), &packet, &local_ips)
             .expect("Linux DLT_RAW is supported")
             .expect("local raw IP flow");
+
+        assert_flow(flow, expected);
+    }
+
+    #[test]
+    fn linux_sll_local_outgoing_copy_is_ignored() {
+        let local = [127, 0, 0, 1];
+        let transport = fixed_transport(TransportProtocol::Tcp, Direction::Outbound);
+        let ip_packet = ipv4_packet_between(
+            local,
+            local,
+            ip_protocol(TransportProtocol::Tcp),
+            (20 + transport.len()) as u16,
+            &transport,
+        );
+        let local_ips = HashSet::from([IpAddr::V4(local.into())]);
+
+        for link_type in [pcap::Linktype::LINUX_SLL, pcap::Linktype::LINUX_SLL2] {
+            let mut outgoing = add_link_header(link_type, IpVersion::V4, ip_packet.clone());
+            set_sll_packet_type(&mut outgoing, link_type, 4);
+            let outgoing_flow =
+                parse(link_type, &outgoing, &local_ips).expect("supported data link");
+            assert!(outgoing_flow.is_none());
+
+            let mut host = add_link_header(link_type, IpVersion::V4, ip_packet.clone());
+            set_sll_packet_type(&mut host, link_type, 0);
+            let host_flow = parse(link_type, &host, &local_ips)
+                .expect("supported data link")
+                .expect("host copy is retained");
+            assert!(host_flow.peer_local_socket.is_some());
+        }
+    }
+
+    #[test]
+    fn linux_sll_remote_outgoing_copy_is_retained() {
+        let local_ips = HashSet::from(["192.0.2.10".parse::<IpAddr>().unwrap()]);
+
+        for link_type in [pcap::Linktype::LINUX_SLL, pcap::Linktype::LINUX_SLL2] {
+            let (payload, mut expected) = fixed_ip_packet(IpVersion::V4, TransportProtocol::Udp);
+            let mut packet = add_link_header(link_type, IpVersion::V4, payload);
+            set_sll_packet_type(&mut packet, link_type, 4);
+            expected.bytes = packet.len() as u64;
+
+            let flow = parse(link_type, &packet, &local_ips)
+                .expect("supported data link")
+                .expect("remote outgoing flow is retained");
+
+            assert_flow(flow, expected);
+        }
+    }
+
+    #[test]
+    fn null_and_loop_accept_both_address_family_endiannesses() {
+        let (payload, expected) = fixed_ip_packet(IpVersion::V4, TransportProtocol::Udp);
+        let local_ips = HashSet::from([expected.local_ip]);
+
+        for link_type in [pcap::Linktype::NULL, pcap::Linktype::LOOP] {
+            for family in [
+                address_family(IpVersion::V4).to_be_bytes(),
+                address_family(IpVersion::V4).to_le_bytes(),
+            ] {
+                let mut packet = family.to_vec();
+                packet.extend_from_slice(&payload);
+                let mut expected = expected;
+                expected.bytes = packet.len() as u64;
+
+                let flow = parse(link_type, &packet, &local_ips)
+                    .expect("supported data link")
+                    .expect("address family endian is accepted");
+
+                assert_flow(flow, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn bytes_ignore_padding_after_ip_packet() {
+        let (payload, mut expected) = fixed_ip_packet(IpVersion::V4, TransportProtocol::Udp);
+        let local_ips = HashSet::from([expected.local_ip]);
+        let mut packet = add_link_header(pcap::Linktype::ETHERNET, IpVersion::V4, payload);
+        expected.bytes = packet.len() as u64;
+        packet.extend_from_slice(&[0; 16]);
+
+        let flow = parse(pcap::Linktype::ETHERNET, &packet, &local_ips)
+            .expect("supported data link")
+            .expect("padded frame");
 
         assert_flow(flow, expected);
     }
@@ -902,6 +1135,14 @@ mod tests {
         };
         header.extend_from_slice(&packet);
         header
+    }
+
+    fn set_sll_packet_type(packet: &mut [u8], link_type: pcap::Linktype, packet_type: u16) {
+        if link_type == pcap::Linktype::LINUX_SLL {
+            packet[..2].copy_from_slice(&packet_type.to_be_bytes());
+        } else if link_type == pcap::Linktype::LINUX_SLL2 {
+            packet[10] = packet_type as u8;
+        }
     }
 
     fn address_family(version: IpVersion) -> u32 {

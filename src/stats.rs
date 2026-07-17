@@ -213,18 +213,65 @@ impl Stats {
         process: Option<ObservedProcess>,
         observed_at: DateTime<Utc>,
     ) {
+        self.record_flow_processes_at(flow, process, None, observed_at);
+    }
+
+    pub(crate) fn record_flow_processes(
+        &mut self,
+        flow: Flow,
+        process: Option<ObservedProcess>,
+        peer_process: Option<ObservedProcess>,
+    ) {
+        self.record_flow_processes_at(flow, process, peer_process, Utc::now());
+    }
+
+    pub(crate) fn record_flow_processes_at(
+        &mut self,
+        flow: Flow,
+        process: Option<ObservedProcess>,
+        peer_process: Option<ObservedProcess>,
+        observed_at: DateTime<Utc>,
+    ) {
+        if flow.peer_local_socket.is_some() {
+            self.add_out(flow.peer, flow.bytes);
+            self.add_in(
+                flow.local_socket
+                    .map(|socket| socket.ip)
+                    .unwrap_or(flow.peer),
+                flow.bytes,
+            );
+            self.add_process_or_unattributed(process, Direction::Outbound, flow.bytes, observed_at);
+            self.add_process_or_unattributed(
+                peer_process,
+                Direction::Inbound,
+                flow.bytes,
+                observed_at,
+            );
+            return;
+        }
+
         match flow.direction {
             Direction::Inbound => self.add_in(flow.peer, flow.bytes),
             Direction::Outbound => self.add_out(flow.peer, flow.bytes),
         }
+        self.add_process_or_unattributed(process, flow.direction, flow.bytes, observed_at);
+    }
+
+    fn add_process_or_unattributed(
+        &mut self,
+        process: Option<ObservedProcess>,
+        direction: Direction,
+        bytes: u64,
+        observed_at: DateTime<Utc>,
+    ) {
         match process {
             Some(process) => {
-                self.add_proc(process, flow.direction, flow.bytes, observed_at);
+                self.add_proc(process, direction, bytes, observed_at);
             }
             None => {
-                match flow.direction {
-                    Direction::Inbound => self.unattributed.recv += flow.bytes,
-                    Direction::Outbound => self.unattributed.sent += flow.bytes,
+                match direction {
+                    Direction::Inbound => self.unattributed.recv += bytes,
+                    Direction::Outbound => self.unattributed.sent += bytes,
                 }
                 self.unattributed_last_seen = Some(observed_at);
             }
@@ -580,6 +627,7 @@ mod tests {
             peer: ip(peer),
             bytes,
             local_socket: None,
+            peer_local_socket: None,
         }
     }
 
