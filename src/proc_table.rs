@@ -1,20 +1,24 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::capture::TransportProtocol;
+use crate::capture::{LocalSocket, TransportProtocol};
 
 type SocketKey = (IpAddr, u16, TransportProtocol);
+const LOOKUP_MISS_SAMPLE_LIMIT: usize = 8;
 
 /// Process association table rebuilt periodically by a background thread.
 #[derive(Default)]
 pub struct ProcTable {
     entries: HashMap<SocketKey, HashMap<u32, ProcInfo>>,
+    v4_mapped_aliases: HashSet<SocketKey>,
+    record_count: u64,
+    v4_mapped_record_count: u64,
     refreshed_at: Option<Instant>,
     generation: u64,
     max_age: Duration,
@@ -44,32 +48,69 @@ type RefreshRequest = ();
 struct ProcDiagnostics {
     lookup_hits: AtomicU64,
     lookup_misses: AtomicU64,
+    lookup_no_candidate: AtomicU64,
+    lookup_ambiguous: AtomicU64,
+    lookup_stale: AtomicU64,
+    lookup_v4_mapped_hits: AtomicU64,
     no_local_socket: AtomicU64,
     refresh_requests: AtomicU64,
     refresh_actual: AtomicU64,
     refresh_success: AtomicU64,
     refresh_failure: AtomicU64,
+    refresh_records: AtomicU64,
+    refresh_v4_mapped_records: AtomicU64,
     refresh_duration_nanos: AtomicU64,
     last_refresh_duration_nanos: AtomicU64,
+    lookup_miss_samples: Mutex<Vec<LookupMissSample>>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LookupMissSample {
+    pub reason: LookupMissReason,
+    pub local_socket: LocalSocket,
+    pub peer_ip: IpAddr,
+    pub peer_port: u16,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProcDiagnosticsSnapshot {
     pub lookup_hits: u64,
     pub lookup_misses: u64,
+    pub lookup_no_candidate: u64,
+    pub lookup_ambiguous: u64,
+    pub lookup_stale: u64,
+    pub lookup_v4_mapped_hits: u64,
     pub no_local_socket: u64,
     pub refresh_requests: u64,
     pub refresh_actual: u64,
     pub refresh_success: u64,
     pub refresh_failure: u64,
+    pub refresh_records: u64,
+    pub refresh_v4_mapped_records: u64,
     pub refresh_duration: Duration,
     pub last_refresh_duration: Duration,
+    pub lookup_miss_samples: Vec<LookupMissSample>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RefreshWake {
     Periodic,
     Requested,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LookupMissReason {
+    NoCandidate,
+    Ambiguous,
+    Stale,
+}
+
+pub(crate) enum LookupOutcome<'a> {
+    Hit {
+        process: &'a ProcInfo,
+        v4_mapped: bool,
+    },
+    Miss(LookupMissReason),
 }
 
 impl ProcTable {
@@ -82,7 +123,13 @@ impl ProcTable {
             .is_some_and(|refreshed_at| now.saturating_duration_since(refreshed_at) <= self.max_age)
     }
 
-    pub fn lookup(&self, ip: IpAddr, port: u16, protocol: TransportProtocol) -> Option<&ProcInfo> {
+    #[cfg(test)]
+    pub(crate) fn lookup(
+        &self,
+        ip: IpAddr,
+        port: u16,
+        protocol: TransportProtocol,
+    ) -> Option<&ProcInfo> {
         self.lookup_at(ip, port, protocol, Instant::now())
     }
 
@@ -90,6 +137,7 @@ impl ProcTable {
         self.generation
     }
 
+    #[cfg(test)]
     fn lookup_at(
         &self,
         ip: IpAddr,
@@ -97,30 +145,110 @@ impl ProcTable {
         protocol: TransportProtocol,
         now: Instant,
     ) -> Option<&ProcInfo> {
+        match self.lookup_outcome_at(ip, port, protocol, now) {
+            LookupOutcome::Hit { process, .. } => Some(process),
+            LookupOutcome::Miss(_) => None,
+        }
+    }
+
+    pub(crate) fn lookup_outcome(
+        &self,
+        ip: IpAddr,
+        port: u16,
+        protocol: TransportProtocol,
+    ) -> LookupOutcome<'_> {
+        self.lookup_outcome_at(ip, port, protocol, Instant::now())
+    }
+
+    fn lookup_outcome_at(
+        &self,
+        ip: IpAddr,
+        port: u16,
+        protocol: TransportProtocol,
+        now: Instant,
+    ) -> LookupOutcome<'_> {
         if self
             .refreshed_at
             .is_some_and(|refreshed_at| now.saturating_duration_since(refreshed_at) > self.max_age)
         {
-            return None;
+            return LookupOutcome::Miss(LookupMissReason::Stale);
         }
 
-        let candidates = self
+        let key = (ip, port, protocol);
+        let wildcard_key = (wildcard_for(ip), port, protocol);
+        let Some((lookup_key, candidates)) = self
             .entries
-            .get(&(ip, port, protocol))
-            .or_else(|| self.entries.get(&(wildcard_for(ip), port, protocol)))?;
-        (candidates.len() == 1)
-            .then(|| candidates.values().next())
-            .flatten()
+            .get_key_value(&key)
+            .or_else(|| self.entries.get_key_value(&wildcard_key))
+            .map(|(key, candidates)| (*key, candidates))
+        else {
+            return LookupOutcome::Miss(LookupMissReason::NoCandidate);
+        };
+        if candidates.len() != 1 {
+            return LookupOutcome::Miss(LookupMissReason::Ambiguous);
+        }
+        let process = candidates
+            .values()
+            .next()
+            .expect("one candidate exists after length check");
+        LookupOutcome::Hit {
+            process,
+            v4_mapped: self.v4_mapped_aliases.contains(&lookup_key),
+        }
     }
 
     pub(crate) fn record_lookup_hit(&self) {
         self.diagnostics.lookup_hits.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_lookup_miss(&self) {
+    pub(crate) fn record_v4_mapped_lookup_hit(&self) {
+        self.diagnostics
+            .lookup_v4_mapped_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_lookup_miss(&self, reason: LookupMissReason) {
         self.diagnostics
             .lookup_misses
             .fetch_add(1, Ordering::Relaxed);
+        match reason {
+            LookupMissReason::NoCandidate => self
+                .diagnostics
+                .lookup_no_candidate
+                .fetch_add(1, Ordering::Relaxed),
+            LookupMissReason::Ambiguous => self
+                .diagnostics
+                .lookup_ambiguous
+                .fetch_add(1, Ordering::Relaxed),
+            LookupMissReason::Stale => self
+                .diagnostics
+                .lookup_stale
+                .fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    pub(crate) fn record_lookup_miss_sample(
+        &self,
+        reason: LookupMissReason,
+        local_socket: LocalSocket,
+        peer_ip: IpAddr,
+        peer_port: u16,
+    ) {
+        let Ok(mut samples) = self.diagnostics.lookup_miss_samples.lock() else {
+            return;
+        };
+        if samples.len() >= LOOKUP_MISS_SAMPLE_LIMIT {
+            return;
+        }
+        let sample = LookupMissSample {
+            reason,
+            local_socket,
+            peer_ip,
+            peer_port,
+        };
+        if !samples.contains(&sample) {
+            samples.push(sample);
+        }
     }
 
     fn record_no_local_socket(&self) {
@@ -160,15 +288,42 @@ impl ProcTable {
             .store(nanos, Ordering::Relaxed);
     }
 
+    fn record_refresh_table_shape(&self) {
+        self.diagnostics
+            .refresh_records
+            .store(self.record_count, Ordering::Relaxed);
+        self.diagnostics
+            .refresh_v4_mapped_records
+            .store(self.v4_mapped_record_count, Ordering::Relaxed);
+    }
+
     fn diagnostics_snapshot(&self) -> ProcDiagnosticsSnapshot {
+        let lookup_miss_samples = self
+            .diagnostics
+            .lookup_miss_samples
+            .lock()
+            .map(|mut samples| std::mem::take(&mut *samples))
+            .unwrap_or_default();
         ProcDiagnosticsSnapshot {
             lookup_hits: self.diagnostics.lookup_hits.load(Ordering::Relaxed),
             lookup_misses: self.diagnostics.lookup_misses.load(Ordering::Relaxed),
+            lookup_no_candidate: self.diagnostics.lookup_no_candidate.load(Ordering::Relaxed),
+            lookup_ambiguous: self.diagnostics.lookup_ambiguous.load(Ordering::Relaxed),
+            lookup_stale: self.diagnostics.lookup_stale.load(Ordering::Relaxed),
+            lookup_v4_mapped_hits: self
+                .diagnostics
+                .lookup_v4_mapped_hits
+                .load(Ordering::Relaxed),
             no_local_socket: self.diagnostics.no_local_socket.load(Ordering::Relaxed),
             refresh_requests: self.diagnostics.refresh_requests.load(Ordering::Relaxed),
             refresh_actual: self.diagnostics.refresh_actual.load(Ordering::Relaxed),
             refresh_success: self.diagnostics.refresh_success.load(Ordering::Relaxed),
             refresh_failure: self.diagnostics.refresh_failure.load(Ordering::Relaxed),
+            refresh_records: self.diagnostics.refresh_records.load(Ordering::Relaxed),
+            refresh_v4_mapped_records: self
+                .diagnostics
+                .refresh_v4_mapped_records
+                .load(Ordering::Relaxed),
             refresh_duration: Duration::from_nanos(
                 self.diagnostics
                     .refresh_duration_nanos
@@ -179,25 +334,45 @@ impl ProcTable {
                     .last_refresh_duration_nanos
                     .load(Ordering::Relaxed),
             ),
+            lookup_miss_samples,
         }
     }
 
     fn from_records(records: impl IntoIterator<Item = ListenerRecord>) -> Self {
         let mut entries: HashMap<SocketKey, HashMap<u32, ProcInfo>> = HashMap::new();
+        let mut v4_mapped_aliases = HashSet::new();
+        let mut record_count = 0;
+        let mut v4_mapped_record_count = 0;
         for record in records {
-            let key = (record.socket.ip(), record.socket.port(), record.protocol);
-            entries
-                .entry(key)
-                .or_default()
-                .entry(record.pid)
-                .or_insert(ProcInfo {
-                    pid: record.pid,
-                    name: executable_name(&record.path).map(Arc::from),
-                    path: (!record.path.is_empty()).then(|| Arc::from(record.path)),
-                });
+            record_count += 1;
+            let ip = record.socket.ip();
+            let port = record.socket.port();
+            let is_v4_mapped = is_ipv4_mapped(ip);
+            if is_v4_mapped {
+                v4_mapped_record_count += 1;
+            }
+            let name = executable_name(&record.path).map(Arc::from);
+            let path = (!record.path.is_empty()).then(|| Arc::from(record.path));
+            for (key, is_alias) in socket_keys(ip, port, record.protocol) {
+                if is_alias {
+                    v4_mapped_aliases.insert(key);
+                }
+                entries
+                    .entry(key)
+                    .or_default()
+                    .entry(record.pid)
+                    .or_insert_with(|| ProcInfo {
+                        pid: record.pid,
+                        name: name.clone(),
+                        path: path.clone(),
+                    });
+            }
         }
         Self {
             entries,
+            v4_mapped_aliases,
+            record_count,
+            v4_mapped_record_count,
             refreshed_at: None,
             generation: 0,
             max_age: Duration::ZERO,
@@ -222,6 +397,7 @@ impl ProcTable {
         next.refresh_tx = refresh_tx;
         next.diagnostics = diagnostics;
         *self = next;
+        self.record_refresh_table_shape();
         Ok(())
     }
 
@@ -238,6 +414,7 @@ impl ProcTable {
         self.refreshed_at = Some(Instant::now());
         self.generation = self.generation.wrapping_add(1);
         self.max_age = Duration::MAX;
+        self.record_count += 1;
         self.entries
             .entry((ip, port, protocol))
             .or_default()
@@ -305,6 +482,21 @@ fn wildcard_for(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    }
+}
+
+fn is_ipv4_mapped(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V6(ipv6) if ipv6.to_ipv4_mapped().is_some())
+}
+
+fn socket_keys(ip: IpAddr, port: u16, protocol: TransportProtocol) -> Vec<(SocketKey, bool)> {
+    let key = (ip, port, protocol);
+    let IpAddr::V6(ipv6) = ip else {
+        return vec![(key, false)];
+    };
+    match ipv6.to_ipv4_mapped() {
+        Some(ipv4) => vec![(key, false), ((IpAddr::V4(ipv4), port, protocol), true)],
+        None => vec![(key, false)],
     }
 }
 
@@ -832,6 +1024,149 @@ mod tests {
                 .map(|process| process.pid),
             Some(7)
         );
+    }
+
+    #[test]
+    fn ipv4_lookup_matches_ipv4_mapped_ipv6_socket() {
+        let local_ip = IpAddr::V4(Ipv4Addr::new(186, 241, 106, 205));
+        let mapped_ip = IpAddr::V6(Ipv4Addr::new(186, 241, 106, 205).to_ipv6_mapped());
+        let table = ProcTable::from_records([record(
+            mapped_ip,
+            51102,
+            TransportProtocol::Tcp,
+            2027468,
+            "/app/sui",
+        )]);
+
+        assert_eq!(
+            table
+                .lookup(local_ip, 51102, TransportProtocol::Tcp)
+                .map(|process| process.pid),
+            Some(2027468)
+        );
+    }
+
+    #[test]
+    fn ipv4_mapped_records_and_hits_are_counted() {
+        let local_ip = IpAddr::V4(Ipv4Addr::new(186, 241, 106, 205));
+        let mapped_ip = IpAddr::V6(Ipv4Addr::new(186, 241, 106, 205).to_ipv6_mapped());
+        let mut table = ProcTable::default();
+        table
+            .refresh_at(
+                Ok(vec![record(
+                    mapped_ip,
+                    51102,
+                    TransportProtocol::Tcp,
+                    2027468,
+                    "/app/sui",
+                )]),
+                Instant::now(),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+
+        let diagnostics = table.diagnostics_snapshot();
+        assert_eq!(diagnostics.refresh_records, 1);
+        assert_eq!(diagnostics.refresh_v4_mapped_records, 1);
+
+        match table.lookup_outcome(local_ip, 51102, TransportProtocol::Tcp) {
+            LookupOutcome::Hit { process, v4_mapped } => {
+                assert_eq!(process.pid, 2027468);
+                assert!(v4_mapped);
+            }
+            LookupOutcome::Miss(reason) => panic!("expected hit, got {reason:?}"),
+        }
+        table.record_lookup_hit();
+        table.record_v4_mapped_lookup_hit();
+
+        let diagnostics = table.diagnostics_snapshot();
+        assert_eq!(diagnostics.lookup_hits, 1);
+        assert_eq!(diagnostics.lookup_v4_mapped_hits, 1);
+    }
+
+    #[test]
+    fn lookup_miss_reasons_are_counted_separately() {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut table = ProcTable::default();
+        table
+            .refresh_at(Ok(Vec::new()), Instant::now(), Duration::from_secs(1))
+            .unwrap();
+
+        match table.lookup_outcome(ip, 443, TransportProtocol::Tcp) {
+            LookupOutcome::Miss(reason) => table.record_lookup_miss(reason),
+            LookupOutcome::Hit { .. } => panic!("empty table should not match"),
+        }
+
+        table
+            .refresh_at(
+                Ok(vec![
+                    record(ip, 443, TransportProtocol::Tcp, 7, "/usr/bin/server-a"),
+                    record(ip, 443, TransportProtocol::Tcp, 8, "/usr/bin/server-b"),
+                ]),
+                Instant::now(),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        match table.lookup_outcome(ip, 443, TransportProtocol::Tcp) {
+            LookupOutcome::Miss(reason) => table.record_lookup_miss(reason),
+            LookupOutcome::Hit { .. } => panic!("ambiguous table should not match"),
+        }
+
+        table.expire_for_test();
+        match table.lookup_outcome(ip, 443, TransportProtocol::Tcp) {
+            LookupOutcome::Miss(reason) => table.record_lookup_miss(reason),
+            LookupOutcome::Hit { .. } => panic!("stale table should not match"),
+        }
+
+        let diagnostics = table.diagnostics_snapshot();
+        assert_eq!(diagnostics.lookup_misses, 3);
+        assert_eq!(diagnostics.lookup_no_candidate, 1);
+        assert_eq!(diagnostics.lookup_ambiguous, 1);
+        assert_eq!(diagnostics.lookup_stale, 1);
+    }
+
+    #[test]
+    fn lookup_miss_samples_are_bounded_deduplicated_and_drained() {
+        let table = ProcTable::default();
+        let local_ip = IpAddr::V4(Ipv4Addr::new(186, 241, 106, 205));
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(101, 204, 221, 33));
+        let local_socket = crate::capture::LocalSocket {
+            ip: local_ip,
+            port: 51102,
+            protocol: TransportProtocol::Tcp,
+        };
+
+        table.record_lookup_miss_sample(LookupMissReason::NoCandidate, local_socket, peer_ip, 6041);
+        table.record_lookup_miss_sample(LookupMissReason::NoCandidate, local_socket, peer_ip, 6041);
+        for peer_port in 6042..6055 {
+            table.record_lookup_miss_sample(
+                LookupMissReason::NoCandidate,
+                crate::capture::LocalSocket {
+                    port: peer_port,
+                    ..local_socket
+                },
+                peer_ip,
+                peer_port,
+            );
+        }
+
+        let diagnostics = table.diagnostics_snapshot();
+        assert_eq!(
+            diagnostics.lookup_miss_samples.len(),
+            LOOKUP_MISS_SAMPLE_LIMIT
+        );
+        assert_eq!(
+            diagnostics.lookup_miss_samples[0],
+            LookupMissSample {
+                reason: LookupMissReason::NoCandidate,
+                local_socket,
+                peer_ip,
+                peer_port: 6041,
+            }
+        );
+
+        let diagnostics = table.diagnostics_snapshot();
+        assert!(diagnostics.lookup_miss_samples.is_empty());
     }
 
     #[test]
