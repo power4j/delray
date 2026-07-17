@@ -25,7 +25,7 @@
 
 - 分支：`windows-support`
 - 分支来源：`windows-support` 从 `origin/main` 的 `6b5b3e4ccb27790e6274f86a859ebe8094755688` 创建
-- 操作系统：Windows 10 Pro 25H2，build 26200.8875，AMD64
+- 操作系统：注册表报告 `ProductName=Windows 10 Pro`、`DisplayVersion=25H2`、`CurrentBuildNumber=26200`、`UBR=8875`，AMD64
 - Rust：`rustc 1.88.0 (6b00bc388 2025-06-23)`，host 为 `x86_64-pc-windows-msvc`
 - Cargo：`cargo 1.88.0 (873a06493 2025-05-10)`
 - Npcap Runtime：1.88，`AdminOnly=0`
