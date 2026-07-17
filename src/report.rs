@@ -365,6 +365,7 @@ mod tests {
         Flow {
             direction,
             peer: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            peer_port: None,
             bytes,
             local_socket: None,
             peer_local_socket: None,

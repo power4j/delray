@@ -6,9 +6,12 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::attribution::PendingAttributor;
 use crate::capture::{CaptureSource, Flow};
-use crate::proc_table::{self, SharedProcTable};
-use crate::stats::{ObservedProcess, Stats, TrafficSnapshot};
+#[cfg(test)]
+use crate::proc_table;
+use crate::proc_table::SharedProcTable;
+use crate::stats::{Stats, TrafficSnapshot};
 
 const STOP_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
@@ -106,6 +109,7 @@ fn aggregate_loop(
     failure: Arc<OnceLock<PipelineError>>,
 ) {
     let mut stats = Stats::default();
+    let mut attributor = PendingAttributor::default();
     let mut next_snapshot = Instant::now() + snapshot_interval;
 
     loop {
@@ -114,6 +118,7 @@ fn aggregate_loop(
         }
 
         let now = Instant::now();
+        attributor.advance(&mut stats, &proc_table, now);
         if now >= next_snapshot {
             let mut snapshot = stats.snapshot(top_n);
             snapshot.process_data_fresh = proc_table.read().is_ok_and(|table| table.is_fresh());
@@ -136,13 +141,13 @@ fn aggregate_loop(
             .min(STOP_CHECK_INTERVAL);
         match flow_rx.recv_timeout(wait) {
             Ok(flow) => {
-                let process = resolve_process(flow.local_socket, &proc_table);
-                if flow.peer_local_socket.is_some() {
-                    let peer_process = resolve_process(flow.peer_local_socket, &proc_table);
-                    stats.record_flow_processes(flow, process, peer_process);
-                } else {
-                    stats.record_flow(flow, process);
-                }
+                attributor.record_flow(
+                    &mut stats,
+                    flow,
+                    &proc_table,
+                    Instant::now(),
+                    chrono::Utc::now(),
+                );
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
@@ -153,32 +158,6 @@ fn aggregate_loop(
             }
         }
     }
-}
-
-fn resolve_process(
-    socket: Option<crate::capture::LocalSocket>,
-    proc_table: &SharedProcTable,
-) -> Option<ObservedProcess> {
-    let Some(socket) = socket else {
-        proc_table::record_no_local_socket(proc_table);
-        return None;
-    };
-    let table = proc_table.read().ok()?;
-    let process = table
-        .lookup(socket.ip, socket.port, socket.protocol)
-        .map(|process| ObservedProcess {
-            pid: process.pid,
-            name: process.name.clone(),
-            path: process.path.clone(),
-        });
-    if process.is_some() {
-        table.record_lookup_hit();
-        return process;
-    }
-    table.record_lookup_miss();
-    drop(table);
-    proc_table::request_refresh(proc_table);
-    None
 }
 
 pub struct TrafficPipeline {
@@ -498,7 +477,7 @@ mod tests {
     use super::*;
     use crate::capture::Flow;
     use crate::proc_table::ProcTable;
-    use crate::stats::{Direction, Stats, TrafficSnapshot};
+    use crate::stats::{Direction, TrafficSnapshot};
 
     #[test]
     fn try_latest_returns_newest_queued_snapshot() {
@@ -729,6 +708,7 @@ mod tests {
             .send(Flow {
                 direction: Direction::Outbound,
                 peer: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5)),
+                peer_port: Some(443),
                 bytes: 120,
                 local_socket: Some(crate::capture::LocalSocket {
                     ip: local_ip,
@@ -800,6 +780,7 @@ mod tests {
             .send(Flow {
                 direction: Direction::Outbound,
                 peer: local_ip,
+                peer_port: Some(49_152),
                 bytes: 120,
                 local_socket: Some(crate::capture::LocalSocket {
                     ip: local_ip,
@@ -853,100 +834,6 @@ mod tests {
         stop.store(true, Ordering::Release);
         drop(flow_tx);
         worker.join().unwrap();
-    }
-
-    #[test]
-    fn missing_and_ambiguous_candidates_are_unattributed() {
-        let local_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
-        let mut table = ProcTable::default();
-        table.insert_for_test(
-            local_ip,
-            443,
-            crate::capture::TransportProtocol::Tcp,
-            7,
-            Arc::from("server-a"),
-            None,
-        );
-        table.insert_for_test(
-            local_ip,
-            443,
-            crate::capture::TransportProtocol::Tcp,
-            8,
-            Arc::from("server-b"),
-            None,
-        );
-        let proc_table = Arc::new(RwLock::new(table));
-        let mut stats = Stats::default();
-
-        for flow in [
-            socket_flow(local_ip, 443, 40),
-            socket_flow(local_ip, 80, 60),
-        ] {
-            let process = resolve_process(flow.local_socket, &proc_table);
-            stats.record_flow(flow, process);
-        }
-
-        let snapshot = stats.snapshot(10);
-        assert_eq!(snapshot.processes.len(), 1);
-        assert!(snapshot.processes[0].is_unattributed());
-        assert_eq!(snapshot.processes[0].sent, 100);
-        let diagnostics = proc_table::diagnostics_snapshot(&proc_table).unwrap();
-        assert_eq!(diagnostics.lookup_hits, 0);
-        assert_eq!(diagnostics.lookup_misses, 2);
-        assert_eq!(diagnostics.refresh_requests, 2);
-    }
-
-    #[test]
-    fn recovered_resolution_does_not_reassign_historical_traffic() {
-        let local_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
-        let proc_table = Arc::new(RwLock::new(ProcTable::default()));
-        let mut stats = Stats::default();
-        let unresolved = socket_flow(local_ip, 443, 40);
-        let process = resolve_process(unresolved.local_socket, &proc_table);
-        stats.record_flow(unresolved, process);
-
-        proc_table.write().unwrap().insert_for_test(
-            local_ip,
-            443,
-            crate::capture::TransportProtocol::Tcp,
-            7,
-            Arc::from("curl"),
-            None,
-        );
-        let resolved = socket_flow(local_ip, 443, 60);
-        let process = resolve_process(resolved.local_socket, &proc_table);
-        stats.record_flow(resolved, process);
-
-        let snapshot = stats.snapshot(10);
-        let unattributed = snapshot
-            .processes
-            .iter()
-            .find(|process| process.is_unattributed())
-            .unwrap();
-        let attributed = snapshot
-            .processes
-            .iter()
-            .find(|process| process.pid() == Some(7))
-            .unwrap();
-        assert_eq!(unattributed.sent, 40);
-        assert_eq!(attributed.sent, 60);
-        let diagnostics = proc_table::diagnostics_snapshot(&proc_table).unwrap();
-        assert_eq!(diagnostics.lookup_hits, 1);
-        assert_eq!(diagnostics.lookup_misses, 1);
-        assert_eq!(diagnostics.refresh_requests, 1);
-    }
-
-    #[test]
-    fn resolve_process_records_flows_without_local_sockets() {
-        let proc_table = Arc::new(RwLock::new(ProcTable::default()));
-
-        let process = resolve_process(None, &proc_table);
-
-        assert!(process.is_none());
-        let diagnostics = proc_table::diagnostics_snapshot(&proc_table).unwrap();
-        assert_eq!(diagnostics.no_local_socket, 1);
-        assert_eq!(diagnostics.lookup_hits, 0);
-        assert_eq!(diagnostics.lookup_misses, 0);
     }
 
     #[test]
@@ -1086,22 +973,9 @@ mod tests {
         Flow {
             direction: Direction::Inbound,
             peer: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            peer_port: None,
             bytes,
             local_socket: None,
-            peer_local_socket: None,
-        }
-    }
-
-    fn socket_flow(local_ip: IpAddr, port: u16, bytes: u64) -> Flow {
-        Flow {
-            direction: Direction::Outbound,
-            peer: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5)),
-            bytes,
-            local_socket: Some(crate::capture::LocalSocket {
-                ip: local_ip,
-                port,
-                protocol: crate::capture::TransportProtocol::Tcp,
-            }),
             peer_local_socket: None,
         }
     }

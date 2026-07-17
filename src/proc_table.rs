@@ -16,6 +16,7 @@ type SocketKey = (IpAddr, u16, TransportProtocol);
 pub struct ProcTable {
     entries: HashMap<SocketKey, HashMap<u32, ProcInfo>>,
     refreshed_at: Option<Instant>,
+    generation: u64,
     max_age: Duration,
     refresh_tx: Option<SyncSender<RefreshRequest>>,
     diagnostics: Arc<ProcDiagnostics>,
@@ -84,6 +85,10 @@ impl ProcTable {
 
     pub fn lookup(&self, ip: IpAddr, port: u16, protocol: TransportProtocol) -> Option<&ProcInfo> {
         self.lookup_at(ip, port, protocol, Instant::now())
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     fn lookup_at(
@@ -196,6 +201,7 @@ impl ProcTable {
         Self {
             entries,
             refreshed_at: None,
+            generation: 0,
             max_age: Duration::ZERO,
             refresh_tx: None,
             diagnostics: Arc::new(ProcDiagnostics::default()),
@@ -213,6 +219,7 @@ impl ProcTable {
         let records = result?;
         let mut next = Self::from_records(records);
         next.refreshed_at = Some(refreshed_at);
+        next.generation = self.generation.wrapping_add(1);
         next.max_age = refresh.saturating_mul(2);
         next.refresh_tx = refresh_tx;
         next.diagnostics = diagnostics;
@@ -231,6 +238,7 @@ impl ProcTable {
         path: Option<Arc<str>>,
     ) {
         self.refreshed_at = Some(Instant::now());
+        self.generation = self.generation.wrapping_add(1);
         self.max_age = Duration::MAX;
         self.entries
             .entry((ip, port, protocol))
@@ -243,6 +251,21 @@ impl ProcTable {
                     path,
                 },
             );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_for_test(&mut self) {
+        self.max_age = Duration::ZERO;
+        self.refreshed_at = Some(Instant::now() - Duration::from_nanos(1));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_refresh_for_test(&mut self) {
+        let _ = self.refresh_at(
+            Err("listeners unavailable".to_string()),
+            Instant::now(),
+            Duration::from_secs(1),
+        );
     }
 }
 

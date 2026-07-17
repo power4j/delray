@@ -65,6 +65,8 @@ pub struct Flow {
     pub direction: Direction,
     /// 远端 IP（用于 IP 维度统计）。
     pub peer: IpAddr,
+    /// 远端 TCP/UDP 端口；非 TCP/UDP 流量为 `None`。
+    pub peer_port: Option<u16>,
     pub bytes: u64,
     /// 本机 socket，仅 TCP/UDP 有；用于进程关联。
     pub local_socket: Option<LocalSocket>,
@@ -78,7 +80,7 @@ pub enum TransportProtocol {
     Udp,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct LocalSocket {
     pub ip: IpAddr,
     pub port: u16,
@@ -302,12 +304,17 @@ fn parse(
         return Ok(None);
     };
 
-    let (local_socket, peer_local_socket) = match &headers.transport {
+    let (local_socket, peer_local_socket, peer_port) = match &headers.transport {
         Some(TransportHeader::Tcp(tcp)) => {
             let port = if direction == Direction::Outbound {
                 tcp.source_port
             } else {
                 tcp.destination_port
+            };
+            let peer_port = if direction == Direction::Outbound {
+                tcp.destination_port
+            } else {
+                tcp.source_port
             };
             let local_socket = LocalSocket {
                 ip: local_ip,
@@ -319,13 +326,18 @@ fn parse(
                 port: tcp.destination_port,
                 protocol: TransportProtocol::Tcp,
             });
-            (Some(local_socket), peer_local_socket)
+            (Some(local_socket), peer_local_socket, Some(peer_port))
         }
         Some(TransportHeader::Udp(udp)) => {
             let port = if direction == Direction::Outbound {
                 udp.source_port
             } else {
                 udp.destination_port
+            };
+            let peer_port = if direction == Direction::Outbound {
+                udp.destination_port
+            } else {
+                udp.source_port
             };
             let local_socket = LocalSocket {
                 ip: local_ip,
@@ -337,14 +349,15 @@ fn parse(
                 port: udp.destination_port,
                 protocol: TransportProtocol::Udp,
             });
-            (Some(local_socket), peer_local_socket)
+            (Some(local_socket), peer_local_socket, Some(peer_port))
         }
-        _ => (None, None),
+        _ => (None, None, None),
     };
 
     Ok(Some(Flow {
         direction,
         peer,
+        peer_port,
         bytes,
         local_socket,
         peer_local_socket,
@@ -486,6 +499,7 @@ mod tests {
     struct ExpectedFlow {
         direction: Direction,
         peer: IpAddr,
+        peer_port: u16,
         local_ip: IpAddr,
         local_port: u16,
         protocol: TransportProtocol,
@@ -1025,11 +1039,17 @@ mod tests {
         } else {
             5_353
         };
+        let peer_port = if protocol == TransportProtocol::Tcp {
+            443
+        } else {
+            53
+        };
         (
             packet,
             ExpectedFlow {
                 direction,
                 peer,
+                peer_port,
                 local_ip,
                 local_port,
                 protocol,
@@ -1156,6 +1176,7 @@ mod tests {
     fn assert_flow(flow: Flow, expected: ExpectedFlow) {
         assert!(flow.direction == expected.direction);
         assert_eq!(flow.peer, expected.peer);
+        assert_eq!(flow.peer_port, Some(expected.peer_port));
         assert_eq!(flow.bytes, expected.bytes);
         let socket = flow.local_socket.expect("local socket");
         assert_eq!(socket.ip, expected.local_ip);

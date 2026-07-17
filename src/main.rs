@@ -1,3 +1,4 @@
+mod attribution;
 mod capture;
 mod pipeline;
 mod proc_table;
@@ -135,10 +136,12 @@ fn background_loop(
     is_json: bool,
 ) {
     let mut stats = stats::Stats::default();
+    let mut attributor = attribution::PendingAttributor::default();
     let mut next_refresh = Instant::now() + REFRESH_INTERVAL;
     loop {
-        process_next(|| source.next(), proc_table, &mut stats);
+        process_next(|| source.next(), proc_table, &mut stats, &mut attributor);
         if Instant::now() >= next_refresh {
+            attributor.advance(&mut stats, proc_table, Instant::now());
             let res = if is_json {
                 report::render_file_json(path, interface, started_wall, started_at, &stats, top_n)
             } else {
@@ -163,10 +166,12 @@ fn json_stdout_loop(
     top_n: usize,
 ) {
     let mut stats = stats::Stats::default();
+    let mut attributor = attribution::PendingAttributor::default();
     let mut next_refresh = Instant::now() + REFRESH_INTERVAL;
     loop {
-        process_next(|| source.next(), proc_table, &mut stats);
+        process_next(|| source.next(), proc_table, &mut stats, &mut attributor);
         if Instant::now() >= next_refresh {
+            attributor.advance(&mut stats, proc_table, Instant::now());
             report::render_jsonl(interface, started_wall, started_at, &stats, top_n);
             next_refresh = Instant::now() + REFRESH_INTERVAL;
         }
@@ -177,58 +182,24 @@ fn process_next<N, E>(
     mut next_flow: N,
     proc_table: &proc_table::SharedProcTable,
     stats: &mut stats::Stats,
+    attributor: &mut attribution::PendingAttributor,
 ) where
     N: FnMut() -> Result<Option<capture::Flow>, E>,
     E: std::fmt::Display,
 {
+    let now = Instant::now();
     match next_flow() {
         Ok(Some(flow)) => {
-            let process = lookup_optional_process(proc_table, flow.local_socket);
-            if flow.peer_local_socket.is_some() {
-                let peer_process = lookup_optional_process(proc_table, flow.peer_local_socket);
-                stats.record_flow_processes(flow, process, peer_process);
-            } else {
-                stats.record_flow(flow, process);
-            }
+            attributor.record_flow(stats, flow, proc_table, now, chrono::Utc::now());
         }
-        Ok(None) => {}
+        Ok(None) => {
+            attributor.advance(stats, proc_table, now);
+        }
         Err(e) => {
             eprintln!("Capture error: {e}");
+            attributor.advance(stats, proc_table, now);
         }
     }
-}
-
-fn lookup_optional_process(
-    proc_table: &proc_table::SharedProcTable,
-    socket: Option<capture::LocalSocket>,
-) -> Option<stats::ObservedProcess> {
-    let Some(socket) = socket else {
-        proc_table::record_no_local_socket(proc_table);
-        return None;
-    };
-    lookup_process(proc_table, socket)
-}
-
-fn lookup_process(
-    proc_table: &proc_table::SharedProcTable,
-    socket: capture::LocalSocket,
-) -> Option<stats::ObservedProcess> {
-    let table = proc_table.read().ok()?;
-    let process = table
-        .lookup(socket.ip, socket.port, socket.protocol)
-        .map(|process| stats::ObservedProcess {
-            pid: process.pid,
-            name: process.name.clone(),
-            path: process.path.clone(),
-        });
-    if process.is_some() {
-        table.record_lookup_hit();
-        return process;
-    }
-    table.record_lookup_miss();
-    drop(table);
-    proc_table::request_refresh(proc_table);
-    None
 }
 
 /// CLI arguments.
@@ -270,6 +241,7 @@ mod scheduling_tests {
     fn continuous_traffic_yields_after_one_flow() {
         let proc_table = Arc::new(RwLock::new(proc_table::ProcTable::default()));
         let mut stats = stats::Stats::default();
+        let mut attributor = attribution::PendingAttributor::default();
         let mut calls = 0;
 
         process_next(
@@ -278,6 +250,7 @@ mod scheduling_tests {
                 Ok::<_, &'static str>(Some(capture::Flow {
                     direction: stats::Direction::Inbound,
                     peer: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+                    peer_port: None,
                     bytes: 64,
                     local_socket: None,
                     peer_local_socket: None,
@@ -285,6 +258,7 @@ mod scheduling_tests {
             },
             &proc_table,
             &mut stats,
+            &mut attributor,
         );
 
         assert_eq!(calls, 1);

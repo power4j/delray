@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 
 use crate::capture::Flow;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Direction {
     Inbound,
     Outbound,
@@ -203,10 +203,12 @@ impl Stats {
         self.proc_last_seen.insert(key, observed_at);
     }
 
+    #[cfg(test)]
     pub fn record_flow(&mut self, flow: Flow, process: Option<ObservedProcess>) {
         self.record_flow_at(flow, process, Utc::now());
     }
 
+    #[cfg(test)]
     pub(crate) fn record_flow_at(
         &mut self,
         flow: Flow,
@@ -216,15 +218,7 @@ impl Stats {
         self.record_flow_processes_at(flow, process, None, observed_at);
     }
 
-    pub(crate) fn record_flow_processes(
-        &mut self,
-        flow: Flow,
-        process: Option<ObservedProcess>,
-        peer_process: Option<ObservedProcess>,
-    ) {
-        self.record_flow_processes_at(flow, process, peer_process, Utc::now());
-    }
-
+    #[cfg(test)]
     pub(crate) fn record_flow_processes_at(
         &mut self,
         flow: Flow,
@@ -232,6 +226,17 @@ impl Stats {
         peer_process: Option<ObservedProcess>,
         observed_at: DateTime<Utc>,
     ) {
+        self.record_interface_flow(&flow);
+        if flow.peer_local_socket.is_some() {
+            self.record_process(process, Direction::Outbound, flow.bytes, observed_at);
+            self.record_process(peer_process, Direction::Inbound, flow.bytes, observed_at);
+            return;
+        }
+
+        self.record_process(process, flow.direction, flow.bytes, observed_at);
+    }
+
+    pub(crate) fn record_interface_flow(&mut self, flow: &Flow) {
         if flow.peer_local_socket.is_some() {
             self.add_out(flow.peer, flow.bytes);
             self.add_in(
@@ -240,13 +245,6 @@ impl Stats {
                     .unwrap_or(flow.peer),
                 flow.bytes,
             );
-            self.add_process_or_unattributed(process, Direction::Outbound, flow.bytes, observed_at);
-            self.add_process_or_unattributed(
-                peer_process,
-                Direction::Inbound,
-                flow.bytes,
-                observed_at,
-            );
             return;
         }
 
@@ -254,7 +252,16 @@ impl Stats {
             Direction::Inbound => self.add_in(flow.peer, flow.bytes),
             Direction::Outbound => self.add_out(flow.peer, flow.bytes),
         }
-        self.add_process_or_unattributed(process, flow.direction, flow.bytes, observed_at);
+    }
+
+    pub(crate) fn record_process(
+        &mut self,
+        process: Option<ObservedProcess>,
+        direction: Direction,
+        bytes: u64,
+        observed_at: DateTime<Utc>,
+    ) {
+        self.add_process_or_unattributed(process, direction, bytes, observed_at);
     }
 
     fn add_process_or_unattributed(
@@ -625,6 +632,7 @@ mod tests {
         Flow {
             direction,
             peer: ip(peer),
+            peer_port: None,
             bytes,
             local_socket: None,
             peer_local_socket: None,
