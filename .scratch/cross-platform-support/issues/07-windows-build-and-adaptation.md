@@ -13,7 +13,7 @@
 - [x] 数字编号和完整 Npcap 设备名都能够选择网卡。
 - [ ] 缺少 Npcap、设备不存在和权限不足时显示明确英文错误。
 - [ ] 普通用户可以运行；管理员权限只提高受保护进程的归属完整度。
-- [ ] Windows 修正复用共享模块，不复制统计、报告或 TUI 业务逻辑。
+- [x] Windows 修正复用共享模块，不复制统计、报告或 TUI 业务逻辑。
 - [ ] Windows 发现的共享问题具有自动化回归测试，并保持 Linux 测试通过。
 - [x] 本 ticket 不制作安装包、不签名、不捆绑 Npcap，也不更新 README 的支持平台声明。
 
@@ -85,6 +85,14 @@
 
 在同一普通用户会话中，`delray.exe 10 --output <temporary-file>` 成功打开 Intel Wi-Fi 适配器并写入 plain 报告。5 秒观察窗口内接口统计为零，因此此结果只验证物理设备打开和 plain 输出路径，不作为物理网卡流量归属证据。
 
-`delray.exe 13 --format json` 在 Npcap Loopback 上运行时，由本机生成了 TCP/UDP IPv4 和 IPv6 流量：`127.0.0.1` 与 `::1` 的 TCP/UDP 收发均成功。JSON 快照显示非零入站和出站字节，包含进程记录、路径、`last_seen` 和未归属流量；这确认了 Loopback 的 JSON 聚合路径可用。
+`delray.exe 13 --format json` 在 Npcap Loopback 上运行时，由本机生成了 TCP/UDP IPv4 和 IPv6 流量：`127.0.0.1` 与 `::1` 的 TCP/UDP 收发均成功。JSONL 快照显示非零入站和出站字节，包含进程记录、路径、`last_seen` 和未归属流量；这确认了 Loopback 的前台 JSONL 聚合路径可用。Delray 当前使用同一个 `--format json` 参数：前台 stdout 为 JSONL，配合 `--output` 时覆盖写 JSON 文件。
 
-完整物理网卡流量、普通用户与管理员归属率对比、缺少 Npcap 或权限不足错误、JSONL、完整 TUI 交互、终端恢复和长期运行仍未验收。TUI 已有自动化渲染测试覆盖，但 Windows 终端交互需要人工执行，不能用自动化输入替代。
+完整物理网卡流量、普通用户与管理员归属率对比、缺少 Npcap 或权限不足错误、完整 TUI 交互、终端恢复和长期运行仍未验收。TUI 已有自动化渲染测试覆盖，但 Windows 终端交互需要人工执行，不能用自动化输入替代。
+
+### 2026-07-17 JSONL 与 diagnostics 后续验证
+
+在同一普通用户会话中，`delray.exe \Device\NPF_Loopback --format json --diagnostics` 以前台模式运行，并将 stdout 和 stderr 重定向到 `target\manual-validation` 下的临时文件。运行期间本机生成 `127.0.0.1` 与 `::1` 的 TCP/UDP loopback 流量。
+
+结果：stdout 产生 1 行 JSONL；最后一帧 `interface` 为 `\Device\NPF_Loopback`，`totals.in_bytes=1577893`，`totals.out_bytes=1578017`，`top_processes` 包含 9 条记录，至少一条进程记录包含 `path` 和 `last_seen`。stderr 输出 diagnostics，例如 `lookup_hits=2663`、`lookup_misses=2158`、`refresh_success=5`、`refresh_failure=0`、`pending_records=8`。
+
+本轮未修改 Rust 源码。Windows 构建问题来自 SDK 链接环境，后续 Windows 验证也未发现需要复制或分叉统计、报告或 TUI 业务逻辑的问题。
