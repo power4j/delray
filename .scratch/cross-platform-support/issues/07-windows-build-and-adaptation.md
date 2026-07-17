@@ -80,3 +80,11 @@
 本机 SDK 缺失导致的 `LNK1181` 已解除，无需设置 `LIBPCAP_VER`，也未发现需要修改 Windows 源码或复制共享业务逻辑的问题。已有自动化测试同时覆盖数字编号、完整设备名和无效选择；本次 Windows 测试二进制也已实际运行。
 
 缺少 Npcap 的错误未通过卸载或破坏运行时验证。权限不足、管理员与普通用户的归属差异、物理网卡、TCP/UDP、IPv4/IPv6 的完整组合，以及 plain、JSON/JSONL、TUI、终端恢复和持续运行仍属于 ticket 08 的人工验收，相关 checklist 保持未勾选。README 支持平台声明未改动；未下载、复制或提交 Npcap、`delray.exe`、构建产物、安装包或签名文件。
+
+### 2026-07-17 Loopback 与 plain 后续验证
+
+在同一普通用户会话中，`delray.exe 10 --output <temporary-file>` 成功打开 Intel Wi-Fi 适配器并写入 plain 报告。5 秒观察窗口内接口统计为零，因此此结果只验证物理设备打开和 plain 输出路径，不作为物理网卡流量归属证据。
+
+`delray.exe 13 --format json` 在 Npcap Loopback 上运行时，由本机生成了 TCP/UDP IPv4 和 IPv6 流量：`127.0.0.1` 与 `::1` 的 TCP/UDP 收发均成功。JSON 快照显示非零入站和出站字节，包含进程记录、路径、`last_seen` 和未归属流量；这确认了 Loopback 的 JSON 聚合路径可用。
+
+完整物理网卡流量、普通用户与管理员归属率对比、缺少 Npcap 或权限不足错误、JSONL、完整 TUI 交互、终端恢复和长期运行仍未验收。TUI 已有自动化渲染测试覆盖，但 Windows 终端交互需要人工执行，不能用自动化输入替代。
