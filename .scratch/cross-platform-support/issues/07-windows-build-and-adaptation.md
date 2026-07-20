@@ -4,7 +4,7 @@
 
 **Blocked by:** 06 — 完成 Linux 共享改造验收
 
-**Status:** ready-for-human
+**Status:** wontfix
 
 - [x] 从已经合并 Linux 共享改造的最新主干创建 `windows-support` 短期分支。
 - [x] 记录 Windows、Rust 1.88、Npcap SDK 和 Npcap 运行时版本。
@@ -160,3 +160,7 @@ Npcap Runtime is required. Install Npcap from https://npcap.com/ and try again.
 重新安装未启用管理员专用访问的 Npcap 后，普通终端与管理员终端均可直接运行 Delray，不出现 UAC。在相同 iPerf 流量下，两种模式均未观察到明显的流量统计或进程归属差异。
 
 这确认普通用户可以运行，并说明当前受控流量不依赖管理员权限。由于本次未覆盖受保护系统进程，无法验证管理员权限只提升该类进程的归属完整度；ticket 07 的组合验收项保持未勾选。
+
+### 2026-07-20 收尾决定
+
+维护者决定不再执行剩余的权限拒绝和受保护系统进程验收。ticket 07 以 `wontfix` 收尾，表示未完成的验收项后续不再执行，不表示所有验收已通过。Windows `x86_64` 继续作为目标平台；README 不增加支持平台声明。
