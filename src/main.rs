@@ -17,6 +17,14 @@ use proc_table::LookupMissReason;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_TOP_N: u64 = 10;
 const DEFAULT_PROC_REFRESH: u64 = 2;
+const NPCAP_REQUIRED_MESSAGE: &str =
+    "Npcap Runtime is required. Install Npcap from https://npcap.com/ and try again.";
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn LoadLibraryW(file_name: *const u16) -> *mut std::ffi::c_void;
+    fn FreeLibrary(module: *mut std::ffi::c_void) -> i32;
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DispatchMode {
@@ -37,6 +45,11 @@ fn dispatch_mode(cli: &Cli) -> DispatchMode {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    if let Err(message) = require_npcap() {
+        eprintln!("{message}");
+        return ExitCode::FAILURE;
+    }
 
     if dispatch_mode(&cli) == DispatchMode::MissingInterface {
         eprintln!("An explicit interface is required for JSON or background file output.");
@@ -124,6 +137,26 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+#[cfg(windows)]
+fn require_npcap() -> Result<(), &'static str> {
+    let library_name: Vec<u16> = "wpcap.dll\0".encode_utf16().collect();
+    // SAFETY: `library_name` is NUL-terminated and remains alive for the call.
+    let module = unsafe { LoadLibraryW(library_name.as_ptr()) };
+    if module.is_null() {
+        return Err(NPCAP_REQUIRED_MESSAGE);
+    }
+    // SAFETY: `module` was returned by `LoadLibraryW` above and is non-null.
+    unsafe {
+        FreeLibrary(module);
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn require_npcap() -> Result<(), &'static str> {
+    Ok(())
 }
 
 /// Background file loop: capture continuously, write snapshot every refresh interval.
@@ -348,6 +381,14 @@ mod scheduling_tests {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn missing_npcap_message_names_the_runtime_and_installation_source() {
+        assert_eq!(
+            NPCAP_REQUIRED_MESSAGE,
+            "Npcap Runtime is required. Install Npcap from https://npcap.com/ and try again."
+        );
+    }
 
     #[test]
     fn parses_all_args() {
