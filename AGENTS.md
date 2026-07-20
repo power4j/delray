@@ -4,6 +4,19 @@
 
 Issues live as markdown files under `.scratch/<feature>/`. See `docs/agents/issue-tracker.md`.
 
+## Linux release builds
+
+Linux distribution binaries must use the glibc 2.28 baseline documented in
+`README.md`. Use:
+
+```bash
+cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.28
+```
+
+The release artifact is `target/x86_64-unknown-linux-gnu/release/delray`.
+Plain `cargo build --release` is only for local development or same-host
+testing, not for Linux distribution builds.
+
 ### Triage labels
 
 Five default triage roles map to labels of the same name. See `docs/agents/triage-labels.md`.

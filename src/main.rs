@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 
-use capture::CaptureSource;
+use capture::{CaptureSource, TransportProtocol};
+use proc_table::LookupMissReason;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_TOP_N: u64 = 10;
 const DEFAULT_PROC_REFRESH: u64 = 2;
@@ -200,20 +201,55 @@ fn emit_diagnostics(
     eprintln!(
         concat!(
             "diagnostics: lookup_hits={} lookup_misses={} no_local_socket={} ",
+            "lookup_no_candidate={} lookup_ambiguous={} lookup_stale={} ",
+            "lookup_v4_mapped_hits={} ",
             "refresh_requests={} refresh_actual={} refresh_success={} refresh_failure={} ",
+            "refresh_records={} refresh_v4_mapped_records={} ",
             "last_refresh_ms={} pending_records={} pending_bytes={}"
         ),
         proc.lookup_hits,
         proc.lookup_misses,
         proc.no_local_socket,
+        proc.lookup_no_candidate,
+        proc.lookup_ambiguous,
+        proc.lookup_stale,
+        proc.lookup_v4_mapped_hits,
         proc.refresh_requests,
         proc.refresh_actual,
         proc.refresh_success,
         proc.refresh_failure,
+        proc.refresh_records,
+        proc.refresh_v4_mapped_records,
         proc.last_refresh_duration.as_millis(),
         pending.records,
         pending.bytes,
     );
+    for sample in proc.lookup_miss_samples {
+        eprintln!(
+            "diagnostics_miss_sample: reason={} protocol={} local={}:{} peer={}:{}",
+            lookup_miss_reason_label(sample.reason),
+            transport_protocol_label(sample.local_socket.protocol),
+            sample.local_socket.ip,
+            sample.local_socket.port,
+            sample.peer_ip,
+            sample.peer_port,
+        );
+    }
+}
+
+fn lookup_miss_reason_label(reason: LookupMissReason) -> &'static str {
+    match reason {
+        LookupMissReason::NoCandidate => "no_candidate",
+        LookupMissReason::Ambiguous => "ambiguous",
+        LookupMissReason::Stale => "stale",
+    }
+}
+
+fn transport_protocol_label(protocol: TransportProtocol) -> &'static str {
+    match protocol {
+        TransportProtocol::Tcp => "tcp",
+        TransportProtocol::Udp => "udp",
+    }
 }
 
 fn process_next<N, E>(

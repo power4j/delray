@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 use crate::capture::{Flow, LocalSocket};
-use crate::proc_table::{self, SharedProcTable};
+use crate::proc_table::{self, LookupOutcome, SharedProcTable};
 use crate::stats::{Direction, ObservedProcess, Stats};
 
 pub(crate) const PENDING_ATTRIBUTION_WINDOW: Duration = Duration::from_secs(1);
@@ -124,7 +124,7 @@ impl PendingAttributor {
         self.last_generation = generation;
 
         while let Some(pending) = self.pending.pop_front() {
-            match lookup_process(proc_table, pending.socket, false) {
+            match lookup_process(proc_table, pending.socket, None, false) {
                 Some(process) => {
                     stats.record_process(
                         Some(process),
@@ -182,7 +182,8 @@ impl PendingAttributor {
             return;
         };
 
-        if let Some(process) = lookup_process(proc_table, socket, true) {
+        if let Some(process) = lookup_process(proc_table, socket, Some((peer_ip, peer_port)), true)
+        {
             stats.record_process(Some(process), direction, bytes, observed_at);
             return;
         }
@@ -250,26 +251,34 @@ impl PendingAttributor {
 fn lookup_process(
     proc_table: &SharedProcTable,
     socket: LocalSocket,
+    peer: Option<(IpAddr, u16)>,
     request_refresh: bool,
 ) -> Option<ObservedProcess> {
     let table = proc_table.read().ok()?;
-    let process = table
-        .lookup(socket.ip, socket.port, socket.protocol)
-        .map(|process| ObservedProcess {
-            pid: process.pid,
-            name: process.name.clone(),
-            path: process.path.clone(),
-        });
-    if process.is_some() {
-        table.record_lookup_hit();
-        return process;
+    match table.lookup_outcome(socket.ip, socket.port, socket.protocol) {
+        LookupOutcome::Hit { process, v4_mapped } => {
+            table.record_lookup_hit();
+            if v4_mapped {
+                table.record_v4_mapped_lookup_hit();
+            }
+            Some(ObservedProcess {
+                pid: process.pid,
+                name: process.name.clone(),
+                path: process.path.clone(),
+            })
+        }
+        LookupOutcome::Miss(reason) => {
+            table.record_lookup_miss(reason);
+            if let Some((peer_ip, peer_port)) = peer {
+                table.record_lookup_miss_sample(reason, socket, peer_ip, peer_port);
+            }
+            drop(table);
+            if request_refresh {
+                proc_table::request_refresh(proc_table);
+            }
+            None
+        }
     }
-    table.record_lookup_miss();
-    drop(table);
-    if request_refresh {
-        proc_table::request_refresh(proc_table);
-    }
-    None
 }
 
 #[cfg(test)]
