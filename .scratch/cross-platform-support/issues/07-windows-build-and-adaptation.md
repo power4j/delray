@@ -148,3 +148,9 @@ Npcap Runtime is required. Install Npcap from https://npcap.com/ and try again.
 在 Runtime 仍缺失的真实环境中，重新构建 release 后执行 `target\release\delray.exe --format json`，结果为状态码 `1`、stdout 为空、stderr 为上述错误。`cargo +1.88.0 test --locked` 通过 131 项测试，`cargo +1.88.0 build --release --locked` 通过。新增回归测试以注入 Runtime 探测失败的方式执行同一启动分支，并验证在抓包初始化前返回失败；真实验收同时覆盖了延迟加载后的启动行为和 stderr 文案。
 
 本次只使用现有 SDK import library 进行源码构建，未下载、捆绑或提交 Npcap。权限拒绝和普通用户与管理员归属差异尚未验证，因此对应 checklist 保持未勾选。
+
+### 2026-07-20 Npcap 管理员专用访问反馈
+
+安装 Npcap 时启用要求管理员权限的配置后，Medium integrity 的普通终端执行 Delray 会出现 UAC 提示；在管理员终端执行时可以直接运行。两种可运行方式均为提升后的管理员令牌，当前未观察到统计数据存在明显差别。
+
+该结果不能证明普通用户可运行，也不能用于比较普通用户和管理员的进程归属完整度。它说明 Npcap 的管理员专用访问配置本身阻止了普通用户直接打开抓包设备，而非 Delray 主动请求提升权限。普通用户验收需要使用不限制 Npcap 驱动访问的安装配置，在同一受控流量下再与管理员结果比较；权限相关 checklist 保持未勾选。
