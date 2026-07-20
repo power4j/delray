@@ -44,8 +44,10 @@ fn dispatch_mode(cli: &Cli) -> DispatchMode {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    run(Cli::parse(), require_npcap)
+}
 
+fn run(cli: Cli, require_npcap: impl FnOnce() -> Result<(), &'static str>) -> ExitCode {
     if let Err(message) = require_npcap() {
         eprintln!("{message}");
         return ExitCode::FAILURE;
@@ -383,11 +385,10 @@ mod cli_tests {
     use super::*;
 
     #[test]
-    fn missing_npcap_message_names_the_runtime_and_installation_source() {
-        assert_eq!(
-            NPCAP_REQUIRED_MESSAGE,
-            "Npcap Runtime is required. Install Npcap from https://npcap.com/ and try again."
-        );
+    fn missing_npcap_fails_before_capture_setup() {
+        let cli = Cli::try_parse_from(["delray", "--format", "json"]).unwrap();
+
+        assert_eq!(run(cli, || Err(NPCAP_REQUIRED_MESSAGE)), ExitCode::FAILURE);
     }
 
     #[test]
