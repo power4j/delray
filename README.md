@@ -40,6 +40,21 @@ cargo fmt --check
 cargo test
 ```
 
+### Windows x86_64 build (target platform)
+
+Windows `x86_64` is still a target platform under validation and is not yet a supported release platform. Building from source requires Rust 1.88, Npcap Runtime, and the Npcap SDK. Npcap is installed separately by the environment; Delray does not bundle it.
+
+The Npcap SDK x64 `Lib` directory must contain `wpcap.lib` and `Packet.lib`. Set `LIBPCAP_LIBDIR` to that directory in the current PowerShell session before building:
+
+```powershell
+$env:LIBPCAP_LIBDIR = 'path-to-npcap-sdk\Lib\x64'
+
+cargo +1.88.0 check --locked
+cargo +1.88.0 build --release --locked
+```
+
+The release executable is `target\release\delray.exe`. If MSVC reports `LNK1181: cannot open input file 'wpcap.lib'`, check that `LIBPCAP_LIBDIR` points to the SDK x64 `Lib` directory, not the Npcap Runtime installation directory or an x86 library directory.
+
 ## 构建分发二进制
 
 以 glibc 2.28 为基线交叉构建，产物兼容 glibc ≥ 2.28 的目标机：

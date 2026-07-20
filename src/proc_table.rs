@@ -36,7 +36,7 @@ struct ListenerRecord {
     socket: SocketAddr,
     protocol: TransportProtocol,
     pid: u32,
-    _name: String,
+    name: String,
     path: String,
 }
 
@@ -351,7 +351,9 @@ impl ProcTable {
             if is_v4_mapped {
                 v4_mapped_record_count += 1;
             }
-            let name = executable_name(&record.path).map(Arc::from);
+            let name = executable_name(&record.path)
+                .map(Arc::from)
+                .or_else(|| (!record.name.is_empty()).then(|| Arc::from(record.name)));
             let path = (!record.path.is_empty()).then(|| Arc::from(record.path));
             for (key, is_alias) in socket_keys(ip, port, record.protocol) {
                 if is_alias {
@@ -506,7 +508,7 @@ impl From<listeners::Listener> for ListenerRecord {
             socket: listener.socket,
             protocol: listener.protocol.into(),
             pid: listener.process.pid,
-            _name: listener.process.name,
+            name: listener.process.name,
             path: listener.process.path,
         }
     }
@@ -684,7 +686,7 @@ mod tests {
             socket: SocketAddr::new(ip, port),
             protocol,
             pid,
-            _name: name.to_string(),
+            name: name.to_string(),
             path: path.to_string(),
         }
     }
@@ -1272,7 +1274,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_executable_path_does_not_invent_display_name() {
+    fn missing_executable_path_uses_listener_process_name() {
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let table = ProcTable::from_records([record_with_name(
             ip,
@@ -1286,7 +1288,7 @@ mod tests {
         let process = table
             .lookup(ip, 443, TransportProtocol::Tcp)
             .expect("PID attribution should survive a missing executable path");
-        assert!(process.name.is_none());
+        assert_eq!(process.name.as_deref(), Some("curl"));
     }
 
     #[test]

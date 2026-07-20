@@ -7,7 +7,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -231,6 +231,10 @@ fn handle_tui_key<F>(
 where
     F: FnMut(&str) -> anyhow::Result<Activation>,
 {
+    if key.kind == KeyEventKind::Release {
+        return KeyOutcome::Ignored;
+    }
+
     if matches!(key.code, KeyCode::Char('q'))
         || matches!(key.code, KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL))
     {
@@ -720,11 +724,12 @@ fn draw_with_interfaces_at(
         ])
         .split(area);
 
+    let interface_label = interface_display_label(interface, interfaces);
     draw_header(
         f,
         chunks[0],
         state.page,
-        interface.unwrap_or("No interface"),
+        &interface_label,
         host,
         started_at,
         mode,
@@ -743,6 +748,17 @@ fn draw_with_interfaces_at(
         Page::About => draw_about(f, body),
     }
     draw_status_bar(f, chunks[2], state, mode);
+}
+
+fn interface_display_label(interface: Option<&str>, interfaces: &[InterfaceInfo]) -> String {
+    let interface_name = interface.unwrap_or("No interface");
+    interfaces
+        .iter()
+        .find(|candidate| candidate.name == interface_name)
+        .map(|candidate| candidate.description.as_str())
+        .filter(|description| !description.is_empty() && *description != "No description")
+        .map(str::to_string)
+        .unwrap_or_else(|| interface_name.to_string())
 }
 
 fn draw_interface_selector(
@@ -810,15 +826,15 @@ fn draw_interface_selector(
                         Cell::from(format!("{}.", index + 1)),
                         Cell::from(format!(
                             "{}\n{}  {}",
-                            interface.name, interface.description, marker
+                            interface.description, interface.name, marker
                         )),
                     ])
                     .height(2)
                 } else {
                     Row::new(vec![
                         Cell::from(format!("{}.", index + 1)),
-                        Cell::from(interface.name.clone()),
                         Cell::from(interface.description.clone()),
+                        Cell::from(interface.name.clone()),
                         Cell::from(marker),
                     ])
                 }
@@ -835,8 +851,8 @@ fn draw_interface_selector(
             rows,
             [
                 Constraint::Length(3),
-                Constraint::Min(50),
                 Constraint::Min(18),
+                Constraint::Min(50),
                 Constraint::Length(24),
             ],
         )
@@ -1759,6 +1775,126 @@ mod tests {
     }
 
     #[test]
+    fn selector_ignores_releases_and_handles_press_and_repeat() {
+        let mut interfaces = interfaces();
+        interfaces.push(crate::capture::InterfaceInfo {
+            name: "lo".to_string(),
+            description: "Loopback".to_string(),
+            is_default_route: false,
+        });
+        let mut state = AppState::startup(&interfaces);
+        let mut snapshot = Arc::new(TrafficSnapshot::default());
+
+        assert_eq!(
+            handle_tui_key(
+                &mut state,
+                KeyEvent::new_with_kind(
+                    KeyCode::Down,
+                    KeyModifiers::NONE,
+                    crossterm::event::KeyEventKind::Release,
+                ),
+                &mut snapshot,
+                &interfaces,
+                None,
+                |_| unreachable!(),
+            ),
+            KeyOutcome::Ignored
+        );
+        assert_eq!(state.interface_selector.as_ref().unwrap().selected, 0);
+
+        assert_eq!(
+            handle_tui_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &mut snapshot,
+                &interfaces,
+                None,
+                |_| unreachable!(),
+            ),
+            KeyOutcome::Changed
+        );
+        assert_eq!(state.interface_selector.as_ref().unwrap().selected, 1);
+
+        assert_eq!(
+            handle_tui_key(
+                &mut state,
+                KeyEvent::new_with_kind(
+                    KeyCode::Down,
+                    KeyModifiers::NONE,
+                    crossterm::event::KeyEventKind::Repeat,
+                ),
+                &mut snapshot,
+                &interfaces,
+                None,
+                |_| unreachable!(),
+            ),
+            KeyOutcome::Changed
+        );
+        assert_eq!(state.interface_selector.as_ref().unwrap().selected, 2);
+
+        assert_eq!(
+            handle_tui_key(
+                &mut state,
+                KeyEvent::new_with_kind(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                    crossterm::event::KeyEventKind::Release,
+                ),
+                &mut snapshot,
+                &interfaces,
+                None,
+                |_| unreachable!(),
+            ),
+            KeyOutcome::Ignored
+        );
+        assert!(state.interface_selector.is_some());
+    }
+
+    #[test]
+    fn header_uses_interface_description_instead_of_pcap_device_name() {
+        let interfaces = vec![crate::capture::InterfaceInfo {
+            name: r"\Device\NPF_{A1B2C3D4}".to_string(),
+            description: "Intel Ethernet Controller".to_string(),
+            is_default_route: true,
+        }];
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::new();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_with_interfaces(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    Some(r"\Device\NPF_{A1B2C3D4}"),
+                    &interfaces,
+                    "host",
+                    Instant::now(),
+                );
+            })
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("Intel Ethernet Controller"));
+        assert!(!rendered.contains(r"\Device\NPF_{A1B2C3D4}"));
+    }
+
+    #[test]
+    fn interface_label_falls_back_to_pcap_name_without_a_description() {
+        let name = r"\Device\NPF_{A1B2C3D4}";
+        for description in ["", "No description"] {
+            let interfaces = vec![crate::capture::InterfaceInfo {
+                name: name.to_string(),
+                description: description.to_string(),
+                is_default_route: true,
+            }];
+
+            assert_eq!(interface_display_label(Some(name), &interfaces), name);
+        }
+    }
+
+    #[test]
     fn active_interface_selector_cancels_and_successful_switch_resets_view() {
         let interfaces = interfaces();
         let mut state = AppState::new();
@@ -2005,7 +2141,41 @@ mod tests {
             })
             .unwrap();
 
-        assert!(rendered_lines(&terminal).join("\n").contains(pcap_name));
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains(pcap_name));
+        assert!(rendered.find("Npcap Adapter").unwrap() < rendered.find(pcap_name).unwrap());
+    }
+
+    #[test]
+    fn selector_renders_friendly_name_before_pcap_name() {
+        let pcap_name = r"\Device\NPF_{12345678-1234-1234-1234-123456789ABC}";
+        let interfaces = vec![crate::capture::InterfaceInfo {
+            name: pcap_name.to_string(),
+            description: "Intel Ethernet Controller".to_string(),
+            is_default_route: false,
+        }];
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::startup(&interfaces);
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_with_interfaces(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    None,
+                    &interfaces,
+                    "host",
+                    Instant::now(),
+                );
+            })
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(
+            rendered.find("Intel Ethernet Controller").unwrap() < rendered.find(pcap_name).unwrap()
+        );
     }
 
     #[test]
