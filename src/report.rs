@@ -92,7 +92,7 @@ fn plain_snapshot(
     ));
 
     out.push_str(&format!("Top Processes ({top_n})\n"));
-    out.push_str("Process\tPID\tRecv\tSent\tTotal\tPath\tLast Seen\n");
+    out.push_str("Process\tPID\tRecv\tSent\tTotal\tLast Seen\tPath\n");
     for process in snapshot.processes.iter() {
         let name = process.display_name();
         let pid = process
@@ -107,8 +107,8 @@ fn plain_snapshot(
             human_bytes(process.recv),
             human_bytes(process.sent),
             human_bytes(process.total()),
-            path,
-            process.last_seen().to_rfc3339()
+            process.last_seen().to_rfc3339(),
+            path
         ));
     }
 
@@ -276,9 +276,9 @@ mod tests {
 
         let rendered = plain_snapshot("eth0", &chrono::Local::now(), Instant::now(), &stats, 10);
 
-        assert!(rendered.contains("Process\tPID\tRecv\tSent\tTotal\tPath\tLast Seen"));
+        assert!(rendered.contains("Process\tPID\tRecv\tSent\tTotal\tLast Seen\tPath"));
         assert!(
-            rendered.contains("curl\t7\t40 B\t0 B\t40 B\t/usr/bin/curl\t2026-07-15T08:00:00+00:00")
+            rendered.contains("curl\t7\t40 B\t0 B\t40 B\t2026-07-15T08:00:00+00:00\t/usr/bin/curl")
         );
     }
 
@@ -292,7 +292,7 @@ mod tests {
         let rendered = plain_snapshot("eth0", &chrono::Local::now(), Instant::now(), &stats, 10);
 
         assert!(rendered.contains(
-            "<unattributed traffic>\t-\t40 B\t60 B\t100 B\t-\t2026-07-15T08:02:00+00:00"
+            "<unattributed traffic>\t-\t40 B\t60 B\t100 B\t2026-07-15T08:02:00+00:00\t-"
         ));
     }
 
@@ -351,7 +351,7 @@ mod tests {
         );
 
         let rendered = plain_snapshot("eth0", &chrono::Local::now(), Instant::now(), &stats, 10);
-        assert!(rendered.contains("?\t7\t40 B\t0 B\t40 B\t-\t2026-07-15T08:03:00+00:00"));
+        assert!(rendered.contains("?\t7\t40 B\t0 B\t40 B\t2026-07-15T08:03:00+00:00\t-"));
 
         let frame = build_json_frame("eth0", &chrono::Local::now(), Instant::now(), &stats, 10);
         let value = serde_json::to_value(frame).unwrap();
