@@ -40,11 +40,11 @@ cargo fmt --check
 cargo test
 ```
 
-### Windows x86_64 编译（目标平台）
+### Windows x86_64 build (target platform)
 
-Windows `x86_64` 仍处于目标平台验收阶段，尚未作为支持平台发布。源码编译需要安装 Rust 1.88、Npcap Runtime 和 Npcap SDK；运行时依赖由使用环境单独安装，不随 Delray 捆绑。
+Windows `x86_64` is still a target platform under validation and is not yet a supported release platform. Building from source requires Rust 1.88, Npcap Runtime, and the Npcap SDK. Npcap is installed separately by the environment; Delray does not bundle it.
 
-Npcap SDK 的 x64 `Lib` 目录必须包含 `wpcap.lib` 和 `Packet.lib`。在当前 PowerShell 会话中将该目录配置为 `LIBPCAP_LIBDIR` 后再编译：
+The Npcap SDK x64 `Lib` directory must contain `wpcap.lib` and `Packet.lib`. Set `LIBPCAP_LIBDIR` to that directory in the current PowerShell session before building:
 
 ```powershell
 $env:LIBPCAP_LIBDIR = 'path-to-npcap-sdk\Lib\x64'
@@ -53,7 +53,7 @@ cargo +1.88.0 check --locked
 cargo +1.88.0 build --release --locked
 ```
 
-release 产物位于 `target\release\delray.exe`。如果 MSVC 报告 `LNK1181: cannot open input file 'wpcap.lib'`，应检查 `LIBPCAP_LIBDIR` 是否指向 SDK 的 x64 `Lib` 目录，而不是 Runtime 安装目录或 x86 库目录。
+The release executable is `target\release\delray.exe`. If MSVC reports `LNK1181: cannot open input file 'wpcap.lib'`, check that `LIBPCAP_LIBDIR` points to the SDK x64 `Lib` directory, not the Npcap Runtime installation directory or an x86 library directory.
 
 ## 构建分发二进制
 
