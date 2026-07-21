@@ -4,14 +4,14 @@
 //! 检测 ECH（encrypted_server_name / encrypted_client_hello）extension，存在时
 //! 返回 `None`（无法解密真实 SNI，走 NoDomain）。
 //!
-//! 仅实现 [`DomainParser`] trait 的 TLS 部分；HTTP 解析（03）、流表（04）、
-//! 复合 parser 组装不在本票范围。CaptureSource 继续使用 [`NoopDomainParser`]，
-//! 本解析器只通过单元测试验证。
+//! 04 票起由 [`CompositeDomainParser`] 在 TLS handshake ContentType 分支调用；
+//! 生产路径不再使用 [`NoopDomainParser`]。
 //!
+//! [`CompositeDomainParser`]: crate::domain_parse_composite::CompositeDomainParser
 //! [`NoopDomainParser`]: crate::domain_parse::NoopDomainParser
 
-// 04 票将 TlsDomainParser 接线进 CaptureSource；在此之前本模块的所有项仅在
-// 测试中使用，production 路径仍走 NoopDomainParser。
+// 04 票起 TlsDomainParser 经 CompositeDomainParser 接入 CaptureSource；本模块的
+// 类型与函数仍可能仅在复合 parser 路径中可见，保留 dead_code 允许。
 #![allow(dead_code)]
 
 use std::sync::Arc;

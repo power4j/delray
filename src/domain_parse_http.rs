@@ -13,16 +13,16 @@
 //!   自然落到失败分支返回 `None`，匹配"只解析请求，匹配出站方向"。
 //! - 非 HTTP 字节、空 payload、解析错误统一返回 `None`。
 //!
-//! 仅实现 [`DomainParser`] trait 的 HTTP 部分；流表（04）、复合 parser 组装不在
-//! 本票范围。CaptureSource 继续使用 [`NoopDomainParser`]，本解析器只通过单元测试
-//! 验证。
+//! 04 票起由 [`CompositeDomainParser`] 在非 TLS 分支调用；生产路径不再使用
+//! [`NoopDomainParser`]。
 //!
+//! [`CompositeDomainParser`]: crate::domain_parse_composite::CompositeDomainParser
 //! [`NoopDomainParser`]: crate::domain_parse::NoopDomainParser
 //! [`Status::Complete`]: httparse::Status::Complete
 //! [`Status::Partial`]: httparse::Status::Partial
 
-// 04 票将 HttpDomainParser 接线进 CaptureSource；在此之前本模块的所有项仅在
-// 测试中使用，production 路径仍走 NoopDomainParser。
+// 04 票起 HttpDomainParser 经 CompositeDomainParser 接入 CaptureSource；本模块的
+// 类型与函数仍可能仅在复合 parser 路径中可见，保留 dead_code 允许。
 #![allow(dead_code)]
 
 use std::sync::Arc;

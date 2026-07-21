@@ -14,9 +14,13 @@ pub trait DomainParser: Send + Sync {
 
 /// 默认空实现：不做任何解析，总是返回 `None`。
 ///
-/// 在 TLS/HTTP 解析（02/03）落地前作为 [`CaptureSource`] 的占位解析器使用。
+/// 04 票起 production 路径改用 [`CompositeDomainParser`] + [`FlowTable`]，
+/// [`NoopDomainParser`] 保留为测试桩（例如验证"无解析时聚合层行为"）。
 ///
+/// [`CompositeDomainParser`]: crate::domain_parse_composite::CompositeDomainParser
+/// [`FlowTable`]: crate::flow_table::FlowTable
 /// [`CaptureSource`]: crate::capture::CaptureSource
+#[allow(dead_code)]
 pub struct NoopDomainParser;
 
 impl DomainParser for NoopDomainParser {
