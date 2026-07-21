@@ -1,6 +1,6 @@
 # Linux/Windows 可移植架构与进程详情
 
-Status: ready-for-agent
+Status: merged (2026-07-20) — 跨平台改造与进程详情已合并 main（merge commit e8e2537）。Windows 剩余人工验收以 wontfix 收尾（详见 issues/07、issues/08 的「2026-07-20 收尾决定」），Windows x86_64 仍是目标平台，未升级为支持平台。
 
 ## Problem Statement
 
