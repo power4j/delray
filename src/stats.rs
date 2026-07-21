@@ -42,6 +42,9 @@ pub struct TrafficSnapshot {
     pub processes: Arc<[ProcessSnapshot]>,
     pub inbound_ips: Arc<[IpSnapshot]>,
     pub outbound_ips: Arc<[IpSnapshot]>,
+    /// 出站域名维度（05 票）；消费方在 06-08 票接入。
+    #[allow(dead_code)]
+    pub outbound_domains: Arc<[OutboundDomainSnapshot]>,
 }
 
 #[derive(Clone)]
@@ -154,6 +157,52 @@ pub struct IpSnapshot {
     pub bytes: u64,
 }
 
+/// 出站域名维度的快照项，对齐 ProcessSnapshot 的封装风格。
+///
+/// 字段语义对齐 spec：host / in_bytes / out_bytes / total_bytes / last_seen。
+/// `in_bytes` / `out_bytes` 为 pub（同 ProcessSnapshot::recv / sent）；
+/// `host` / `last_seen` 私有并通过 accessor 暴露（同进程维度的封装）。
+///
+/// 字段与 accessor 在 05 票中落地，消费方（TUI 概览/详情页、JSON/plain 输出）
+/// 在 06-08 票接入；在此之前通过 `#[allow(dead_code)]` 抑制未使用告警。
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct OutboundDomainSnapshot {
+    host: Arc<str>,
+    pub in_bytes: u64,
+    pub out_bytes: u64,
+    last_seen: DateTime<Utc>,
+}
+
+#[allow(dead_code)]
+impl OutboundDomainSnapshot {
+    pub(crate) fn new(
+        host: Arc<str>,
+        in_bytes: u64,
+        out_bytes: u64,
+        last_seen: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            host,
+            in_bytes,
+            out_bytes,
+            last_seen,
+        }
+    }
+
+    pub(crate) fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub(crate) fn last_seen(&self) -> DateTime<Utc> {
+        self.last_seen
+    }
+
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.in_bytes.saturating_add(self.out_bytes)
+    }
+}
+
 /// Cumulative stats since start.
 #[derive(Default)]
 pub struct Stats {
@@ -168,6 +217,17 @@ pub struct Stats {
     unattributed: ProcTraffic,
     unattributed_last_seen: Option<DateTime<Utc>>,
     proc_names: HashMap<ProcessKey, Arc<str>>,
+    by_domain: HashMap<Arc<str>, DomainTraffic>,
+    domain_last_seen: HashMap<Arc<str>, DateTime<Utc>>,
+}
+
+/// 按域名累计的双向字节计数，对齐 ProcTraffic 的 recv/sent 拆分。
+#[derive(Default, Clone, Copy)]
+struct DomainTraffic {
+    /// Recv (inbound) bytes —— 对端回包累计到此。
+    recv: u64,
+    /// Sent (outbound) bytes —— 本机发出包累计到此。
+    sent: u64,
 }
 
 impl Stats {
@@ -227,6 +287,12 @@ impl Stats {
         observed_at: DateTime<Utc>,
     ) {
         self.record_interface_flow(&flow);
+        self.record_outbound_domain(
+            flow.domain.as_ref(),
+            flow.direction,
+            flow.bytes,
+            observed_at,
+        );
         if flow.peer_local_socket.is_some() {
             self.record_process(process, Direction::Outbound, flow.bytes, observed_at);
             self.record_process(peer_process, Direction::Inbound, flow.bytes, observed_at);
@@ -262,6 +328,29 @@ impl Stats {
         observed_at: DateTime<Utc>,
     ) {
         self.add_process_or_unattributed(process, direction, bytes, observed_at);
+    }
+
+    /// 按 spec Q8 / Q10：已识别连接（domain=Some）的双向流量按方向累计到该域名，
+    /// 并更新该域名的 last_seen；未识别（domain=None）不进维度。
+    ///
+    /// Last seen 规则与进程维度一致：只在 record_*_domain 被实际调用时更新，
+    /// snapshot() 仅读取不更新。
+    pub(crate) fn record_outbound_domain(
+        &mut self,
+        domain: Option<&Arc<str>>,
+        direction: Direction,
+        bytes: u64,
+        observed_at: DateTime<Utc>,
+    ) {
+        let Some(host) = domain else {
+            return;
+        };
+        let entry = self.by_domain.entry(host.clone()).or_default();
+        match direction {
+            Direction::Inbound => entry.recv += bytes,
+            Direction::Outbound => entry.sent += bytes,
+        }
+        self.domain_last_seen.insert(host.clone(), observed_at);
     }
 
     fn add_process_or_unattributed(
@@ -323,6 +412,15 @@ impl Stats {
             .map(|(ip, bytes)| IpSnapshot { ip, bytes })
             .collect::<Vec<_>>()
             .into();
+        let outbound_domains = self
+            .top_domains(top_n)
+            .into_iter()
+            .map(|(host, traffic)| {
+                let last_seen = self.domain_last_seen[&host];
+                OutboundDomainSnapshot::new(host, traffic.recv, traffic.sent, last_seen)
+            })
+            .collect::<Vec<_>>()
+            .into();
 
         TrafficSnapshot {
             in_bytes: self.in_bytes,
@@ -331,6 +429,7 @@ impl Stats {
             processes: processes.into(),
             inbound_ips,
             outbound_ips,
+            outbound_domains,
         }
     }
 
@@ -347,6 +446,17 @@ impl Stats {
             .by_proc
             .iter()
             .map(|(key, traffic)| (key.clone(), *traffic))
+            .collect();
+        entries.sort_unstable_by_key(|(_, t)| std::cmp::Reverse(t.recv + t.sent));
+        entries.truncate(n);
+        entries
+    }
+
+    fn top_domains(&self, n: usize) -> Vec<(Arc<str>, DomainTraffic)> {
+        let mut entries: Vec<(Arc<str>, DomainTraffic)> = self
+            .by_domain
+            .iter()
+            .map(|(host, traffic)| (host.clone(), *traffic))
             .collect();
         entries.sort_unstable_by_key(|(_, t)| std::cmp::Reverse(t.recv + t.sent));
         entries.truncate(n);
@@ -628,6 +738,170 @@ mod tests {
         ));
     }
 
+    // ── 出站域名维度（05 票） ──────────────────────────────────────────
+
+    #[test]
+    fn domain_flow_aggregates_bidirectionally() {
+        let mut stats = Stats::default();
+        let host: Arc<str> = Arc::from("example.com");
+        let observed_at: DateTime<Utc> = "2026-07-15T08:00:00Z".parse().unwrap();
+
+        stats.record_flow_at(
+            flow_with_domain(
+                Direction::Outbound,
+                [203, 0, 113, 9],
+                100,
+                Some(host.clone()),
+            ),
+            None,
+            observed_at,
+        );
+        stats.record_flow_at(
+            flow_with_domain(
+                Direction::Inbound,
+                [203, 0, 113, 9],
+                240,
+                Some(host.clone()),
+            ),
+            None,
+            observed_at,
+        );
+
+        let snapshot = stats.snapshot(10);
+        assert_eq!(snapshot.outbound_domains.len(), 1);
+        let domain = &snapshot.outbound_domains[0];
+        assert_eq!(domain.host(), "example.com");
+        assert_eq!(domain.in_bytes, 240);
+        assert_eq!(domain.out_bytes, 100);
+        assert_eq!(domain.total_bytes(), 340);
+    }
+
+    #[test]
+    fn outbound_domain_snapshots_are_ranked_by_total_bytes() {
+        let mut stats = Stats::default();
+        let a: Arc<str> = Arc::from("a.example");
+        let b: Arc<str> = Arc::from("b.example");
+        let c: Arc<str> = Arc::from("c.example");
+
+        stats.record_flow(
+            flow_with_domain(Direction::Outbound, [203, 0, 113, 1], 100, Some(a.clone())),
+            None,
+        );
+        stats.record_flow(
+            flow_with_domain(Direction::Inbound, [203, 0, 113, 2], 50, Some(b.clone())),
+            None,
+        );
+        stats.record_flow(
+            flow_with_domain(Direction::Outbound, [203, 0, 113, 3], 200, Some(c.clone())),
+            None,
+        );
+
+        let snapshot = stats.snapshot(2);
+        assert_eq!(snapshot.outbound_domains.len(), 2);
+        assert_eq!(snapshot.outbound_domains[0].host(), "c.example");
+        assert_eq!(snapshot.outbound_domains[0].total_bytes(), 200);
+        assert_eq!(snapshot.outbound_domains[1].host(), "a.example");
+        assert_eq!(snapshot.outbound_domains[1].total_bytes(), 100);
+        assert!(
+            !snapshot
+                .outbound_domains
+                .iter()
+                .any(|domain| domain.host() == "b.example")
+        );
+    }
+
+    #[test]
+    fn unidentified_flows_do_not_enter_domain_dimension() {
+        let mut stats = Stats::default();
+
+        stats.record_flow(flow(Direction::Outbound, [203, 0, 113, 9], 100), None);
+        stats.record_flow(flow(Direction::Inbound, [203, 0, 113, 9], 50), None);
+
+        let snapshot = stats.snapshot(10);
+        assert!(snapshot.outbound_domains.is_empty());
+        // 未识别流量仍然进入接口与 IP 维度，守恒边界不变。
+        assert_eq!(snapshot.in_bytes, 50);
+        assert_eq!(snapshot.out_bytes, 100);
+    }
+
+    #[test]
+    fn domain_last_seen_advances_only_when_flow_is_recorded() {
+        let mut stats = Stats::default();
+        let host: Arc<str> = Arc::from("example.com");
+        let first: DateTime<Utc> = "2026-07-15T08:00:00Z".parse().unwrap();
+        let second: DateTime<Utc> = "2026-07-15T08:01:30Z".parse().unwrap();
+
+        stats.record_flow_at(
+            flow_with_domain(
+                Direction::Outbound,
+                [203, 0, 113, 9],
+                40,
+                Some(host.clone()),
+            ),
+            None,
+            first,
+        );
+        assert_eq!(stats.snapshot(10).outbound_domains[0].last_seen(), first);
+
+        // snapshot() 不更新 last_seen（与进程维度规则一致）。
+        let unchanged = stats.snapshot(10);
+        assert_eq!(unchanged.outbound_domains[0].last_seen(), first);
+
+        stats.record_flow_at(
+            flow_with_domain(Direction::Inbound, [203, 0, 113, 9], 60, Some(host.clone())),
+            None,
+            second,
+        );
+        let updated = stats.snapshot(10);
+        assert_eq!(updated.outbound_domains[0].last_seen(), second);
+        assert_eq!(
+            (
+                updated.outbound_domains[0].in_bytes,
+                updated.outbound_domains[0].out_bytes,
+            ),
+            (60, 40)
+        );
+    }
+
+    #[test]
+    fn domain_dimension_does_not_conserve_with_interface_totals() {
+        let mut stats = Stats::default();
+        let host: Arc<str> = Arc::from("example.com");
+
+        // 已识别流量（进出站域名维度）：100 + 50 = 150。
+        stats.record_flow(
+            flow_with_domain(
+                Direction::Outbound,
+                [203, 0, 113, 9],
+                100,
+                Some(host.clone()),
+            ),
+            None,
+        );
+        stats.record_flow(
+            flow_with_domain(Direction::Inbound, [203, 0, 113, 9], 50, Some(host.clone())),
+            None,
+        );
+        // 未识别流量（不进域名维度）：80 + 30 = 110。
+        stats.record_flow(flow(Direction::Outbound, [198, 51, 100, 5], 80), None);
+        stats.record_flow(flow(Direction::Inbound, [198, 51, 100, 5], 30), None);
+
+        let snapshot = stats.snapshot(10);
+        let domain_total: u64 = snapshot
+            .outbound_domains
+            .iter()
+            .map(|domain| domain.total_bytes())
+            .sum();
+
+        // 接口总量 = 100 + 50 + 80 + 30 = 260。
+        assert_eq!(snapshot.in_bytes, 80);
+        assert_eq!(snapshot.out_bytes, 180);
+        assert_eq!(snapshot.in_bytes + snapshot.out_bytes, 260);
+        // 域名总量 = 150，是接口总量的子集（明确不与接口总量守恒）。
+        assert_eq!(domain_total, 150);
+        assert!(domain_total < snapshot.in_bytes + snapshot.out_bytes);
+    }
+
     fn flow(direction: Direction, peer: [u8; 4], bytes: u64) -> Flow {
         Flow {
             direction,
@@ -637,6 +911,23 @@ mod tests {
             local_socket: None,
             peer_local_socket: None,
             domain: None,
+        }
+    }
+
+    fn flow_with_domain(
+        direction: Direction,
+        peer: [u8; 4],
+        bytes: u64,
+        domain: Option<Arc<str>>,
+    ) -> Flow {
+        Flow {
+            direction,
+            peer: ip(peer),
+            peer_port: None,
+            bytes,
+            local_socket: None,
+            peer_local_socket: None,
+            domain,
         }
     }
 

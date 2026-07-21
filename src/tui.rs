@@ -2535,6 +2535,7 @@ mod tests {
             }]
             .into(),
             process_data_fresh: false,
+            ..TrafficSnapshot::default()
         };
         let mut state = AppState::new();
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
