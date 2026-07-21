@@ -1594,6 +1594,31 @@ fn draw_ip_table(
     f.render_stateful_widget(table, area, &mut ratatui_state(entries.len(), selected));
 }
 
+/// Overview preview of top outbound domains. Mirrors `draw_ip_preview` and
+/// `draw_process_preview`: panel prefix `dom`, title `Top Domains`, rows
+/// clipped by height, `preview_position` footer. Wired into the Overview row
+/// layout in ticket 07; kept unused here so the helper can land independently.
+#[allow(dead_code)]
+fn draw_domain_preview(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    snapshot: &TrafficSnapshot,
+    mode: LayoutMode,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let footer = preview_position(snapshot.outbound_domains.len(), area.height);
+    let block = panel_block(
+        "dom",
+        "Top Domains",
+        Some(snapshot.outbound_domains.len()),
+        COLOR_VIOLET,
+        COLOR_VIOLET_BORDER,
+        Some(footer),
+    );
+    let table = domain_table(snapshot, mode, block, now);
+    f.render_widget(table, area);
+}
+
 fn draw_domains(
     f: &mut ratatui::Frame,
     area: Rect,
