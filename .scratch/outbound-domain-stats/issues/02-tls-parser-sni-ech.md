@@ -4,13 +4,13 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Cargo.toml 加 `tls-parser 0.12`
-- [ ] 识别 TLS 记录 ContentType=Handshake(22) + ClientHello(0x01)
-- [ ] 提取 SNI（parse_tls_extension_sni）
-- [ ] 检测 ECH extension，存在时返回 None（加密，走 NoDomain）
-- [ ] 非 ClientHello / ApplicationData / 无 SNI / 解析错误返回 None
-- [ ] 测试：含 SNI 的 ClientHello、无 SNI、含 ECH、ApplicationData、残缺字节
+- [x] Cargo.toml 加 `tls-parser 0.12`
+- [x] 识别 TLS 记录 ContentType=Handshake(22) + ClientHello(0x01)
+- [x] 提取 SNI（parse_tls_extension_sni）
+- [x] 检测 ECH extension，存在时返回 None（加密，走 NoDomain）
+- [x] 非 ClientHello / ApplicationData / 无 SNI / 解析错误返回 None
+- [x] 测试：含 SNI 的 ClientHello、无 SNI、含 ECH、ApplicationData、残缺字节
 
 ## Comments
