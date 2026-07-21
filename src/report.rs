@@ -112,6 +112,19 @@ fn plain_snapshot(
         ));
     }
 
+    out.push_str(&format!("\nTop Hosts ({top_n})\n"));
+    out.push_str("Host\tIn\tOut\tTotal\tLast Seen\n");
+    for domain in snapshot.outbound_domains.iter() {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            domain.host(),
+            human_bytes(domain.in_bytes),
+            human_bytes(domain.out_bytes),
+            human_bytes(domain.total_bytes()),
+            domain.last_seen().to_rfc3339(),
+        ));
+    }
+
     out.push_str(&format!("\nTop Inbound IPs ({top_n})\n"));
     out.push_str("IP\tBytes\n");
     for entry in snapshot.inbound_ips.iter() {
@@ -138,6 +151,7 @@ struct JsonFrame<'a> {
     uptime_secs: u64,
     totals: JsonTotals,
     top_processes: Vec<JsonProc>,
+    top_hosts: Vec<JsonHost>,
     top_inbound_ips: Vec<JsonIp>,
     top_outbound_ips: Vec<JsonIp>,
 }
@@ -163,6 +177,15 @@ struct JsonProc {
 struct JsonIp {
     ip: String,
     bytes: u64,
+}
+
+#[derive(Serialize)]
+struct JsonHost {
+    host: String,
+    in_bytes: u64,
+    out_bytes: u64,
+    total_bytes: u64,
+    last_seen: String,
 }
 
 fn build_json_frame<'a>(
@@ -208,6 +231,18 @@ fn build_json_frame<'a>(
         })
         .collect();
 
+    let top_hosts = snapshot
+        .outbound_domains
+        .iter()
+        .map(|domain| JsonHost {
+            host: domain.host().to_string(),
+            in_bytes: domain.in_bytes,
+            out_bytes: domain.out_bytes,
+            total_bytes: domain.total_bytes(),
+            last_seen: domain.last_seen().to_rfc3339(),
+        })
+        .collect();
+
     JsonFrame {
         interface,
         host: host.clone(),
@@ -219,6 +254,7 @@ fn build_json_frame<'a>(
             out_bytes: snapshot.out_bytes,
         },
         top_processes,
+        top_hosts,
         top_inbound_ips,
         top_outbound_ips,
     }
@@ -371,5 +407,92 @@ mod tests {
             peer_local_socket: None,
             domain: None,
         }
+    }
+
+    fn flow_with_domain(direction: Direction, bytes: u64, domain: Option<Arc<str>>) -> Flow {
+        Flow {
+            direction,
+            peer: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            peer_port: None,
+            bytes,
+            local_socket: None,
+            peer_local_socket: None,
+            domain,
+        }
+    }
+
+    #[test]
+    fn plain_snapshot_renders_top_hosts_section() {
+        let mut stats = Stats::default();
+        let host: Arc<str> = Arc::from("example.com");
+        let observed_at = "2026-07-15T08:00:00Z".parse().unwrap();
+        stats.record_flow_at(
+            flow_with_domain(Direction::Outbound, 100, Some(host.clone())),
+            None,
+            observed_at,
+        );
+        stats.record_flow_at(
+            flow_with_domain(Direction::Inbound, 240, Some(host)),
+            None,
+            observed_at,
+        );
+
+        let rendered = plain_snapshot("eth0", &chrono::Local::now(), Instant::now(), &stats, 10);
+
+        assert!(rendered.contains("Top Hosts (10)\n"));
+        assert!(rendered.contains("Host\tIn\tOut\tTotal\tLast Seen\n"));
+        assert!(rendered.contains("example.com\t240 B\t100 B\t340 B\t2026-07-15T08:00:00+00:00\n"));
+    }
+
+    #[test]
+    fn plain_snapshot_renders_empty_top_hosts_section() {
+        let stats = Stats::default();
+        let rendered = plain_snapshot("eth0", &chrono::Local::now(), Instant::now(), &stats, 10);
+
+        // Section header and column row still appear when no domains observed.
+        assert!(rendered.contains("Top Hosts (10)\n"));
+        assert!(rendered.contains("Host\tIn\tOut\tTotal\tLast Seen\n"));
+        // No domain data rows.
+        assert!(!rendered.contains("example.com"));
+    }
+
+    #[test]
+    fn json_snapshot_renders_top_hosts_array() {
+        let mut stats = Stats::default();
+        let host: Arc<str> = Arc::from("example.com");
+        let observed_at = "2026-07-15T08:00:00Z".parse().unwrap();
+        stats.record_flow_at(
+            flow_with_domain(Direction::Outbound, 100, Some(host.clone())),
+            None,
+            observed_at,
+        );
+        stats.record_flow_at(
+            flow_with_domain(Direction::Inbound, 240, Some(host)),
+            None,
+            observed_at,
+        );
+
+        let frame = build_json_frame("eth0", &chrono::Local::now(), Instant::now(), &stats, 10);
+        let value = serde_json::to_value(frame).unwrap();
+
+        let top_hosts = value["top_hosts"].as_array().unwrap();
+        assert_eq!(top_hosts.len(), 1);
+        let entry = &top_hosts[0];
+        assert_eq!(entry["host"], "example.com");
+        assert_eq!(entry["in_bytes"], 240);
+        assert_eq!(entry["out_bytes"], 100);
+        assert_eq!(entry["total_bytes"], 340);
+        // RFC 3339 (matches process/IP dimension's last_seen format).
+        assert_eq!(entry["last_seen"], "2026-07-15T08:00:00+00:00");
+    }
+
+    #[test]
+    fn json_snapshot_renders_empty_top_hosts_array() {
+        let stats = Stats::default();
+        let frame = build_json_frame("eth0", &chrono::Local::now(), Instant::now(), &stats, 10);
+        let value = serde_json::to_value(frame).unwrap();
+
+        assert!(value["top_hosts"].is_array());
+        assert!(value["top_hosts"].as_array().unwrap().is_empty());
     }
 }
