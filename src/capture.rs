@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow};
 use etherparse::{EtherType, NetHeaders, PacketHeaders, TransportHeader};
 use pcap::{Capture, Device};
 
+use crate::domain_parse::{DomainParser, NoopDomainParser};
 use crate::stats::Direction;
 
 /// 指定网卡的抓包源。
@@ -17,6 +18,7 @@ pub struct CaptureSource {
     interface_name: String,
     link_type: pcap::Linktype,
     local_ips: HashSet<IpAddr>,
+    domain_parser: Box<dyn DomainParser>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,11 +76,6 @@ pub struct Flow {
     /// 第二个本机 socket，仅当源和目标都属于本机时存在。
     pub peer_local_socket: Option<LocalSocket>,
     /// 出站连接解析出的目标域名；入站或未识别时为 `None`。
-    ///
-    /// 由 capture 层 L7 域名解析 seam 写入；聚合层负责按域名累计流量（05 票）。
-    /// 字段加入在先、读取在后：在被 seam 写入之前，lib 构建只构造不读取，
-    /// 故临时挂 `#[allow(dead_code)]`；seam 落地后写入路径建立，lint 自然消除。
-    #[allow(dead_code)]
     pub domain: Option<Arc<str>>,
 }
 
@@ -196,6 +193,16 @@ fn collect_local_ips(devices: &[Device]) -> HashSet<IpAddr> {
 impl CaptureSource {
     /// 按网卡名打开实时抓包。
     pub fn open(selector: &str) -> Result<Self> {
+        Self::open_with_domain_parser(selector, Box::new(NoopDomainParser))
+    }
+
+    /// 与 [`open`](Self::open) 相同，但允许注入自定义的 L7 域名解析器。
+    ///
+    /// 02/03 票提供 TLS/HTTP 解析器实现；本票调用方使用 [`NoopDomainParser`]。
+    pub fn open_with_domain_parser(
+        selector: &str,
+        domain_parser: Box<dyn DomainParser>,
+    ) -> Result<Self> {
         let devices = Device::list()?;
         let local_ips = collect_local_ips(&devices);
         let device = select_device(selector, devices)?;
@@ -219,6 +226,7 @@ impl CaptureSource {
             interface_name,
             link_type,
             local_ips,
+            domain_parser,
         })
     }
 
@@ -233,7 +241,12 @@ impl CaptureSource {
     /// 读取下一个包；无包（读超时）返回 Ok(None)。
     pub fn next(&mut self) -> Result<Option<Flow>> {
         match self.cap.next_packet() {
-            Ok(packet) => parse(self.link_type, packet.data, &self.local_ips),
+            Ok(packet) => parse_with_domain_parser(
+                self.link_type,
+                packet.data,
+                &self.local_ips,
+                self.domain_parser.as_ref(),
+            ),
             Err(pcap::Error::TimeoutExpired) => Ok(None),
             Err(e) => Err(anyhow::Error::from(e)),
         }
@@ -241,11 +254,28 @@ impl CaptureSource {
 }
 
 /// 解析数据链路帧为单向流量记录；非 IP 或与本机无关返回 None。
+///
+/// 仅在测试中使用：production 路径走 [`parse_with_domain_parser`]，
+/// 老 test 调用此 pure-parsing 入口验证链路层/IP/TCP 解析本身。
+#[cfg(test)]
 fn parse(
     link_type: pcap::Linktype,
     data: &[u8],
     local_ips: &HashSet<IpAddr>,
 ) -> Result<Option<Flow>> {
+    Ok(parse_with_payload(link_type, data, local_ips)?.map(|(flow, _)| flow))
+}
+
+/// 与 [`parse`] 相同，并额外返回 TCP payload（仅当本包为 TCP 且 payload 非空）。
+///
+/// payload 借用自 `data`，调用方须在 `data` 生命周期内使用。
+/// L7 域名解析 seam 在此 payload 上调用 [`DomainParser`]；payload 不进入 Flow。
+#[allow(clippy::type_complexity)]
+fn parse_with_payload<'a>(
+    link_type: pcap::Linktype,
+    data: &'a [u8],
+    local_ips: &HashSet<IpAddr>,
+) -> Result<Option<(Flow, Option<&'a [u8]>)>> {
     let format = packet_format(link_type)?;
     let (headers, link_len, sll_packet_type) = match format {
         PacketFormat::Ethernet => (PacketHeaders::from_ethernet_slice(data).ok(), 14, None),
@@ -312,6 +342,7 @@ fn parse(
         return Ok(None);
     };
 
+    let is_tcp = matches!(headers.transport, Some(TransportHeader::Tcp(_)));
     let (local_socket, peer_local_socket, peer_port) = match &headers.transport {
         Some(TransportHeader::Tcp(tcp)) => {
             let port = if direction == Direction::Outbound {
@@ -362,15 +393,53 @@ fn parse(
         _ => (None, None, None),
     };
 
-    Ok(Some(Flow {
-        direction,
-        peer,
-        peer_port,
-        bytes,
-        local_socket,
-        peer_local_socket,
-        domain: None,
-    }))
+    let tcp_payload = if is_tcp {
+        let payload = headers.payload.slice();
+        (!payload.is_empty()).then_some(payload)
+    } else {
+        None
+    };
+
+    Ok(Some((
+        Flow {
+            direction,
+            peer,
+            peer_port,
+            bytes,
+            local_socket,
+            peer_local_socket,
+            domain: None,
+        },
+        tcp_payload,
+    )))
+}
+
+/// 在 [`parse`] 基础上调用 L7 域名解析 seam。
+///
+/// 仅当方向为出站、协议为 TCP、payload 非空时，调用 `parser`；
+/// 其它情况（入站、无 payload、UDP、非 TCP/UDP）跳过解析。
+///
+/// 流表查询与"首包解析一次"约束在 04 票接入；本票每次出站 TCP 有 payload
+/// 都会调用 `parser`（用桩而非真实流表）。
+pub(crate) fn parse_with_domain_parser(
+    link_type: pcap::Linktype,
+    data: &[u8],
+    local_ips: &HashSet<IpAddr>,
+    parser: &dyn DomainParser,
+) -> Result<Option<Flow>> {
+    let Some((mut flow, payload)) = parse_with_payload(link_type, data, local_ips)? else {
+        return Ok(None);
+    };
+    if flow.direction == Direction::Outbound
+        && let Some(payload) = payload
+    {
+        // TODO(04): 流表查询——若连接已 Resolved/NoDomain 则跳过解析；
+        // 首包未命中时调用 parser 并把结果写入流表。
+        if let Some(domain) = parser.parse_domain(payload) {
+            flow.domain = Some(domain);
+        }
+    }
+    Ok(Some(flow))
 }
 
 fn packet_format(link_type: pcap::Linktype) -> Result<PacketFormat> {
@@ -560,6 +629,134 @@ mod tests {
         .expect("outbound ICMP flow");
 
         assert!(icmp.domain.is_none());
+    }
+
+    #[test]
+    fn outbound_tcp_packet_with_payload_invokes_domain_parser() {
+        let parser = RecordingParser::new(Some(Arc::from("example.com")));
+        let local_ips = HashSet::from([IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]);
+        let packet = outbound_tcp_ethernet_frame(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+
+        let flow = parse_with_domain_parser(pcap::Linktype::ETHERNET, &packet, &local_ips, &parser)
+            .expect("supported data link")
+            .expect("outbound TCP flow");
+
+        assert_eq!(flow.direction, Direction::Outbound);
+        assert_eq!(flow.domain.as_deref(), Some("example.com"));
+        assert_eq!(parser.call_count(), 1);
+    }
+
+    #[test]
+    fn inbound_tcp_packet_skips_domain_parser() {
+        let parser = RecordingParser::new(Some(Arc::from("example.com")));
+        let local_ips = HashSet::from([IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]);
+        let packet = inbound_tcp_ethernet_frame(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+
+        let flow = parse_with_domain_parser(pcap::Linktype::ETHERNET, &packet, &local_ips, &parser)
+            .expect("supported data link")
+            .expect("inbound TCP flow");
+
+        assert_eq!(flow.direction, Direction::Inbound);
+        assert!(flow.domain.is_none());
+        assert_eq!(parser.call_count(), 0);
+    }
+
+    #[test]
+    fn outbound_tcp_packet_without_payload_skips_domain_parser() {
+        let parser = RecordingParser::new(Some(Arc::from("example.com")));
+        let local_ips = HashSet::from([IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]);
+        let packet = outbound_tcp_ethernet_frame(&[]);
+
+        let flow = parse_with_domain_parser(pcap::Linktype::ETHERNET, &packet, &local_ips, &parser)
+            .expect("supported data link")
+            .expect("outbound TCP flow");
+
+        assert_eq!(flow.direction, Direction::Outbound);
+        assert!(flow.domain.is_none());
+        assert_eq!(parser.call_count(), 0);
+    }
+
+    #[test]
+    fn outbound_udp_packet_skips_domain_parser() {
+        let parser = RecordingParser::new(Some(Arc::from("example.com")));
+        let local_ips = HashSet::from([IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]);
+        let (ip_packet, _) = fixed_ip_packet(IpVersion::V4, TransportProtocol::Udp);
+        let packet = add_link_header(pcap::Linktype::ETHERNET, IpVersion::V4, ip_packet);
+
+        let flow = parse_with_domain_parser(pcap::Linktype::ETHERNET, &packet, &local_ips, &parser)
+            .expect("supported data link")
+            .expect("outbound UDP flow");
+
+        assert_eq!(flow.direction, Direction::Outbound);
+        assert!(flow.domain.is_none());
+        assert_eq!(parser.call_count(), 0);
+    }
+
+    #[test]
+    fn outbound_tcp_payload_with_parser_returning_none_leaves_domain_unset() {
+        let parser = RecordingParser::new(None);
+        let local_ips = HashSet::from([IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]);
+        let packet = outbound_tcp_ethernet_frame(b"\x16\x03\x01\x00\x00");
+
+        let flow = parse_with_domain_parser(pcap::Linktype::ETHERNET, &packet, &local_ips, &parser)
+            .expect("supported data link")
+            .expect("outbound TCP flow");
+
+        assert!(flow.domain.is_none());
+        assert_eq!(parser.call_count(), 1);
+    }
+
+    /// 测试桩：记录调用次数并可配置返回结果。
+    ///
+    /// 该桩用于在 capture 层 seam 测试中验证调用时机与 payload 透传；
+    /// 真实 TLS/HTTP 解析在 02/03 票实现。
+    struct RecordingParser {
+        calls: std::sync::Mutex<usize>,
+        result: Option<Arc<str>>,
+    }
+
+    impl RecordingParser {
+        fn new(result: Option<Arc<str>>) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(0),
+                result,
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            *self.calls.lock().expect("parser call counter not poisoned")
+        }
+    }
+
+    impl crate::domain_parse::DomainParser for RecordingParser {
+        fn parse_domain(&self, _tcp_payload: &[u8]) -> Option<Arc<str>> {
+            *self.calls.lock().expect("parser call counter not poisoned") += 1;
+            self.result.clone()
+        }
+    }
+
+    fn outbound_tcp_ethernet_frame(payload: &[u8]) -> Vec<u8> {
+        tcp_ethernet_frame(Direction::Outbound, payload)
+    }
+
+    fn inbound_tcp_ethernet_frame(payload: &[u8]) -> Vec<u8> {
+        tcp_ethernet_frame(Direction::Inbound, payload)
+    }
+
+    fn tcp_ethernet_frame(direction: Direction, payload: &[u8]) -> Vec<u8> {
+        let mut transport = fixed_transport(TransportProtocol::Tcp, direction);
+        transport.extend_from_slice(payload);
+        let local = [192, 0, 2, 10];
+        let remote = [198, 51, 100, 5];
+        let (source, destination) = endpoints(direction, local, remote);
+        let ip_packet = ipv4_packet_between(
+            source,
+            destination,
+            ip_protocol(TransportProtocol::Tcp),
+            (20 + transport.len()) as u16,
+            &transport,
+        );
+        add_link_header(pcap::Linktype::ETHERNET, IpVersion::V4, ip_packet)
     }
 
     #[test]

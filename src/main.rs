@@ -1,5 +1,6 @@
 mod attribution;
 mod capture;
+mod domain_parse;
 mod pipeline;
 mod proc_table;
 mod report;
