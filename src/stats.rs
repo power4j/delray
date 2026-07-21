@@ -42,8 +42,7 @@ pub struct TrafficSnapshot {
     pub processes: Arc<[ProcessSnapshot]>,
     pub inbound_ips: Arc<[IpSnapshot]>,
     pub outbound_ips: Arc<[IpSnapshot]>,
-    /// 出站域名维度（05 票）；消费方在 06-08 票接入。
-    #[allow(dead_code)]
+    /// 出站域名维度（05 票）；消费方：TUI 概览/详情页（06-07）、report plain/JSON 输出（08）。
     pub outbound_domains: Arc<[OutboundDomainSnapshot]>,
 }
 
@@ -163,10 +162,9 @@ pub struct IpSnapshot {
 /// `in_bytes` / `out_bytes` 为 pub（同 ProcessSnapshot::recv / sent）；
 /// `host` / `last_seen` 私有并通过 accessor 暴露（同进程维度的封装）。
 ///
-/// 字段与 accessor 在 05 票中落地，消费方（TUI 概览/详情页、JSON/plain 输出）
-/// 在 06-08 票接入；在此之前通过 `#[allow(dead_code)]` 抑制未使用告警。
+/// 字段与 accessor 在 05 票中落地；消费方：TUI 概览/详情页（06-07）、
+/// report plain/JSON 输出（08）。
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct OutboundDomainSnapshot {
     host: Arc<str>,
     pub in_bytes: u64,
@@ -174,7 +172,6 @@ pub struct OutboundDomainSnapshot {
     last_seen: DateTime<Utc>,
 }
 
-#[allow(dead_code)]
 impl OutboundDomainSnapshot {
     pub(crate) fn new(
         host: Arc<str>,
