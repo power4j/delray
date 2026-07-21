@@ -1568,6 +1568,7 @@ fn draw_ip_table(
 
 fn draw_about(f: &mut ratatui::Frame, area: Rect) {
     let version = env!("CARGO_PKG_VERSION");
+    let commit = env!("DELRAY_BUILD_COMMIT");
     let frame_width = area.width.saturating_sub(4).min(62);
     let horizontal = Layout::default()
         .direction(LayoutDir::Horizontal)
@@ -1605,7 +1606,7 @@ fn draw_about(f: &mut ratatui::Frame, area: Rect) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            format!("Version {version}"),
+            format!("Version {version} ({commit})"),
             Style::default().fg(COLOR_MUTED),
         )),
     ];
@@ -2396,6 +2397,7 @@ mod tests {
         let rendered = lines.join("\n");
         assert!(rendered.contains("Network Traffic Analyzer"));
         assert!(rendered.contains("Version"));
+        assert!(rendered.contains(env!("DELRAY_BUILD_COMMIT")));
         assert!(!rendered.contains("private-interface"));
         assert!(!rendered.contains("private-host"));
     }
