@@ -369,6 +369,7 @@ mod tests {
             bytes,
             local_socket: None,
             peer_local_socket: None,
+            domain: None,
         }
     }
 }

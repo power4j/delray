@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use etherparse::{EtherType, NetHeaders, PacketHeaders, TransportHeader};
@@ -72,6 +73,13 @@ pub struct Flow {
     pub local_socket: Option<LocalSocket>,
     /// 第二个本机 socket，仅当源和目标都属于本机时存在。
     pub peer_local_socket: Option<LocalSocket>,
+    /// 出站连接解析出的目标域名；入站或未识别时为 `None`。
+    ///
+    /// 由 capture 层 L7 域名解析 seam 写入；聚合层负责按域名累计流量（05 票）。
+    /// 字段加入在先、读取在后：在被 seam 写入之前，lib 构建只构造不读取，
+    /// 故临时挂 `#[allow(dead_code)]`；seam 落地后写入路径建立，lint 自然消除。
+    #[allow(dead_code)]
+    pub domain: Option<Arc<str>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -361,6 +369,7 @@ fn parse(
         bytes,
         local_socket,
         peer_local_socket,
+        domain: None,
     }))
 }
 
@@ -520,6 +529,37 @@ mod tests {
         .expect("outbound ICMP flow");
 
         assert!(icmp.local_socket.is_none());
+    }
+
+    #[test]
+    fn flow_carries_optional_domain_field() {
+        let flow = Flow {
+            direction: Direction::Outbound,
+            peer: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            peer_port: None,
+            bytes: 0,
+            local_socket: None,
+            peer_local_socket: None,
+            domain: Some(Arc::from("example.com")),
+        };
+
+        assert_eq!(flow.domain.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn parsed_flow_defaults_to_no_domain() {
+        let local_ip = Ipv4Addr::new(192, 0, 2, 10);
+        let local_ips = HashSet::from([IpAddr::V4(local_ip)]);
+
+        let icmp = parse(
+            pcap::Linktype::ETHERNET,
+            &ipv4_frame(1, 28, &[8, 0, 0, 0, 0, 0, 0, 0]),
+            &local_ips,
+        )
+        .expect("supported data link")
+        .expect("outbound ICMP flow");
+
+        assert!(icmp.domain.is_none());
     }
 
     #[test]

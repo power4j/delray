@@ -302,6 +302,7 @@ mod tests {
                 protocol: TransportProtocol::Tcp,
             }),
             peer_local_socket: None,
+            domain: None,
         }
     }
 

@@ -367,6 +367,7 @@ mod scheduling_tests {
                     bytes: 64,
                     local_socket: None,
                     peer_local_socket: None,
+                    domain: None,
                 }))
             },
             &proc_table,
