@@ -1739,4 +1739,244 @@ mod tests {
             dst_addr: None,
         }
     }
+
+    /// 出站域名解析路径的性能基准（09 票）。
+    ///
+    /// 默认 `#[ignore]` 不进 CI 回归；触发方式：
+    /// `cargo test --release perf_benches -- --ignored --nocapture`。
+    ///
+    /// 每个测试用 `std::time::Instant` 测吞吐并 `eprintln!` 输出，宽松下限
+    /// 用 `assert!` 守住——若架构退化（如 FlowKey hash 退化到 O(N) 查表）
+    /// 会被抓到；但偶发的机器/负载波动不会误报。
+    ///
+    /// 三个场景对应 spec 的性能预算：
+    /// - 每包热路径：FlowTable::lookup（moka W-TinyLFU O(1) 查表）；
+    /// - 每连接开销：首包 TLS ClientHello 解析（tls-parser）；
+    /// - 高并发连接：流表接近 65536 上限时的 lookup 行为。
+    mod perf_benches {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        use super::*;
+        use crate::domain_parse_composite::CompositeDomainParser;
+        use crate::flow_table::{FlowEntry, FlowKey, FlowTable};
+
+        /// 场景 1：每包热路径——单连接后续包命中 Resolved 流表项。
+        ///
+        /// 模拟"首包已解析、后续大量包走查表"的稳态。spec 性能预算：
+        /// moka lookup O(1)，远小于 pcap 抓包。
+        #[test]
+        #[ignore = "性能基准：cargo test --release perf_benches -- --ignored --nocapture"]
+        fn flow_table_lookup_per_packet_throughput() {
+            let table = FlowTable::new();
+            let local_ips = HashSet::from([IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]);
+            let parser = RecordingParser::new(Some(Arc::from("example.com")));
+            let packet =
+                outbound_tcp_ethernet_frame(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+
+            // 首包填表（一次解析）
+            parse_with_domain_parser(
+                pcap::Linktype::ETHERNET,
+                &packet,
+                &local_ips,
+                &parser,
+                Some(&table),
+            )
+            .expect("supported data link");
+            assert_eq!(parser.call_count(), 1, "首包应触发解析");
+
+            // 后续 N 包——应全部命中 Resolved，不再调 parser
+            const N: usize = 100_000;
+            let start = Instant::now();
+            for _ in 0..N {
+                let _ = parse_with_domain_parser(
+                    pcap::Linktype::ETHERNET,
+                    &packet,
+                    &local_ips,
+                    &parser,
+                    Some(&table),
+                )
+                .expect("supported data link");
+            }
+            let elapsed = start.elapsed();
+
+            assert_eq!(
+                parser.call_count(),
+                1,
+                "后续包应全部命中流表，不应再调 parser"
+            );
+
+            let ns_per_packet = elapsed.as_nanos() as f64 / N as f64;
+            let packets_per_sec = N as f64 / elapsed.as_secs_f64();
+            eprintln!(
+                "flow_table_lookup_per_packet: N={N} elapsed={elapsed:?} ns/packet={ns_per_packet:.1} packets/sec={packets_per_sec:.0}"
+            );
+
+            // 宽松下限：>100k packets/sec 表示查表 O(1)（含 L3/L4 parse + flow_key + moka get）。
+            // 1 CPU/1G 服务器目标：网卡突发 100k pps 也远超 delray 处理能力，
+            // delray 限速瓶颈是 pcap 抓包（系统调用）而非查表。
+            assert!(
+                packets_per_sec > 100_000.0,
+                "查表吞吐 {packets_per_sec:.0} packets/sec 应大于 100k（O(1) lookup）"
+            );
+        }
+
+        /// 场景 2：每连接首包解析开销。
+        ///
+        /// 模拟"每条新连接的首包都要走完整 TLS 解析"。spec 性能预算：
+        /// 每连接一次解析，开销远小于 pcap 抓包和进程表刷新。
+        #[test]
+        #[ignore = "性能基准：cargo test --release perf_benches -- --ignored --nocapture"]
+        fn first_packet_tls_parse_throughput() {
+            let parser = CompositeDomainParser::new();
+            let local_ips = HashSet::from([IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]);
+            // 用真实的 TLS ClientHello（含 SNI）payload，包在出站 TCP 帧里。
+            let packet = outbound_tcp_ethernet_frame(&tls_client_hello_with_sni(b"example.com"));
+
+            const N: usize = 10_000;
+            let start = Instant::now();
+            for _ in 0..N {
+                // 每次新建 FlowTable（= 不缓存），强制首包解析路径。
+                let table = FlowTable::new();
+                let flow = parse_with_domain_parser(
+                    pcap::Linktype::ETHERNET,
+                    &packet,
+                    &local_ips,
+                    &parser,
+                    Some(&table),
+                )
+                .expect("supported data link")
+                .expect("outbound TCP flow");
+                assert_eq!(flow.domain.as_deref(), Some("example.com"));
+            }
+            let elapsed = start.elapsed();
+
+            let ns_per_parse = elapsed.as_nanos() as f64 / N as f64;
+            let parses_per_sec = N as f64 / elapsed.as_secs_f64();
+            eprintln!(
+                "first_packet_tls_parse: N={N} elapsed={elapsed:?} ns/parse={ns_per_parse:.1} parses/sec={parses_per_sec:.0}"
+            );
+
+            // 宽松下限：>1k parses/sec 表示单次解析在毫秒级以下
+            // （1 CPU 也能跟上千新连接/秒，远超典型服务器的外连速率）。
+            assert!(
+                parses_per_sec > 1_000.0,
+                "首包解析吞吐 {parses_per_sec:.0} parses/sec 应大于 1k"
+            );
+        }
+
+        /// 场景 3：流表接近容量上限时的 lookup 性能。
+        ///
+        /// 模拟高并发连接（spec 边界 65536）。预填接近容量的条目，
+        /// 再测 hot key lookup 吞吐——验证 W-TinyLFU 在大表下仍 O(1)。
+        #[test]
+        #[ignore = "性能基准：cargo test --release perf_benches -- --ignored --nocapture"]
+        fn flow_table_near_capacity_lookup_throughput() {
+            const CAPACITY: u64 = 65_536;
+            // 预填条目数：moka 默认 window ratio 约下 1% 的 window + 99% probationary，
+            // 预填 60k 已能逼近真实工作集大小，又能在合理时间内完成。
+            const PRE_FILL: u64 = 60_000;
+            const LOOKUPS: usize = 100_000;
+
+            let table = FlowTable::with_capacity_and_tti(CAPACITY, Duration::from_secs(3600));
+            let domain: Arc<str> = Arc::from("example.com");
+
+            // 预填条目（不同 peer_ip + local_port 组合）
+            for i in 0..PRE_FILL {
+                let key = FlowKey {
+                    local_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                    local_port: 10_000 + ((i % 10_000) as u16),
+                    peer_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, (i % 256) as u8)),
+                    peer_port: 443,
+                };
+                table.insert_resolved(key, domain.clone());
+            }
+            table.run_pending_tasks();
+
+            // 构造一个已命中的 hot key 反复 lookup
+            let hot_key = FlowKey {
+                local_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                local_port: 10_000,
+                peer_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)),
+                peer_port: 443,
+            };
+            assert!(
+                matches!(table.lookup(&hot_key), Some(FlowEntry::Resolved(_))),
+                "hot_key 应在预填条目中"
+            );
+
+            let start = Instant::now();
+            for _ in 0..LOOKUPS {
+                let _ = table.lookup(&hot_key);
+            }
+            let elapsed = start.elapsed();
+
+            let ns_per_lookup = elapsed.as_nanos() as f64 / LOOKUPS as f64;
+            let lookups_per_sec = LOOKUPS as f64 / elapsed.as_secs_f64();
+            eprintln!(
+                "flow_table_near_capacity_lookup: capacity={CAPACITY} prefilled={PRE_FILL} lookups={LOOKUPS} elapsed={elapsed:?} ns/lookup={ns_per_lookup:.1} lookups/sec={lookups_per_sec:.0}"
+            );
+
+            // 宽松下限：>100k lookups/sec，与空表场景 1 基本一致（W-TinyLFU 仍 O(1) hash）。
+            assert!(
+                lookups_per_sec > 100_000.0,
+                "大表查表吞吐 {lookups_per_sec:.0} lookups/sec 应大于 100k"
+            );
+        }
+
+        // ── TLS ClientHello wire 构造（与 domain_parse_tls.rs fixture 类似） ──
+
+        fn tls_client_hello_with_sni(name: &[u8]) -> Vec<u8> {
+            let body = client_hello_body(name);
+            wrap_handshake_record(&body)
+        }
+
+        fn client_hello_body(sni_name: &[u8]) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(&[0x03, 0x03]); // version TLS 1.2
+            body.extend_from_slice(&[0u8; 32]); // random
+            body.push(0x00); // session_id length
+            body.extend_from_slice(&[0x00, 0x02, 0x00, 0x2F]); // cipher_suites
+            body.push(0x01); // compression_methods length
+            body.push(0x00); // null
+            // extensions: SNI
+            let sni = sni_extension(sni_name);
+            body.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+            body.extend_from_slice(&sni);
+            handshake_msg(0x01, &body)
+        }
+
+        fn sni_extension(name: &[u8]) -> Vec<u8> {
+            let list_len = 1 + 2 + name.len();
+            let ext_data_len = 2 + list_len;
+            let mut ext = Vec::new();
+            ext.extend_from_slice(&[0x00, 0x00]); // type: server_name
+            ext.extend_from_slice(&(ext_data_len as u16).to_be_bytes());
+            ext.extend_from_slice(&(list_len as u16).to_be_bytes());
+            ext.push(0x00); // host_name
+            ext.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            ext.extend_from_slice(name);
+            ext
+        }
+
+        fn handshake_msg(msg_type: u8, body: &[u8]) -> Vec<u8> {
+            let len = body.len() as u32;
+            let mut msg = Vec::with_capacity(4 + body.len());
+            msg.push(msg_type);
+            msg.push((len >> 16) as u8);
+            msg.push((len >> 8) as u8);
+            msg.push(len as u8);
+            msg.extend_from_slice(body);
+            msg
+        }
+
+        fn wrap_handshake_record(handshake_msg: &[u8]) -> Vec<u8> {
+            let mut record = Vec::with_capacity(5 + handshake_msg.len());
+            record.push(0x16); // ContentType: Handshake
+            record.extend_from_slice(&[0x03, 0x01]); // version TLS 1.0
+            record.extend_from_slice(&(handshake_msg.len() as u16).to_be_bytes());
+            record.extend_from_slice(handshake_msg);
+            record
+        }
+    }
 }
