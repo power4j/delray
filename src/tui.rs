@@ -32,18 +32,26 @@ enum Page {
     Overview,
     Processes,
     Ips,
+    Domains,
     About,
 }
 
 impl Page {
-    const ALL: [Page; 4] = [Page::Overview, Page::Processes, Page::Ips, Page::About];
+    const ALL: [Page; 5] = [
+        Page::Overview,
+        Page::Processes,
+        Page::Ips,
+        Page::Domains,
+        Page::About,
+    ];
 
     fn index(self) -> usize {
         match self {
             Page::Overview => 0,
             Page::Processes => 1,
             Page::Ips => 2,
-            Page::About => 3,
+            Page::Domains => 3,
+            Page::About => 4,
         }
     }
 }
@@ -143,10 +151,12 @@ struct AppState {
     ip_in_scroll: usize,
     ip_out_scroll: usize,
     ip_focus: IpFocus,
+    domain_scroll: usize,
     /// Monotonic view height, updated each draw for clamping scrolls.
     proc_view_height: usize,
     ip_in_view_height: usize,
     ip_out_view_height: usize,
+    domain_view_height: usize,
     interface_selector: Option<InterfaceSelector>,
 }
 
@@ -159,9 +169,11 @@ impl AppState {
             ip_in_scroll: 0,
             ip_out_scroll: 0,
             ip_focus: IpFocus::Inbound,
+            domain_scroll: 0,
             proc_view_height: 1,
             ip_in_view_height: 1,
             ip_out_view_height: 1,
+            domain_view_height: 1,
             interface_selector: None,
         }
     }
@@ -509,6 +521,10 @@ fn handle_key(state: &mut AppState, key: KeyEvent, snapshot: &TrafficSnapshot) -
             KeyOutcome::Changed
         }
         KeyCode::Char('4') => {
+            state.page = Page::Domains;
+            KeyOutcome::Changed
+        }
+        KeyCode::Char('5') => {
             state.page = Page::About;
             KeyOutcome::Changed
         }
@@ -577,6 +593,7 @@ impl AppState {
                 IpFocus::Inbound => self.ip_in_view_height,
                 IpFocus::Outbound => self.ip_out_view_height,
             },
+            Page::Domains => self.domain_view_height,
             _ => 1,
         }
     }
@@ -595,6 +612,9 @@ fn scroll(state: &mut AppState, delta: isize) {
                 state.ip_out_scroll = (state.ip_out_scroll as isize + delta).max(0) as usize;
             }
         },
+        Page::Domains => {
+            state.domain_scroll = (state.domain_scroll as isize + delta).max(0) as usize;
+        }
         _ => {}
     }
 }
@@ -606,6 +626,7 @@ fn scroll_to_top(state: &mut AppState) {
             IpFocus::Inbound => state.ip_in_scroll = 0,
             IpFocus::Outbound => state.ip_out_scroll = 0,
         },
+        Page::Domains => state.domain_scroll = 0,
         _ => {}
     }
 }
@@ -626,6 +647,10 @@ fn scroll_to_bottom(state: &mut AppState, snapshot: &TrafficSnapshot) {
                 state.ip_out_scroll = len.saturating_sub(state.ip_out_view_height);
             }
         },
+        Page::Domains => {
+            let len = snapshot.outbound_domains.len();
+            state.domain_scroll = len.saturating_sub(state.domain_view_height);
+        }
         _ => {}
     }
 }
@@ -745,6 +770,7 @@ fn draw_with_interfaces_at(
             None => draw_processes(f, body, state, snapshot, mode),
         },
         Page::Ips => draw_ips(f, body, state, snapshot, mode),
+        Page::Domains => draw_domains(f, body, state, snapshot, mode, now),
         Page::About => draw_about(f, body),
     }
     draw_status_bar(f, chunks[2], state, mode);
@@ -965,11 +991,13 @@ fn navigation_line(page: Page, mode: LayoutMode) -> Line<'static> {
             (Page::Overview, LayoutMode::Compact) => " 1 ".to_string(),
             (Page::Processes, LayoutMode::Compact) => " 2 ".to_string(),
             (Page::Ips, LayoutMode::Compact) => " 3 ".to_string(),
-            (Page::About, LayoutMode::Compact) => " 4 ".to_string(),
+            (Page::Domains, LayoutMode::Compact) => " 4 ".to_string(),
+            (Page::About, LayoutMode::Compact) => " 5 ".to_string(),
             (Page::Overview, _) => " 1 Overview ".to_string(),
             (Page::Processes, _) => " 2 Processes ".to_string(),
             (Page::Ips, _) => " 3 IPs ".to_string(),
-            (Page::About, _) => " 4 About ".to_string(),
+            (Page::Domains, _) => " 4 Domains ".to_string(),
+            (Page::About, _) => " 5 About ".to_string(),
         };
         let style = if candidate == page {
             Style::default()
@@ -1566,6 +1594,131 @@ fn draw_ip_table(
     f.render_stateful_widget(table, area, &mut ratatui_state(entries.len(), selected));
 }
 
+fn draw_domains(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    state: &mut AppState,
+    snapshot: &TrafficSnapshot,
+    mode: LayoutMode,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let view_h = area.height.saturating_sub(3) as usize;
+    state.domain_view_height = view_h.max(1);
+    state.domain_scroll = state
+        .domain_scroll
+        .min(snapshot.outbound_domains.len().saturating_sub(1));
+
+    let footer = selected_position(state.domain_scroll, snapshot.outbound_domains.len());
+    let block = panel_block(
+        "dom",
+        "Domains",
+        Some(snapshot.outbound_domains.len()),
+        COLOR_VIOLET,
+        COLOR_VIOLET_BORDER,
+        Some(footer),
+    );
+    let table = domain_table(snapshot, mode, block, now)
+        .row_highlight_style(
+            Style::default()
+                .bg(COLOR_SELECTION)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+    f.render_stateful_widget(
+        table,
+        area,
+        &mut ratatui_state(snapshot.outbound_domains.len(), state.domain_scroll),
+    );
+}
+
+fn domain_table(
+    snapshot: &TrafficSnapshot,
+    mode: LayoutMode,
+    block: Block<'static>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Table<'static> {
+    let compact = mode == LayoutMode::Compact;
+    let rows = domain_rows(snapshot, compact, now);
+    let header_style = Style::default().fg(COLOR_MUTED);
+    let table = if compact {
+        Table::new(
+            rows,
+            [
+                Constraint::Min(18),
+                Constraint::Length(12),
+                Constraint::Length(12),
+            ],
+        )
+        .header(Row::new(vec!["Host", "Total", "Last seen"]).style(header_style))
+    } else {
+        Table::new(
+            rows,
+            [
+                Constraint::Min(20),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(12),
+                Constraint::Length(12),
+            ],
+        )
+        .header(Row::new(vec!["Host", "In", "Out", "Total", "Last seen"]).style(header_style))
+    };
+    table.column_spacing(1).block(block)
+}
+
+fn domain_rows(
+    snapshot: &TrafficSnapshot,
+    compact: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<Row<'static>> {
+    if snapshot.outbound_domains.is_empty() {
+        let cells = if compact {
+            vec![
+                Cell::from("No outbound domains observed"),
+                Cell::from(""),
+                Cell::from(""),
+            ]
+        } else {
+            vec![
+                Cell::from("No outbound domains observed"),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+            ]
+        };
+        return vec![Row::new(cells).style(Style::default().fg(COLOR_MUTED))];
+    }
+
+    snapshot
+        .outbound_domains
+        .iter()
+        .map(|domain| {
+            let host = Cell::from(truncate(domain.host(), 40));
+            let last_seen = Cell::from(relative_last_seen(domain.last_seen(), now));
+            if compact {
+                Row::new(vec![
+                    host,
+                    Cell::from(human_bytes(domain.total_bytes()))
+                        .style(Style::default().fg(COLOR_STRONG)),
+                    last_seen,
+                ])
+            } else {
+                Row::new(vec![
+                    host,
+                    Cell::from(human_bytes(domain.in_bytes))
+                        .style(Style::default().fg(COLOR_INBOUND)),
+                    Cell::from(human_bytes(domain.out_bytes))
+                        .style(Style::default().fg(COLOR_OUTBOUND)),
+                    Cell::from(human_bytes(domain.total_bytes()))
+                        .style(Style::default().fg(COLOR_STRONG)),
+                    last_seen,
+                ])
+            }
+        })
+        .collect()
+}
+
 fn draw_about(f: &mut ratatui::Frame, area: Rect) {
     let version = env!("CARGO_PKG_VERSION");
     let commit = env!("DELRAY_BUILD_COMMIT");
@@ -1633,12 +1786,12 @@ fn draw_status_bar(f: &mut ratatui::Frame, area: Rect, state: &mut AppState, mod
 
     let mut spans = Vec::new();
     push_hint(&mut spans, "i", "interface");
-    push_hint(&mut spans, "1-4", "page");
+    push_hint(&mut spans, "1-5", "page");
     push_hint(&mut spans, "h/l", "switch");
     if state.page == Page::Ips {
         push_hint(&mut spans, "Tab", "panel");
     }
-    if matches!(state.page, Page::Processes | Page::Ips) {
+    if matches!(state.page, Page::Processes | Page::Ips | Page::Domains) {
         if state.page == Page::Processes {
             push_hint(&mut spans, "Enter", ":details");
         }
@@ -1707,7 +1860,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::stats::{IpSnapshot, ProcessSnapshot, TrafficSnapshot};
+    use crate::stats::{IpSnapshot, OutboundDomainSnapshot, ProcessSnapshot, TrafficSnapshot};
 
     fn interfaces() -> Vec<crate::capture::InterfaceInfo> {
         vec![
@@ -2221,7 +2374,7 @@ mod tests {
             .unwrap();
 
         let first_line = rendered_lines(&terminal)[0].clone();
-        assert!(first_line.contains("delray  1 Overview  2 Processes  3 IPs  4 About"));
+        assert!(first_line.contains("delray  1 Overview  2 Processes  3 IPs  4 Domains  5 About"));
         let overview_cell = terminal
             .backend()
             .buffer()
@@ -2601,6 +2754,162 @@ mod tests {
     }
 
     #[test]
+    fn domains_page_renders_columns_and_rows_from_snapshot() {
+        let snapshot = TrafficSnapshot {
+            outbound_domains: vec![OutboundDomainSnapshot::new(
+                Arc::from("example.com"),
+                240,
+                100,
+                "2026-07-15T08:00:00Z".parse().unwrap(),
+            )]
+            .into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        state.page = Page::Domains;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_at(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    "eth0",
+                    "host",
+                    Instant::now(),
+                    "2026-07-15T08:02:30Z".parse().unwrap(),
+                );
+            })
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("Host"));
+        assert!(rendered.contains("In"));
+        assert!(rendered.contains("Out"));
+        assert!(rendered.contains("Total"));
+        assert!(rendered.contains("Last seen"));
+        assert!(rendered.contains("example.com"));
+        assert!(rendered.contains("240 B"));
+        assert!(rendered.contains("100 B"));
+        assert!(rendered.contains("340 B"));
+        assert!(rendered.contains("2m ago"));
+        assert!(rendered.contains("j/k scroll"));
+        assert!(rendered.contains("1/1"));
+    }
+
+    #[test]
+    fn domains_page_renders_empty_state_when_no_domains() {
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::new();
+        state.page = Page::Domains;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("No outbound domains observed"));
+        assert!(rendered.contains("Host"));
+        assert!(rendered.contains("Last seen"));
+        assert!(rendered.contains("0/0"));
+    }
+
+    #[test]
+    fn domains_page_relative_last_seen_uses_the_same_format_as_process_details() {
+        let snapshot = TrafficSnapshot {
+            outbound_domains: vec![
+                OutboundDomainSnapshot::new(
+                    Arc::from("seconds.example"),
+                    10,
+                    20,
+                    "2026-07-15T08:00:00Z".parse().unwrap(),
+                ),
+                OutboundDomainSnapshot::new(
+                    Arc::from("minutes.example"),
+                    30,
+                    40,
+                    "2026-07-15T07:00:00Z".parse().unwrap(),
+                ),
+                OutboundDomainSnapshot::new(
+                    Arc::from("hours.example"),
+                    50,
+                    60,
+                    "2026-07-14T06:00:00Z".parse().unwrap(),
+                ),
+            ]
+            .into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        state.page = Page::Domains;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_at(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    "eth0",
+                    "host",
+                    Instant::now(),
+                    "2026-07-15T08:00:30Z".parse().unwrap(),
+                );
+            })
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("seconds.example"));
+        assert!(rendered.contains("30s ago"));
+        assert!(rendered.contains("minutes.example"));
+        assert!(rendered.contains("1h ago"));
+        assert!(rendered.contains("hours.example"));
+        assert!(rendered.contains("1d ago"));
+    }
+
+    #[test]
+    fn domains_page_scrolls_through_entries() {
+        let snapshot = TrafficSnapshot {
+            outbound_domains: (0..30)
+                .map(|index| {
+                    OutboundDomainSnapshot::new(
+                        Arc::from(format!("host-{index}.example").into_boxed_str()),
+                        100 + index as u64,
+                        50,
+                        "2026-07-15T08:00:00Z".parse().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        state.page = Page::Domains;
+
+        assert!(matches!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &snapshot,
+            ),
+            KeyOutcome::Changed
+        ));
+        assert_eq!(state.domain_scroll, 1);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("host-1.example"));
+        assert!(rendered.contains("> host-1.example"));
+        assert!(rendered.contains("2/30"));
+    }
+
+    #[test]
     fn page_key_reports_changed() {
         let mut state = AppState::new();
         let snapshot = TrafficSnapshot::default();
@@ -2613,6 +2922,28 @@ mod tests {
 
         assert!(matches!(outcome, KeyOutcome::Changed));
         assert!(state.page == Page::Processes);
+    }
+
+    #[test]
+    fn page_key_four_opens_domains_and_five_opens_about() {
+        let mut state = AppState::new();
+        let snapshot = TrafficSnapshot::default();
+
+        let outcome = handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE),
+            &snapshot,
+        );
+        assert!(matches!(outcome, KeyOutcome::Changed));
+        assert!(state.page == Page::Domains);
+
+        let outcome = handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE),
+            &snapshot,
+        );
+        assert!(matches!(outcome, KeyOutcome::Changed));
+        assert!(state.page == Page::About);
     }
 
     #[test]
