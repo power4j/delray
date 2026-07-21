@@ -17,6 +17,7 @@ use proc_table::LookupMissReason;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_TOP_N: u64 = 10;
 const DEFAULT_PROC_REFRESH: u64 = 2;
+#[cfg_attr(not(windows), allow(dead_code))]
 const NPCAP_REQUIRED_MESSAGE: &str =
     "Npcap Runtime is required. Install Npcap from https://npcap.com/ and try again.";
 
