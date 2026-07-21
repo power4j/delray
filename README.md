@@ -42,7 +42,7 @@ cargo test
 
 ### Windows x86_64 build (target platform)
 
-Windows `x86_64` is still a target platform under validation and is not yet a supported release platform. Building from source requires Rust 1.88, Npcap Runtime, and the Npcap SDK. Npcap is installed separately by the environment; Delray does not bundle it.
+Windows `x86_64` is still a target platform under validation and is not yet a supported release platform. Building from source requires Rust 1.88, Npcap Runtime, and the Npcap SDK. Install Npcap from [npcap.com](https://npcap.com/); Delray does not bundle or redistribute it.
 
 The Npcap SDK x64 `Lib` directory must contain `wpcap.lib` and `Packet.lib`. Set `LIBPCAP_LIBDIR` to that directory in the current PowerShell session before building:
 
