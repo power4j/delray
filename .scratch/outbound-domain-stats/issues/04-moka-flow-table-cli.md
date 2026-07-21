@@ -4,14 +4,14 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Cargo.toml 加 `moka 0.12`（`default-features = false, features = ["sync"]`）
-- [ ] 流表项 enum：Pending / Resolved(Arc<str>) / NoDomain
-- [ ] moka 配置 `max_capacity`（默认 65536）+ `time_to_idle`（5 分钟）
-- [ ] capture 接线：流表未命中 → 解析（02/03）→ 填表；命中 → 返回域名
-- [ ] NoDomain 填入后该连接后续包不再解析
-- [ ] clap 加 `--flow-table <N>`（正整数），传入流表容量
-- [ ] 测试：首包填表、查表命中、NoDomain 不重试、空闲超时淘汰、表满 LRU 淘汰、5-tuple 复用
+- [x] Cargo.toml 加 `moka 0.12`（`default-features = false, features = ["sync"]`）
+- [x] 流表项 enum：Pending / Resolved(Arc<str>) / NoDomain
+- [x] moka 配置 `max_capacity`（默认 65536）+ `time_to_idle`（5 分钟）
+- [x] capture 接线：流表未命中 → 解析（02/03）→ 填表；命中 → 返回域名
+- [x] NoDomain 填入后该连接后续包不再解析
+- [x] clap 加 `--flow-table <N>`（正整数），传入流表容量
+- [x] 测试：首包填表、查表命中、NoDomain 不重试、空闲超时淘汰、表满 LRU 淘汰、5-tuple 复用
 
 ## Comments

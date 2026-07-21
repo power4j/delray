@@ -4,12 +4,12 @@
 
 **Blocked by:** 无
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Flow 增加 `domain: Option<Arc<str>>` 字段（含测试构造与默认值）
-- [ ] capture 层定义解析 seam：接受 TCP payload 字节、方向、5-tuple，返回 `Option<域名>`；可注入（测试桩）
-- [ ] 调用点：只对出站方向、有 payload 的包调用 seam（流表查询在 04 接入，本票用桩）
-- [ ] 不传 raw payload 到聚合层（只传解析出的 domain）
-- [ ] 现有 capture / pipeline / stats 测试不回归
+- [x] Flow 增加 `domain: Option<Arc<str>>` 字段（含测试构造与默认值）
+- [x] capture 层定义解析 seam：接受 TCP payload 字节、方向、5-tuple，返回 `Option<域名>`；可注入（测试桩）
+- [x] 调用点：只对出站方向、有 payload 的包调用 seam（流表查询在 04 接入，本票用桩）
+- [x] 不传 raw payload 到聚合层（只传解析出的 domain）
+- [x] 现有 capture / pipeline / stats 测试不回归
 
 ## Comments

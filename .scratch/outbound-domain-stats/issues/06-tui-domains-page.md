@@ -4,7 +4,7 @@
 
 **Blocked by:** 05
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] Page 枚举加 Domains（第 4），About 顺延第 5；`ALL` 数组与索引同步
 - [x] 顶部 tab 渲染 1–5

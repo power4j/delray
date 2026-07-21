@@ -4,12 +4,12 @@
 
 **Blocked by:** 02, 03, 04
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] 出站域名快照类型：host / in_bytes / out_bytes / total_bytes / last_seen
-- [ ] 聚合：domain=Some 的 Flow 按域名累计双向字节 + 更新 last_seen
-- [ ] domain=None 不进维度（不设未归属域名）
-- [ ] top-N 排序复用 `--top-n`
-- [ ] 测试：双向累计、top-N、未识别不进、Last seen 规则、守恒边界（不与接口总量守恒，只含已识别子集）
+- [x] 出站域名快照类型：host / in_bytes / out_bytes / total_bytes / last_seen
+- [x] 聚合：domain=Some 的 Flow 按域名累计双向字节 + 更新 last_seen
+- [x] domain=None 不进维度（不设未归属域名）
+- [x] top-N 排序复用 `--top-n`
+- [x] 测试：双向累计、top-N、未识别不进、Last seen 规则、守恒边界（不与接口总量守恒，只含已识别子集）
 
 ## Comments

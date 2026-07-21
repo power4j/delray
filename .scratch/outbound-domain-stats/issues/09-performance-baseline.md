@@ -4,7 +4,7 @@
 
 **Blocked by:** 06, 07, 08
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] 复用现有持续运行 / 资源采样测试基线
 - [x] 对比启用域名解析前后的 CPU / 内存（工作集）/ 句柄
