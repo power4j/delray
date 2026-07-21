@@ -460,6 +460,14 @@ pub(crate) fn parse_with_domain_parser(
         return Ok(None);
     };
     if flow.direction != Direction::Outbound {
+        // Q8 双向统计：Inbound 回包不解析 payload（Q1 出站视角），但查流表补
+        // domain，使对端回包累计到该域名的 in_bytes。NoDomain 或未命中则 domain 留 None。
+        if let Some(table) = flow_table
+            && let Some(key) = flow_key_from(&flow)
+            && let Some(FlowEntry::Resolved(domain)) = table.lookup(&key)
+        {
+            flow.domain = Some(domain);
+        }
         return Ok(Some(flow));
     }
     let Some(payload) = payload else {
@@ -957,6 +965,46 @@ mod tests {
         .expect("supported data link");
 
         assert_eq!(parser.call_count(), 2, "两条不同连接应各自解析一次");
+    }
+
+    #[test]
+    fn inbound_flow_looks_up_flow_table_to_restore_domain() {
+        // Q8 双向统计：Outbound 首包填表后，Inbound 回包查表补 domain，
+        // 使对端回包累计到该域名的 in_bytes；Inbound 不解析 payload（Q1 出站视角）。
+        let table = FlowTable::new();
+        let local_ips = HashSet::from([IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]);
+
+        let outbound = outbound_tcp_ethernet_frame(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        let outbound_flow = parse_with_domain_parser(
+            pcap::Linktype::ETHERNET,
+            &outbound,
+            &local_ips,
+            &RecordingParser::new(Some(Arc::from("example.com"))),
+            Some(&table),
+        )
+        .expect("supported data link")
+        .expect("outbound TCP flow");
+        assert_eq!(outbound_flow.domain.as_deref(), Some("example.com"));
+
+        let inbound_parser = RecordingParser::new(Some(Arc::from("would-not-be-used.com")));
+        let inbound = inbound_tcp_ethernet_frame(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        let inbound_flow = parse_with_domain_parser(
+            pcap::Linktype::ETHERNET,
+            &inbound,
+            &local_ips,
+            &inbound_parser,
+            Some(&table),
+        )
+        .expect("supported data link")
+        .expect("inbound TCP flow");
+
+        assert_eq!(inbound_flow.direction, Direction::Inbound);
+        assert_eq!(
+            inbound_flow.domain.as_deref(),
+            Some("example.com"),
+            "Inbound 回包应查流表补 domain（Q8 双向统计）"
+        );
+        assert_eq!(inbound_parser.call_count(), 0, "Inbound 不应解析 payload");
     }
 
     /// 测试桩：记录调用次数并可配置返回结果。
