@@ -6,11 +6,11 @@
 
 **Status:** ready-for-agent
 
-- [ ] Page 枚举加 Domains（第 4），About 顺延第 5；`ALL` 数组与索引同步
-- [ ] 顶部 tab 渲染 1–5
-- [ ] `draw_domains`：表格 Host/In/Out/Total/Last seen
-- [ ] Last seen 相对时间（与进程详情一致）
-- [ ] 空状态文案
-- [ ] 测试：TestBackend 渲染、tab 导航、空状态、列内容
+- [x] Page 枚举加 Domains（第 4），About 顺延第 5；`ALL` 数组与索引同步
+- [x] 顶部 tab 渲染 1–5
+- [x] `draw_domains`：表格 Host/In/Out/Total/Last seen
+- [x] Last seen 相对时间（与进程详情一致）
+- [x] 空状态文案
+- [x] 测试：TestBackend 渲染、tab 导航、空状态、列内容
 
 ## Comments
