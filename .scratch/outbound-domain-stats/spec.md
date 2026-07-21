@@ -43,7 +43,7 @@ delray 在 TCP 出站流量的连接级解析 TLS SNI（ClientHello）和明文 
 - **连接级流表**：键为 5-tuple（本机 IP、本机端口、peer IP、peer端口、协议），值为域名。capture 层解析首包填表，后续包按连接查表累计。
 - **双向统计**：已识别连接的双向流量（in + out）都归该域名。
 - **不设未归属域名**：未识别流量不进出站域名维度；用户对照接口流量看识别比例。流表淘汰的连接后续流量同样不进维度。
-- **解析位置**：capture 层对流表未命中连接的**首个有 payload 出站包**解析一次；Flow 扩展带 `domain: Option<String>`，不传 raw payload（性能：避免每包传 2KB）。
+- **解析位置**：capture 层对流表未命中连接的**首个有 payload 出站包**解析一次；Flow 扩展带 `domain: Option<Arc<str>>`，不传 raw payload（性能：避免每包传 2KB）。
 - **解析失败**：TCP 顺序保证首包即应用层首包；首包解析失败则标记该连接 NoDomain，后续包不再试。
 - **流表项状态**：Pending（首包未到）/ Resolved(域名) / NoDomain（首包解析失败或 ECH）。
 - **流表边界**：默认上限 65536 条（~6MB）；新增 `--flow-table <N>` CLI 参数可调；空闲超时 5 分钟 + 表满 LRU 兜底；不做 TCP 状态追踪（FIN/RST），接受低概率 5-tuple 复用误归属。
