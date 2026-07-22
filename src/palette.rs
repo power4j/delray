@@ -115,7 +115,7 @@ const TRUECOLOR: Palette = Palette {
     text: Color::Rgb(216, 224, 232),
     strong: Color::Rgb(244, 247, 250),
     muted: Color::Rgb(116, 129, 145),
-    border: Color::Rgb(37, 53, 68),
+    border: Color::Rgb(255, 140, 40),
     accent: Color::Rgb(255, 183, 3),
     accent_dim: Color::Rgb(154, 111, 8),
     inbound: Color::Rgb(255, 191, 36),

@@ -1672,7 +1672,7 @@ fn draw_ip_table(
         title,
         Some(entries.len()),
         color,
-        if focused { palette::coral() } else { palette::border() },
+        palette::border(),
         Some(selected_position(selected, entries.len())),
     );
     let table = ip_table(entries, color, block)
