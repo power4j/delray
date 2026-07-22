@@ -32,18 +32,26 @@ enum Page {
     Overview,
     Processes,
     Ips,
+    Domains,
     About,
 }
 
 impl Page {
-    const ALL: [Page; 4] = [Page::Overview, Page::Processes, Page::Ips, Page::About];
+    const ALL: [Page; 5] = [
+        Page::Overview,
+        Page::Processes,
+        Page::Ips,
+        Page::Domains,
+        Page::About,
+    ];
 
     fn index(self) -> usize {
         match self {
             Page::Overview => 0,
             Page::Processes => 1,
             Page::Ips => 2,
-            Page::About => 3,
+            Page::Domains => 3,
+            Page::About => 4,
         }
     }
 }
@@ -143,10 +151,12 @@ struct AppState {
     ip_in_scroll: usize,
     ip_out_scroll: usize,
     ip_focus: IpFocus,
+    domain_scroll: usize,
     /// Monotonic view height, updated each draw for clamping scrolls.
     proc_view_height: usize,
     ip_in_view_height: usize,
     ip_out_view_height: usize,
+    domain_view_height: usize,
     interface_selector: Option<InterfaceSelector>,
 }
 
@@ -159,9 +169,11 @@ impl AppState {
             ip_in_scroll: 0,
             ip_out_scroll: 0,
             ip_focus: IpFocus::Inbound,
+            domain_scroll: 0,
             proc_view_height: 1,
             ip_in_view_height: 1,
             ip_out_view_height: 1,
+            domain_view_height: 1,
             interface_selector: None,
         }
     }
@@ -509,6 +521,10 @@ fn handle_key(state: &mut AppState, key: KeyEvent, snapshot: &TrafficSnapshot) -
             KeyOutcome::Changed
         }
         KeyCode::Char('4') => {
+            state.page = Page::Domains;
+            KeyOutcome::Changed
+        }
+        KeyCode::Char('5') => {
             state.page = Page::About;
             KeyOutcome::Changed
         }
@@ -577,6 +593,7 @@ impl AppState {
                 IpFocus::Inbound => self.ip_in_view_height,
                 IpFocus::Outbound => self.ip_out_view_height,
             },
+            Page::Domains => self.domain_view_height,
             _ => 1,
         }
     }
@@ -595,6 +612,9 @@ fn scroll(state: &mut AppState, delta: isize) {
                 state.ip_out_scroll = (state.ip_out_scroll as isize + delta).max(0) as usize;
             }
         },
+        Page::Domains => {
+            state.domain_scroll = (state.domain_scroll as isize + delta).max(0) as usize;
+        }
         _ => {}
     }
 }
@@ -606,6 +626,7 @@ fn scroll_to_top(state: &mut AppState) {
             IpFocus::Inbound => state.ip_in_scroll = 0,
             IpFocus::Outbound => state.ip_out_scroll = 0,
         },
+        Page::Domains => state.domain_scroll = 0,
         _ => {}
     }
 }
@@ -626,6 +647,10 @@ fn scroll_to_bottom(state: &mut AppState, snapshot: &TrafficSnapshot) {
                 state.ip_out_scroll = len.saturating_sub(state.ip_out_view_height);
             }
         },
+        Page::Domains => {
+            let len = snapshot.outbound_domains.len();
+            state.domain_scroll = len.saturating_sub(state.domain_view_height);
+        }
         _ => {}
     }
 }
@@ -739,12 +764,13 @@ fn draw_with_interfaces_at(
         vertical: 1,
     });
     match state.page {
-        Page::Overview => draw_overview(f, body, snapshot, mode),
+        Page::Overview => draw_overview(f, body, snapshot, mode, now),
         Page::Processes => match state.process_detail.as_ref() {
             Some(detail) => draw_process_detail(f, body, detail, now),
             None => draw_processes(f, body, state, snapshot, mode),
         },
         Page::Ips => draw_ips(f, body, state, snapshot, mode),
+        Page::Domains => draw_domains(f, body, state, snapshot, mode, now),
         Page::About => draw_about(f, body),
     }
     draw_status_bar(f, chunks[2], state, mode);
@@ -965,11 +991,13 @@ fn navigation_line(page: Page, mode: LayoutMode) -> Line<'static> {
             (Page::Overview, LayoutMode::Compact) => " 1 ".to_string(),
             (Page::Processes, LayoutMode::Compact) => " 2 ".to_string(),
             (Page::Ips, LayoutMode::Compact) => " 3 ".to_string(),
-            (Page::About, LayoutMode::Compact) => " 4 ".to_string(),
+            (Page::Domains, LayoutMode::Compact) => " 4 ".to_string(),
+            (Page::About, LayoutMode::Compact) => " 5 ".to_string(),
             (Page::Overview, _) => " 1 Overview ".to_string(),
             (Page::Processes, _) => " 2 Processes ".to_string(),
             (Page::Ips, _) => " 3 IPs ".to_string(),
-            (Page::About, _) => " 4 About ".to_string(),
+            (Page::Domains, _) => " 4 Domains ".to_string(),
+            (Page::About, _) => " 5 About ".to_string(),
         };
         let style = if candidate == page {
             Style::default()
@@ -1015,33 +1043,24 @@ fn runtime_line(
     Line::from(spans)
 }
 
-fn draw_overview(f: &mut ratatui::Frame, area: Rect, snapshot: &TrafficSnapshot, mode: LayoutMode) {
+fn draw_overview(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    snapshot: &TrafficSnapshot,
+    mode: LayoutMode,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    // Row-based layout (ticket 07): every row is either a full-width panel or two
+    // equal 50/50 columns. Wide/Standard use three rows; Compact stacks four rows.
+    //
+    // Height allocation:
+    //   * Wide/Standard — Traffic fixed at top; the Process|Domain row gets
+    //     Fill(2) and the IP row gets Fill(1) so the previews of processes and
+    //     domains (the primary diagnostic dimensions) take the larger share.
+    //   * Compact — Traffic fixed at top; the three preview panels split the
+    //     remaining space evenly (Fill(1) each) since vertical space is scarce.
     match mode {
-        LayoutMode::Wide => {
-            let columns = Layout::default()
-                .direction(LayoutDir::Horizontal)
-                .constraints([
-                    Constraint::Percentage(42),
-                    Constraint::Length(1),
-                    Constraint::Percentage(58),
-                ])
-                .split(area);
-            let left = Layout::default()
-                .direction(LayoutDir::Vertical)
-                .constraints([
-                    Constraint::Length(6),
-                    Constraint::Length(1),
-                    Constraint::Fill(1),
-                    Constraint::Length(1),
-                    Constraint::Fill(1),
-                ])
-                .split(columns[0]);
-            draw_traffic(f, left[0], snapshot);
-            draw_ip_preview(f, left[2], snapshot, true);
-            draw_ip_preview(f, left[4], snapshot, false);
-            draw_process_preview(f, columns[2], snapshot, mode);
-        }
-        LayoutMode::Standard | LayoutMode::Compact => {
+        LayoutMode::Wide | LayoutMode::Standard => {
             let rows = Layout::default()
                 .direction(LayoutDir::Vertical)
                 .constraints([
@@ -1053,21 +1072,49 @@ fn draw_overview(f: &mut ratatui::Frame, area: Rect, snapshot: &TrafficSnapshot,
                 ])
                 .split(area);
             draw_traffic(f, rows[0], snapshot);
+
+            // Force compact tables in the half-width preview columns so the
+            // full five-column layout does not cramp at 50% width.
+            let preview_mode = LayoutMode::Compact;
+            let mid = Layout::default()
+                .direction(LayoutDir::Horizontal)
+                .constraints([
+                    Constraint::Percentage(50),
+                    Constraint::Length(1),
+                    Constraint::Percentage(50),
+                ])
+                .split(rows[2]);
+            draw_process_preview(f, mid[0], snapshot, preview_mode);
+            draw_domain_preview(f, mid[2], snapshot, preview_mode, now);
+
+            let bottom = Layout::default()
+                .direction(LayoutDir::Horizontal)
+                .constraints([
+                    Constraint::Percentage(50),
+                    Constraint::Length(1),
+                    Constraint::Percentage(50),
+                ])
+                .split(rows[4]);
+            draw_ip_preview(f, bottom[0], snapshot, true);
+            draw_ip_preview(f, bottom[2], snapshot, false);
+        }
+        LayoutMode::Compact => {
+            let rows = Layout::default()
+                .direction(LayoutDir::Vertical)
+                .constraints([
+                    Constraint::Length(6),
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                ])
+                .split(area);
+            draw_traffic(f, rows[0], snapshot);
             draw_process_preview(f, rows[2], snapshot, mode);
-            if mode == LayoutMode::Compact {
-                draw_ip_preview(f, rows[4], snapshot, true);
-            } else {
-                let ips = Layout::default()
-                    .direction(LayoutDir::Horizontal)
-                    .constraints([
-                        Constraint::Percentage(50),
-                        Constraint::Length(1),
-                        Constraint::Percentage(50),
-                    ])
-                    .split(rows[4]);
-                draw_ip_preview(f, ips[0], snapshot, true);
-                draw_ip_preview(f, ips[2], snapshot, false);
-            }
+            draw_domain_preview(f, rows[4], snapshot, mode, now);
+            draw_ip_preview(f, rows[6], snapshot, true);
         }
     }
 }
@@ -1566,6 +1613,154 @@ fn draw_ip_table(
     f.render_stateful_widget(table, area, &mut ratatui_state(entries.len(), selected));
 }
 
+/// Overview preview of top outbound domains. Mirrors `draw_ip_preview` and
+/// `draw_process_preview`: panel prefix `dom`, title `Top Domains`, rows
+/// clipped by height, `preview_position` footer.
+fn draw_domain_preview(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    snapshot: &TrafficSnapshot,
+    mode: LayoutMode,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let footer = preview_position(snapshot.outbound_domains.len(), area.height);
+    let block = panel_block(
+        "dom",
+        "Top Domains",
+        Some(snapshot.outbound_domains.len()),
+        COLOR_VIOLET,
+        COLOR_VIOLET_BORDER,
+        Some(footer),
+    );
+    let table = domain_table(snapshot, mode, block, now);
+    f.render_widget(table, area);
+}
+
+fn draw_domains(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    state: &mut AppState,
+    snapshot: &TrafficSnapshot,
+    mode: LayoutMode,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let view_h = area.height.saturating_sub(3) as usize;
+    state.domain_view_height = view_h.max(1);
+    state.domain_scroll = state
+        .domain_scroll
+        .min(snapshot.outbound_domains.len().saturating_sub(1));
+
+    let footer = selected_position(state.domain_scroll, snapshot.outbound_domains.len());
+    let block = panel_block(
+        "dom",
+        "Domains",
+        Some(snapshot.outbound_domains.len()),
+        COLOR_VIOLET,
+        COLOR_VIOLET_BORDER,
+        Some(footer),
+    );
+    let table = domain_table(snapshot, mode, block, now)
+        .row_highlight_style(
+            Style::default()
+                .bg(COLOR_SELECTION)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+    f.render_stateful_widget(
+        table,
+        area,
+        &mut ratatui_state(snapshot.outbound_domains.len(), state.domain_scroll),
+    );
+}
+
+fn domain_table(
+    snapshot: &TrafficSnapshot,
+    mode: LayoutMode,
+    block: Block<'static>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Table<'static> {
+    let compact = mode == LayoutMode::Compact;
+    let rows = domain_rows(snapshot, compact, now);
+    let header_style = Style::default().fg(COLOR_MUTED);
+    let table = if compact {
+        Table::new(
+            rows,
+            [
+                Constraint::Min(18),
+                Constraint::Length(12),
+                Constraint::Length(12),
+            ],
+        )
+        .header(Row::new(vec!["Host", "Total", "Last seen"]).style(header_style))
+    } else {
+        Table::new(
+            rows,
+            [
+                Constraint::Min(20),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(12),
+                Constraint::Length(12),
+            ],
+        )
+        .header(Row::new(vec!["Host", "In", "Out", "Total", "Last seen"]).style(header_style))
+    };
+    table.column_spacing(1).block(block)
+}
+
+fn domain_rows(
+    snapshot: &TrafficSnapshot,
+    compact: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<Row<'static>> {
+    if snapshot.outbound_domains.is_empty() {
+        let cells = if compact {
+            vec![
+                Cell::from("No outbound domains observed"),
+                Cell::from(""),
+                Cell::from(""),
+            ]
+        } else {
+            vec![
+                Cell::from("No outbound domains observed"),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+            ]
+        };
+        return vec![Row::new(cells).style(Style::default().fg(COLOR_MUTED))];
+    }
+
+    snapshot
+        .outbound_domains
+        .iter()
+        .map(|domain| {
+            let host = Cell::from(truncate(domain.host(), 40));
+            let last_seen = Cell::from(relative_last_seen(domain.last_seen(), now));
+            if compact {
+                Row::new(vec![
+                    host,
+                    Cell::from(human_bytes(domain.total_bytes()))
+                        .style(Style::default().fg(COLOR_STRONG)),
+                    last_seen,
+                ])
+            } else {
+                Row::new(vec![
+                    host,
+                    Cell::from(human_bytes(domain.in_bytes))
+                        .style(Style::default().fg(COLOR_INBOUND)),
+                    Cell::from(human_bytes(domain.out_bytes))
+                        .style(Style::default().fg(COLOR_OUTBOUND)),
+                    Cell::from(human_bytes(domain.total_bytes()))
+                        .style(Style::default().fg(COLOR_STRONG)),
+                    last_seen,
+                ])
+            }
+        })
+        .collect()
+}
+
 fn draw_about(f: &mut ratatui::Frame, area: Rect) {
     let version = env!("CARGO_PKG_VERSION");
     let commit = env!("DELRAY_BUILD_COMMIT");
@@ -1633,12 +1828,12 @@ fn draw_status_bar(f: &mut ratatui::Frame, area: Rect, state: &mut AppState, mod
 
     let mut spans = Vec::new();
     push_hint(&mut spans, "i", "interface");
-    push_hint(&mut spans, "1-4", "page");
+    push_hint(&mut spans, "1-5", "page");
     push_hint(&mut spans, "h/l", "switch");
     if state.page == Page::Ips {
         push_hint(&mut spans, "Tab", "panel");
     }
-    if matches!(state.page, Page::Processes | Page::Ips) {
+    if matches!(state.page, Page::Processes | Page::Ips | Page::Domains) {
         if state.page == Page::Processes {
             push_hint(&mut spans, "Enter", ":details");
         }
@@ -1707,7 +1902,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::stats::{IpSnapshot, ProcessSnapshot, TrafficSnapshot};
+    use crate::stats::{IpSnapshot, OutboundDomainSnapshot, ProcessSnapshot, TrafficSnapshot};
 
     fn interfaces() -> Vec<crate::capture::InterfaceInfo> {
         vec![
@@ -2221,7 +2416,7 @@ mod tests {
             .unwrap();
 
         let first_line = rendered_lines(&terminal)[0].clone();
-        assert!(first_line.contains("delray  1 Overview  2 Processes  3 IPs  4 About"));
+        assert!(first_line.contains("delray  1 Overview  2 Processes  3 IPs  4 Domains  5 About"));
         let overview_cell = terminal
             .backend()
             .buffer()
@@ -2234,7 +2429,7 @@ mod tests {
     }
 
     #[test]
-    fn wide_overview_uses_the_legacy_panel_grid_and_palette() {
+    fn wide_overview_uses_row_layout_with_equal_columns() {
         let snapshot = TrafficSnapshot::default();
         let mut state = AppState::new();
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
@@ -2258,14 +2453,159 @@ mod tests {
         let inbound = position("Inbound IPs");
         let outbound = position("Outbound IPs");
         let processes = position("Top Processes");
-        assert!(traffic.0 < 50 && inbound.0 < 50 && outbound.0 < 50);
-        assert!(traffic.1 < inbound.1 && inbound.1 < outbound.1);
-        assert!(processes.0 > 50 && processes.1 < inbound.1);
+        let domains = position("Top Domains");
 
+        // Row 1: Traffic spans the full width at the top.
+        assert!(traffic.1 < processes.1);
+        assert!(traffic.1 < inbound.1);
+
+        // Row 2: Process (left) and Domain (right) share the same band.
+        assert_eq!(processes.1, domains.1);
+        assert!(processes.0 < 50);
+        assert!(domains.0 >= 50);
+
+        // Row 3: Inbound (left) and Outbound (right) share a lower band.
+        assert_eq!(inbound.1, outbound.1);
+        assert!(inbound.1 > processes.1);
+        assert!(inbound.0 < 50);
+        assert!(outbound.0 >= 50);
+
+        // Two equal columns: the right column sits ~half the body width to the
+        // right of the left column.
+        let body_width: usize = 120 - 4; // 2-char margin each side
+        let half_width = body_width / 2;
+        assert!((domains.0 - processes.0) >= half_width.saturating_sub(2));
+        assert!((domains.0 - processes.0) <= half_width + 2);
+        assert!((outbound.0 - inbound.0) >= half_width.saturating_sub(2));
+        assert!((outbound.0 - inbound.0) <= half_width + 2);
+
+        // Palette: the "n" prefix of the Traffic panel keeps the violet tint.
         let net_cell = &terminal.backend().buffer()[(traffic.0 as u16 - 4, traffic.1 as u16)];
         assert_eq!(net_cell.symbol(), "n");
         assert_eq!(net_cell.fg, Color::Rgb(167, 139, 250));
         assert_eq!(net_cell.bg, Color::Rgb(9, 13, 20));
+    }
+
+    #[test]
+    fn standard_overview_uses_row_layout_with_equal_columns() {
+        // 80-column terminal lands in Standard mode (80..120). The Overview
+        // still arranges its panels in the row-based layout: Traffic at top,
+        // then Process|Domain on the same band, then Inbound|Outbound IPs on
+        // the next.
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let lines = rendered_lines(&terminal);
+        let position = |label: &str| {
+            lines
+                .iter()
+                .enumerate()
+                .find_map(|(y, line)| {
+                    line.find(label)
+                        .map(|byte_offset| (line[..byte_offset].chars().count(), y))
+                })
+                .unwrap_or_else(|| panic!("missing panel label: {label}"))
+        };
+        let traffic = position("Traffic");
+        let processes = position("Top Processes");
+        let domains = position("Top Domains");
+        let inbound = position("Inbound IPs");
+        let outbound = position("Outbound IPs");
+
+        assert!(traffic.1 < processes.1);
+        assert!(traffic.1 < inbound.1);
+
+        assert_eq!(processes.1, domains.1);
+        assert!(processes.0 < domains.0);
+
+        assert_eq!(inbound.1, outbound.1);
+        assert!(inbound.1 > processes.1);
+        assert!(inbound.0 < outbound.0);
+    }
+
+    #[test]
+    fn compact_overview_stacks_four_rows_without_side_by_side_panels() {
+        // <80 columns triggers Compact mode. Overview stacks Traffic / Process
+        // / Domain / Inbound IP vertically — no side-by-side panels.
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::new();
+        let mut terminal = Terminal::new(TestBackend::new(72, 30)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let lines = rendered_lines(&terminal);
+        let position = |label: &str| {
+            lines
+                .iter()
+                .enumerate()
+                .find_map(|(y, line)| {
+                    line.find(label)
+                        .map(|byte_offset| (line[..byte_offset].chars().count(), y))
+                })
+                .unwrap_or_else(|| panic!("missing panel label: {label}"))
+        };
+        let traffic = position("Traffic");
+        let processes = position("Top Processes");
+        let domains = position("Top Domains");
+        let inbound = position("Inbound IPs");
+
+        // Vertical order: Traffic < Process < Domain < Inbound IP.
+        assert!(traffic.1 < processes.1);
+        assert!(processes.1 < domains.1);
+        assert!(domains.1 < inbound.1);
+
+        // Compact Overview omits Outbound IPs.
+        assert!(!lines.iter().any(|line| line.contains("Outbound IPs")));
+    }
+
+    #[test]
+    fn overview_domain_preview_lists_top_domains_and_empty_state() {
+        let populated = TrafficSnapshot {
+            outbound_domains: vec![OutboundDomainSnapshot::new(
+                Arc::from("example.com"),
+                100,
+                240,
+                "2026-07-15T08:00:00Z".parse().unwrap(),
+            )]
+            .into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &mut state,
+                    &populated,
+                    "eth0",
+                    "host",
+                    Instant::now(),
+                )
+            })
+            .unwrap();
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("Top Domains"));
+        assert!(rendered.contains("example.com"));
+        assert!(rendered.contains("340 B"));
+        assert!(!rendered.contains("No outbound domains observed"));
+
+        let empty = TrafficSnapshot::default();
+        let mut terminal2 = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal2
+            .draw(|frame| draw(frame, &mut state, &empty, "eth0", "host", Instant::now()))
+            .unwrap();
+        let rendered2 = rendered_lines(&terminal2).join("\n");
+        assert!(rendered2.contains("Top Domains"));
+        assert!(rendered2.contains("No outbound domains observed"));
+        assert!(rendered2.contains("0/0"));
     }
 
     #[test]
@@ -2534,6 +2874,13 @@ mod tests {
                 bytes: 2048,
             }]
             .into(),
+            outbound_domains: vec![OutboundDomainSnapshot::new(
+                Arc::from("example.com"),
+                1024,
+                2048,
+                "2026-07-15T08:00:00Z".parse().unwrap(),
+            )]
+            .into(),
             process_data_fresh: false,
         };
         let mut state = AppState::new();
@@ -2548,6 +2895,8 @@ mod tests {
         assert!(rendered.contains("192.0.2.10"));
         assert!(rendered.contains("198.51.100.20"));
         assert!(rendered.contains("Top Processes"));
+        assert!(rendered.contains("Top Domains"));
+        assert!(rendered.contains("example.com"));
         assert!(!rendered.contains("/usr/bin/curl"));
     }
 
@@ -2558,7 +2907,9 @@ mod tests {
             ..TrafficSnapshot::default()
         };
         let mut state = AppState::new();
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        // Use a 120-wide terminal so the half-width preview columns still have
+        // enough room to render the `<unattributed traffic>` label in full.
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
 
         terminal
             .draw(|frame| {
@@ -2600,6 +2951,162 @@ mod tests {
     }
 
     #[test]
+    fn domains_page_renders_columns_and_rows_from_snapshot() {
+        let snapshot = TrafficSnapshot {
+            outbound_domains: vec![OutboundDomainSnapshot::new(
+                Arc::from("example.com"),
+                240,
+                100,
+                "2026-07-15T08:00:00Z".parse().unwrap(),
+            )]
+            .into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        state.page = Page::Domains;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_at(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    "eth0",
+                    "host",
+                    Instant::now(),
+                    "2026-07-15T08:02:30Z".parse().unwrap(),
+                );
+            })
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("Host"));
+        assert!(rendered.contains("In"));
+        assert!(rendered.contains("Out"));
+        assert!(rendered.contains("Total"));
+        assert!(rendered.contains("Last seen"));
+        assert!(rendered.contains("example.com"));
+        assert!(rendered.contains("240 B"));
+        assert!(rendered.contains("100 B"));
+        assert!(rendered.contains("340 B"));
+        assert!(rendered.contains("2m ago"));
+        assert!(rendered.contains("j/k scroll"));
+        assert!(rendered.contains("1/1"));
+    }
+
+    #[test]
+    fn domains_page_renders_empty_state_when_no_domains() {
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::new();
+        state.page = Page::Domains;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("No outbound domains observed"));
+        assert!(rendered.contains("Host"));
+        assert!(rendered.contains("Last seen"));
+        assert!(rendered.contains("0/0"));
+    }
+
+    #[test]
+    fn domains_page_relative_last_seen_uses_the_same_format_as_process_details() {
+        let snapshot = TrafficSnapshot {
+            outbound_domains: vec![
+                OutboundDomainSnapshot::new(
+                    Arc::from("seconds.example"),
+                    10,
+                    20,
+                    "2026-07-15T08:00:00Z".parse().unwrap(),
+                ),
+                OutboundDomainSnapshot::new(
+                    Arc::from("minutes.example"),
+                    30,
+                    40,
+                    "2026-07-15T07:00:00Z".parse().unwrap(),
+                ),
+                OutboundDomainSnapshot::new(
+                    Arc::from("hours.example"),
+                    50,
+                    60,
+                    "2026-07-14T06:00:00Z".parse().unwrap(),
+                ),
+            ]
+            .into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        state.page = Page::Domains;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_at(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    "eth0",
+                    "host",
+                    Instant::now(),
+                    "2026-07-15T08:00:30Z".parse().unwrap(),
+                );
+            })
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("seconds.example"));
+        assert!(rendered.contains("30s ago"));
+        assert!(rendered.contains("minutes.example"));
+        assert!(rendered.contains("1h ago"));
+        assert!(rendered.contains("hours.example"));
+        assert!(rendered.contains("1d ago"));
+    }
+
+    #[test]
+    fn domains_page_scrolls_through_entries() {
+        let snapshot = TrafficSnapshot {
+            outbound_domains: (0..30)
+                .map(|index| {
+                    OutboundDomainSnapshot::new(
+                        Arc::from(format!("host-{index}.example").into_boxed_str()),
+                        100 + index as u64,
+                        50,
+                        "2026-07-15T08:00:00Z".parse().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        state.page = Page::Domains;
+
+        assert!(matches!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &snapshot,
+            ),
+            KeyOutcome::Changed
+        ));
+        assert_eq!(state.domain_scroll, 1);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("host-1.example"));
+        assert!(rendered.contains("> host-1.example"));
+        assert!(rendered.contains("2/30"));
+    }
+
+    #[test]
     fn page_key_reports_changed() {
         let mut state = AppState::new();
         let snapshot = TrafficSnapshot::default();
@@ -2612,6 +3119,28 @@ mod tests {
 
         assert!(matches!(outcome, KeyOutcome::Changed));
         assert!(state.page == Page::Processes);
+    }
+
+    #[test]
+    fn page_key_four_opens_domains_and_five_opens_about() {
+        let mut state = AppState::new();
+        let snapshot = TrafficSnapshot::default();
+
+        let outcome = handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE),
+            &snapshot,
+        );
+        assert!(matches!(outcome, KeyOutcome::Changed));
+        assert!(state.page == Page::Domains);
+
+        let outcome = handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE),
+            &snapshot,
+        );
+        assert!(matches!(outcome, KeyOutcome::Changed));
+        assert!(state.page == Page::About);
     }
 
     #[test]

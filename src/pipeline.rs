@@ -716,6 +716,7 @@ mod tests {
                     protocol: crate::capture::TransportProtocol::Tcp,
                 }),
                 peer_local_socket: None,
+                domain: None,
             })
             .unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -792,6 +793,7 @@ mod tests {
                     port: 49_152,
                     protocol: crate::capture::TransportProtocol::Tcp,
                 }),
+                domain: None,
             })
             .unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -977,6 +979,7 @@ mod tests {
             bytes,
             local_socket: None,
             peer_local_socket: None,
+            domain: None,
         }
     }
 }

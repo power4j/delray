@@ -1,5 +1,10 @@
 mod attribution;
 mod capture;
+mod domain_parse;
+mod domain_parse_composite;
+mod domain_parse_http;
+mod domain_parse_tls;
+mod flow_table;
 mod pipeline;
 mod proc_table;
 mod report;
@@ -17,6 +22,7 @@ use proc_table::LookupMissReason;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_TOP_N: u64 = 10;
 const DEFAULT_PROC_REFRESH: u64 = 2;
+const DEFAULT_FLOW_TABLE: u64 = 65_536;
 #[cfg_attr(not(windows), allow(dead_code))]
 const NPCAP_REQUIRED_MESSAGE: &str =
     "Npcap Runtime is required. Install Npcap from https://npcap.com/ and try again.";
@@ -67,7 +73,8 @@ fn run(cli: Cli, require_npcap: impl FnOnce() -> Result<(), &'static str>) -> Ex
     let is_json = cli.format == "json";
 
     if cli.output.is_none() && !is_json {
-        let mut session = match session::TrafficSession::discover(proc_table, top_n) {
+        let mut session = match session::TrafficSession::discover(proc_table, top_n, cli.flow_table)
+        {
             Ok(session) => session,
             Err(error) => {
                 eprintln!("Failed to enumerate interfaces: {error}");
@@ -94,7 +101,7 @@ fn run(cli: Cli, require_npcap: impl FnOnce() -> Result<(), &'static str>) -> Ex
 
     let started_wall = chrono::Local::now();
     let started_at = Instant::now();
-    let mut source = match CaptureSource::open(interface_selector) {
+    let mut source = match CaptureSource::open(interface_selector, cli.flow_table) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to open interface: {e}");
@@ -330,6 +337,9 @@ struct Cli {
     /// Number of entries per top-N list (default: 10, min: 1)
     #[arg(long = "top-n", short = 'n', default_value_t = DEFAULT_TOP_N, value_parser = clap::value_parser!(u64).range(1..))]
     top_n: u64,
+    /// Connection flow table capacity in 5-tuples (default: 65536, min: 1)
+    #[arg(long = "flow-table", default_value_t = DEFAULT_FLOW_TABLE, value_parser = clap::value_parser!(u64).range(1..))]
+    flow_table: u64,
     /// Emit process attribution diagnostics to stderr on each output refresh
     #[arg(long)]
     diagnostics: bool,
@@ -367,6 +377,7 @@ mod scheduling_tests {
                     bytes: 64,
                     local_socket: None,
                     peer_local_socket: None,
+                    domain: None,
                 }))
             },
             &proc_table,
@@ -427,6 +438,30 @@ mod cli_tests {
     #[test]
     fn proc_refresh_zero_rejected() {
         let result = Cli::try_parse_from(["delray", "eth0", "--proc-refresh", "0"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn flow_table_defaults_to_65536() {
+        let cli = Cli::try_parse_from(["delray", "eth0"]).unwrap();
+        assert_eq!(cli.flow_table, DEFAULT_FLOW_TABLE);
+    }
+
+    #[test]
+    fn flow_table_accepts_custom_capacity() {
+        let cli = Cli::try_parse_from(["delray", "eth0", "--flow-table", "4096"]).unwrap();
+        assert_eq!(cli.flow_table, 4096);
+    }
+
+    #[test]
+    fn flow_table_zero_rejected() {
+        let result = Cli::try_parse_from(["delray", "eth0", "--flow-table", "0"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn flow_table_non_numeric_rejected() {
+        let result = Cli::try_parse_from(["delray", "eth0", "--flow-table", "huge"]);
         assert!(result.is_err());
     }
 

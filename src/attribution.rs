@@ -76,6 +76,12 @@ impl PendingAttributor {
     ) {
         self.advance(stats, proc_table, now);
         stats.record_interface_flow(&flow);
+        stats.record_outbound_domain(
+            flow.domain.as_ref(),
+            flow.direction,
+            flow.bytes,
+            observed_at,
+        );
 
         self.record_endpoint(
             stats,
@@ -302,6 +308,7 @@ mod tests {
                 protocol: TransportProtocol::Tcp,
             }),
             peer_local_socket: None,
+            domain: None,
         }
     }
 

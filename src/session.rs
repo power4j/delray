@@ -35,17 +35,23 @@ pub struct TrafficSession {
     interfaces: Vec<InterfaceInfo>,
     proc_table: SharedProcTable,
     top_n: usize,
+    flow_table_capacity: u64,
     active: Option<ActiveCapture>,
     fallback: Option<ActiveCapture>,
     pending: Option<PendingActivation>,
 }
 
 impl TrafficSession {
-    pub fn discover(proc_table: SharedProcTable, top_n: usize) -> Result<Self> {
+    pub fn discover(
+        proc_table: SharedProcTable,
+        top_n: usize,
+        flow_table_capacity: u64,
+    ) -> Result<Self> {
         Ok(Self {
             interfaces: crate::capture::interface_catalog()?,
             proc_table,
             top_n,
+            flow_table_capacity,
             active: None,
             fallback: None,
             pending: None,
@@ -63,8 +69,9 @@ impl TrafficSession {
     pub fn activate(&mut self, selector: &str) -> Result<Activation> {
         let proc_table = self.proc_table.clone();
         let top_n = self.top_n;
+        let capacity = self.flow_table_capacity;
         self.activate_with(selector, move |name| {
-            let source = CaptureSource::open(name)?;
+            let source = CaptureSource::open(name, capacity)?;
             TrafficPipeline::spawn(source, proc_table, top_n).map_err(anyhow::Error::from)
         })
     }
@@ -72,8 +79,9 @@ impl TrafficSession {
     pub fn begin_activate(&mut self, selector: &str) -> Result<Activation> {
         let proc_table = self.proc_table.clone();
         let top_n = self.top_n;
+        let capacity = self.flow_table_capacity;
         self.begin_activate_with(selector, move |name| {
-            let source = CaptureSource::open(name)?;
+            let source = CaptureSource::open(name, capacity)?;
             TrafficPipeline::spawn(source, proc_table, top_n).map_err(anyhow::Error::from)
         })
     }
@@ -220,6 +228,7 @@ impl TrafficSession {
             interfaces,
             proc_table,
             top_n,
+            flow_table_capacity: crate::flow_table::DEFAULT_FLOW_TABLE_CAPACITY,
             active: Some(ActiveCapture {
                 interface: interface.to_string(),
                 pipeline,
