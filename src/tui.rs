@@ -20,6 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 
 use crate::capture::InterfaceInfo;
+use crate::palette;
 use crate::report::{fmt_elapsed, hostname, human_bytes, truncate};
 use crate::session::{Activation, TrafficSession};
 use crate::stats::{IpSnapshot, ProcessSnapshot, TrafficSnapshot};
@@ -87,22 +88,6 @@ impl LayoutMode {
     }
 }
 
-const COLOR_BG: Color = Color::Rgb(9, 13, 20);
-const COLOR_TEXT: Color = Color::Rgb(216, 224, 232);
-const COLOR_STRONG: Color = Color::Rgb(244, 247, 250);
-const COLOR_MUTED: Color = Color::Rgb(116, 129, 145);
-const COLOR_BORDER: Color = Color::Rgb(37, 53, 68);
-const COLOR_ACCENT: Color = Color::Rgb(255, 183, 3);
-const COLOR_ACCENT_DIM: Color = Color::Rgb(154, 111, 8);
-const COLOR_INBOUND: Color = Color::Rgb(255, 191, 36);
-const COLOR_OUTBOUND: Color = Color::Rgb(41, 197, 246);
-const COLOR_VIOLET: Color = Color::Rgb(167, 139, 250);
-const COLOR_CORAL: Color = Color::Rgb(251, 113, 133);
-const COLOR_SELECTION: Color = Color::Rgb(23, 43, 60);
-const COLOR_INBOUND_BORDER: Color = Color::Rgb(102, 80, 30);
-const COLOR_OUTBOUND_BORDER: Color = Color::Rgb(29, 86, 108);
-const COLOR_VIOLET_BORDER: Color = Color::Rgb(76, 65, 111);
-
 const MIN_TERMINAL_WIDTH: u16 = 60;
 const MIN_TERMINAL_HEIGHT: u16 = 16;
 
@@ -158,6 +143,12 @@ struct AppState {
     ip_out_view_height: usize,
     domain_view_height: usize,
     interface_selector: Option<InterfaceSelector>,
+    /// Whether the settings overlay is open.
+    settings_open: bool,
+    /// User-facing palette selection, adjusted in the settings overlay.
+    palette_choice: palette::PaletteChoice,
+    /// Terminal color tier detected at startup; `Auto` follows this.
+    detected_tier: palette::ColorTier,
 }
 
 impl AppState {
@@ -175,6 +166,9 @@ impl AppState {
             ip_out_view_height: 1,
             domain_view_height: 1,
             interface_selector: None,
+            settings_open: false,
+            palette_choice: palette::PaletteChoice::Auto,
+            detected_tier: palette::detect_tier(),
         }
     }
 
@@ -296,6 +290,39 @@ where
             }
             _ => KeyOutcome::Ignored,
         }
+    } else if state.settings_open {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('o') => {
+                state.settings_open = false;
+                KeyOutcome::Changed
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
+                state.palette_choice = next_palette_choice(state.palette_choice);
+                palette::set_active_tier(palette::resolve(
+                    state.palette_choice,
+                    state.detected_tier,
+                ));
+                KeyOutcome::Changed
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                state.palette_choice = prev_palette_choice(state.palette_choice);
+                palette::set_active_tier(palette::resolve(
+                    state.palette_choice,
+                    state.detected_tier,
+                ));
+                KeyOutcome::Changed
+            }
+            // j/k/Up/Down have no effect with a single adjustable option.
+            KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') => {
+                KeyOutcome::Ignored
+            }
+            // The overlay swallows all other keys so page shortcuts do not
+            // leak through while it is open.
+            _ => KeyOutcome::Ignored,
+        }
+    } else if key.code == KeyCode::Char('o') {
+        state.settings_open = true;
+        KeyOutcome::Changed
     } else if key.code == KeyCode::Char('i') {
         state.open_interface_selector(interfaces, active, true);
         KeyOutcome::Changed
@@ -331,6 +358,7 @@ fn finish_tui_activation(
 
 /// Run the TUI until the user quits.
 pub fn run(session: &mut TrafficSession) -> io::Result<()> {
+    palette::set_active_tier(palette::detect_tier());
     let started_at = Instant::now();
     let host = hostname();
     let mut snapshot = session
@@ -585,6 +613,50 @@ fn next_page(p: Page) -> Page {
     Page::ALL[(idx + 1) % Page::ALL.len()]
 }
 
+/// Palette choices in the order the settings overlay cycles through them.
+const PALETTE_CHOICES: [palette::PaletteChoice; 4] = [
+    palette::PaletteChoice::Auto,
+    palette::PaletteChoice::Truecolor,
+    palette::PaletteChoice::SixteenColor,
+    palette::PaletteChoice::Monochrome,
+];
+
+fn next_palette_choice(choice: palette::PaletteChoice) -> palette::PaletteChoice {
+    let idx = PALETTE_CHOICES
+        .iter()
+        .position(|candidate| *candidate == choice)
+        .unwrap_or(0);
+    PALETTE_CHOICES[(idx + 1) % PALETTE_CHOICES.len()]
+}
+
+fn prev_palette_choice(choice: palette::PaletteChoice) -> palette::PaletteChoice {
+    let idx = PALETTE_CHOICES
+        .iter()
+        .position(|candidate| *candidate == choice)
+        .unwrap_or(0);
+    let len = PALETTE_CHOICES.len();
+    PALETTE_CHOICES[(idx + len - 1) % len]
+}
+
+/// User-visible label for a palette choice, as shown in the settings overlay.
+fn palette_choice_label(choice: palette::PaletteChoice) -> &'static str {
+    match choice {
+        palette::PaletteChoice::Auto => "Auto",
+        palette::PaletteChoice::Truecolor => "truecolor",
+        palette::PaletteChoice::SixteenColor => "16-color",
+        palette::PaletteChoice::Monochrome => "monochrome",
+    }
+}
+
+/// User-visible label for a detected color tier.
+fn color_tier_label(tier: palette::ColorTier) -> &'static str {
+    match tier {
+        palette::ColorTier::Truecolor => "truecolor",
+        palette::ColorTier::Sixteen => "16-color",
+        palette::ColorTier::Monochrome => "monochrome",
+    }
+}
+
 impl AppState {
     fn current_view_height(&self) -> usize {
         match self.page {
@@ -725,7 +797,7 @@ fn draw_with_interfaces_at(
 ) {
     let area = f.area();
     f.render_widget(
-        Block::default().style(Style::default().fg(COLOR_TEXT).bg(COLOR_BG)),
+        Block::default().style(Style::default().fg(palette::text()).bg(palette::bg())),
         area,
     );
 
@@ -774,6 +846,10 @@ fn draw_with_interfaces_at(
         Page::About => draw_about(f, body),
     }
     draw_status_bar(f, chunks[2], state, mode);
+
+    if state.settings_open {
+        draw_settings(f, area, state);
+    }
 }
 
 fn interface_display_label(interface: Option<&str>, interfaces: &[InterfaceInfo]) -> String {
@@ -811,13 +887,13 @@ fn draw_interface_selector(
             Span::styled(
                 " delray ",
                 Style::default()
-                    .fg(COLOR_ACCENT)
+                    .fg(palette::accent())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 "Select an interface",
                 Style::default()
-                    .fg(COLOR_STRONG)
+                    .fg(palette::strong())
                     .add_modifier(Modifier::BOLD),
             ),
         ])),
@@ -828,7 +904,7 @@ fn draw_interface_selector(
     let rows = if interfaces.is_empty() {
         vec![
             Row::new(vec![Cell::from(""), Cell::from("No interfaces available")])
-                .style(Style::default().fg(COLOR_MUTED)),
+                .style(Style::default().fg(palette::muted())),
         ]
     } else {
         interfaces
@@ -869,7 +945,7 @@ fn draw_interface_selector(
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_VIOLET_BORDER));
+        .border_style(Style::default().fg(palette::violet_border()));
     let table = if compact {
         Table::new(rows, [Constraint::Length(3), Constraint::Min(1)])
     } else {
@@ -887,8 +963,8 @@ fn draw_interface_selector(
     .block(block)
     .row_highlight_style(
         Style::default()
-            .fg(COLOR_STRONG)
-            .bg(COLOR_SELECTION)
+            .fg(palette::strong())
+            .patch(palette::selection_style())
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol("> ");
@@ -914,9 +990,9 @@ fn draw_interface_selector(
     f.render_widget(
         Paragraph::new(hint)
             .style(Style::default().fg(if selector.error.is_some() {
-                COLOR_CORAL
+                palette::coral()
             } else {
-                COLOR_MUTED
+                palette::muted()
             }))
             .wrap(Wrap { trim: true }),
         chunks[2],
@@ -936,13 +1012,13 @@ fn draw_too_small(f: &mut ratatui::Frame, area: Rect) {
         Line::from(Span::styled(
             "delray",
             Style::default()
-                .fg(COLOR_ACCENT)
+                .fg(palette::accent())
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
             format!("Terminal too small (minimum {MIN_TERMINAL_WIDTH}x{MIN_TERMINAL_HEIGHT})"),
-            Style::default().fg(COLOR_MUTED),
+            Style::default().fg(palette::muted()),
         )),
     ];
     f.render_widget(
@@ -983,7 +1059,7 @@ fn navigation_line(page: Page, mode: LayoutMode) -> Line<'static> {
     let mut spans = vec![Span::styled(
         " delray ",
         Style::default()
-            .fg(COLOR_ACCENT)
+            .fg(palette::accent())
             .add_modifier(Modifier::BOLD),
     )];
     for candidate in Page::ALL {
@@ -1001,11 +1077,11 @@ fn navigation_line(page: Page, mode: LayoutMode) -> Line<'static> {
         };
         let style = if candidate == page {
             Style::default()
-                .fg(COLOR_STRONG)
-                .bg(Color::Rgb(43, 37, 15))
+                .fg(palette::strong())
+                .bg(palette::overview_highlight())
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(COLOR_MUTED)
+            Style::default().fg(palette::muted())
         };
         spans.push(Span::styled(label, style));
     }
@@ -1020,24 +1096,24 @@ fn runtime_line(
 ) -> Line<'static> {
     let mut spans = vec![
         Span::styled(" ", Style::default()),
-        Span::styled(interface.to_string(), Style::default().fg(COLOR_STRONG)),
+        Span::styled(interface.to_string(), Style::default().fg(palette::strong())),
     ];
     if mode == LayoutMode::Wide {
         spans.push(Span::styled("  ", Style::default()));
         spans.push(Span::styled(
             host.to_string(),
-            Style::default().fg(COLOR_STRONG),
+            Style::default().fg(palette::strong()),
         ));
     }
-    spans.push(Span::styled("  up ", Style::default().fg(COLOR_MUTED)));
+    spans.push(Span::styled("  up ", Style::default().fg(palette::muted())));
     spans.push(Span::styled(
         fmt_elapsed(started_at.elapsed()),
-        Style::default().fg(COLOR_STRONG),
+        Style::default().fg(palette::strong()),
     ));
     if mode != LayoutMode::Compact {
         spans.push(Span::styled(
             format!("  {}", chrono::Local::now().format("%H:%M:%S")),
-            Style::default().fg(COLOR_MUTED),
+            Style::default().fg(palette::muted()),
         ));
     }
     Line::from(spans)
@@ -1124,8 +1200,8 @@ fn draw_traffic(f: &mut ratatui::Frame, area: Rect, snapshot: &TrafficSnapshot) 
         "net",
         "Traffic",
         None,
-        COLOR_VIOLET,
-        COLOR_VIOLET_BORDER,
+        palette::violet(),
+        palette::violet_border(),
         None,
     );
     let inner = block.inner(area);
@@ -1135,21 +1211,21 @@ fn draw_traffic(f: &mut ratatui::Frame, area: Rect, snapshot: &TrafficSnapshot) 
     let lines = vec![
         traffic_line(
             "IN total",
-            COLOR_INBOUND,
+            palette::inbound(),
             ratio(snapshot.in_bytes, total),
             &human_bytes(snapshot.in_bytes),
             inner.width,
         ),
         traffic_line(
             "OUT total",
-            COLOR_OUTBOUND,
+            palette::outbound(),
             ratio(snapshot.out_bytes, total),
             &human_bytes(snapshot.out_bytes),
             inner.width,
         ),
         traffic_line(
             "Combined",
-            COLOR_ACCENT_DIM,
+            palette::accent_dim(),
             if total > 0 { 1.0 } else { 0.0 },
             &human_bytes(total),
             inner.width,
@@ -1176,9 +1252,9 @@ fn traffic_line(label: &str, color: Color, ratio: f64, value: &str, width: u16) 
         Span::styled("█".repeat(filled), Style::default().fg(color)),
         Span::styled(
             "─".repeat(bar_width.saturating_sub(filled)),
-            Style::default().fg(COLOR_BORDER),
+            Style::default().fg(palette::border()),
         ),
-        Span::styled(format!("  {value}"), Style::default().fg(COLOR_STRONG)),
+        Span::styled(format!("  {value}"), Style::default().fg(palette::strong())),
     ])
 }
 
@@ -1200,14 +1276,14 @@ fn panel_block(
         Span::styled(
             title.to_string(),
             Style::default()
-                .fg(COLOR_STRONG)
+                .fg(palette::strong())
                 .add_modifier(Modifier::BOLD),
         ),
     ];
     if let Some(count) = count {
         title_spans.push(Span::styled(
             format!(" {count} "),
-            Style::default().fg(COLOR_MUTED),
+            Style::default().fg(palette::muted()),
         ));
     } else {
         title_spans.push(Span::raw(" "));
@@ -1221,7 +1297,7 @@ fn panel_block(
         block = block.title_bottom(
             Line::from(Span::styled(
                 format!(" {footer} "),
-                Style::default().fg(COLOR_MUTED),
+                Style::default().fg(palette::muted()),
             ))
             .alignment(Alignment::Right),
         );
@@ -1239,7 +1315,7 @@ fn process_name_span(process: &ProcessSnapshot, max_chars: usize) -> Span<'stati
         Span::styled(
             name,
             Style::default()
-                .fg(Color::Yellow)
+                .fg(palette::warn())
                 .add_modifier(Modifier::ITALIC),
         )
     } else {
@@ -1258,14 +1334,14 @@ fn draw_process_preview(
         "proc",
         "Top Processes",
         Some(snapshot.processes.len()),
-        COLOR_CORAL,
-        COLOR_CORAL,
+        palette::coral(),
+        palette::coral(),
         Some(footer),
     );
     let table = process_table(snapshot, mode, block)
         .row_highlight_style(
             Style::default()
-                .bg(COLOR_SELECTION)
+                .patch(palette::selection_style())
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("> ");
@@ -1279,7 +1355,7 @@ fn process_table(
 ) -> Table<'static> {
     let compact = mode == LayoutMode::Compact;
     let rows = process_rows(snapshot, compact);
-    let header_style = Style::default().fg(COLOR_MUTED);
+    let header_style = Style::default().fg(palette::muted());
     let table = if compact {
         Table::new(
             rows,
@@ -1323,7 +1399,7 @@ fn process_rows(snapshot: &TrafficSnapshot, compact: bool) -> Vec<Row<'static>> 
                 Cell::from(""),
             ]
         };
-        return vec![Row::new(cells).style(Style::default().fg(COLOR_MUTED))];
+        return vec![Row::new(cells).style(Style::default().fg(palette::muted()))];
     }
 
     snapshot
@@ -1335,8 +1411,8 @@ fn process_rows(snapshot: &TrafficSnapshot, compact: bool) -> Vec<Row<'static>> 
                 Row::new(vec![
                     name,
                     Cell::from(human_bytes(process.sent))
-                        .style(Style::default().fg(COLOR_OUTBOUND)),
-                    Cell::from(human_bytes(process.recv)).style(Style::default().fg(COLOR_INBOUND)),
+                        .style(Style::default().fg(palette::outbound())),
+                    Cell::from(human_bytes(process.recv)).style(Style::default().fg(palette::inbound())),
                 ])
             } else {
                 Row::new(vec![
@@ -1347,11 +1423,11 @@ fn process_rows(snapshot: &TrafficSnapshot, compact: bool) -> Vec<Row<'static>> 
                             .map(|pid| pid.to_string())
                             .unwrap_or_else(|| "-".to_string()),
                     ),
-                    Cell::from(human_bytes(process.recv)).style(Style::default().fg(COLOR_INBOUND)),
+                    Cell::from(human_bytes(process.recv)).style(Style::default().fg(palette::inbound())),
                     Cell::from(human_bytes(process.sent))
-                        .style(Style::default().fg(COLOR_OUTBOUND)),
+                        .style(Style::default().fg(palette::outbound())),
                     Cell::from(human_bytes(process.total()))
-                        .style(Style::default().fg(COLOR_STRONG)),
+                        .style(Style::default().fg(palette::strong())),
                 ])
             }
         })
@@ -1392,14 +1468,14 @@ fn draw_processes(
         "proc",
         "Processes",
         Some(snapshot.processes.len()),
-        COLOR_CORAL,
-        COLOR_CORAL,
+        palette::coral(),
+        palette::coral(),
         Some(footer),
     );
     let table = process_table(snapshot, mode, block)
         .row_highlight_style(
             Style::default()
-                .bg(COLOR_SELECTION)
+                .patch(palette::selection_style())
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("> ");
@@ -1445,7 +1521,7 @@ fn draw_process_detail(
         lines.push(Line::from(Span::styled(
             "Tracking paused",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(palette::warn())
                 .add_modifier(Modifier::BOLD),
         )));
     }
@@ -1453,8 +1529,8 @@ fn draw_process_detail(
         "proc",
         "Process Details",
         None,
-        COLOR_CORAL,
-        COLOR_CORAL,
+        palette::coral(),
+        palette::coral(),
         None,
     );
     let paragraph = Paragraph::new(lines)
@@ -1500,15 +1576,15 @@ fn draw_ip_preview(f: &mut ratatui::Frame, area: Rect, snapshot: &TrafficSnapsho
 
 fn ip_theme(inbound: bool) -> (&'static str, &'static str, Color, Color) {
     if inbound {
-        ("in", "Inbound IPs", COLOR_INBOUND, COLOR_INBOUND_BORDER)
+        ("in", "Inbound IPs", palette::inbound(), palette::inbound_border())
     } else {
-        ("out", "Outbound IPs", COLOR_OUTBOUND, COLOR_OUTBOUND_BORDER)
+        ("out", "Outbound IPs", palette::outbound(), palette::outbound_border())
     }
 }
 
 fn ip_table(entries: &[IpSnapshot], color: Color, block: Block<'static>) -> Table<'static> {
     let rows = if entries.is_empty() {
-        vec![Row::new(vec!["No traffic observed", ""]).style(Style::default().fg(COLOR_MUTED))]
+        vec![Row::new(vec!["No traffic observed", ""]).style(Style::default().fg(palette::muted()))]
     } else {
         entries
             .iter()
@@ -1521,7 +1597,7 @@ fn ip_table(entries: &[IpSnapshot], color: Color, block: Block<'static>) -> Tabl
             .collect()
     };
     Table::new(rows, [Constraint::Min(20), Constraint::Length(14)])
-        .header(Row::new(vec!["Remote address", "Bytes"]).style(Style::default().fg(COLOR_MUTED)))
+        .header(Row::new(vec!["Remote address", "Bytes"]).style(Style::default().fg(palette::muted())))
         .column_spacing(1)
         .block(block)
 }
@@ -1596,14 +1672,14 @@ fn draw_ip_table(
         title,
         Some(entries.len()),
         color,
-        if focused { COLOR_CORAL } else { border },
+        if focused { palette::coral() } else { border },
         Some(selected_position(selected, entries.len())),
     );
     let table = ip_table(entries, color, block)
         .row_highlight_style(if focused {
             Style::default()
-                .fg(COLOR_STRONG)
-                .bg(COLOR_SELECTION)
+                .fg(palette::strong())
+                .patch(palette::selection_style())
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
@@ -1627,8 +1703,8 @@ fn draw_domain_preview(
         "dom",
         "Top Domains",
         Some(snapshot.outbound_domains.len()),
-        COLOR_VIOLET,
-        COLOR_VIOLET_BORDER,
+        palette::violet(),
+        palette::violet_border(),
         Some(footer),
     );
     let table = domain_table(snapshot, mode, block, now);
@@ -1654,14 +1730,14 @@ fn draw_domains(
         "dom",
         "Domains",
         Some(snapshot.outbound_domains.len()),
-        COLOR_VIOLET,
-        COLOR_VIOLET_BORDER,
+        palette::violet(),
+        palette::violet_border(),
         Some(footer),
     );
     let table = domain_table(snapshot, mode, block, now)
         .row_highlight_style(
             Style::default()
-                .bg(COLOR_SELECTION)
+                .patch(palette::selection_style())
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("> ");
@@ -1680,7 +1756,7 @@ fn domain_table(
 ) -> Table<'static> {
     let compact = mode == LayoutMode::Compact;
     let rows = domain_rows(snapshot, compact, now);
-    let header_style = Style::default().fg(COLOR_MUTED);
+    let header_style = Style::default().fg(palette::muted());
     let table = if compact {
         Table::new(
             rows,
@@ -1728,7 +1804,7 @@ fn domain_rows(
                 Cell::from(""),
             ]
         };
-        return vec![Row::new(cells).style(Style::default().fg(COLOR_MUTED))];
+        return vec![Row::new(cells).style(Style::default().fg(palette::muted()))];
     }
 
     snapshot
@@ -1741,18 +1817,18 @@ fn domain_rows(
                 Row::new(vec![
                     host,
                     Cell::from(human_bytes(domain.total_bytes()))
-                        .style(Style::default().fg(COLOR_STRONG)),
+                        .style(Style::default().fg(palette::strong())),
                     last_seen,
                 ])
             } else {
                 Row::new(vec![
                     host,
                     Cell::from(human_bytes(domain.in_bytes))
-                        .style(Style::default().fg(COLOR_INBOUND)),
+                        .style(Style::default().fg(palette::inbound())),
                     Cell::from(human_bytes(domain.out_bytes))
-                        .style(Style::default().fg(COLOR_OUTBOUND)),
+                        .style(Style::default().fg(palette::outbound())),
                     Cell::from(human_bytes(domain.total_bytes()))
-                        .style(Style::default().fg(COLOR_STRONG)),
+                        .style(Style::default().fg(palette::strong())),
                     last_seen,
                 ])
             }
@@ -1782,7 +1858,7 @@ fn draw_about(f: &mut ratatui::Frame, area: Rect) {
         .split(horizontal)[1];
     let frame = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(COLOR_BORDER));
+        .border_style(Style::default().fg(palette::border()));
     let content_area = frame.inner(frame_area);
     f.render_widget(frame, frame_area);
 
@@ -1790,22 +1866,95 @@ fn draw_about(f: &mut ratatui::Frame, area: Rect) {
         Line::from(Span::styled(
             "delray",
             Style::default()
-                .fg(COLOR_ACCENT)
+                .fg(palette::accent())
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
             "Network Traffic Analyzer",
-            Style::default().fg(COLOR_STRONG),
+            Style::default().fg(palette::strong()),
         )),
         Line::from(""),
         Line::from(Span::styled(
             format!("Version {version} ({commit})"),
-            Style::default().fg(COLOR_MUTED),
+            Style::default().fg(palette::muted()),
         )),
     ];
     let para = Paragraph::new(lines).alignment(Alignment::Center);
     f.render_widget(para, content_area);
+}
+
+/// Centered settings overlay: lets the user pick the active palette tier for
+/// the session. Drawn on top of the current page when `state.settings_open`.
+fn draw_settings(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    let popup = centered_rect(area, 60, 7);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette::accent()))
+        .title(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "Settings",
+                Style::default()
+                    .fg(palette::accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ]));
+    let detected_label = color_tier_label(state.detected_tier);
+    let choice_label = palette_choice_label(state.palette_choice);
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "Palette: ",
+                Style::default()
+                    .fg(palette::strong())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                choice_label.to_string(),
+                Style::default().fg(palette::accent()),
+            ),
+            Span::styled(
+                format!("  (detected: {detected_label})"),
+                Style::default().fg(palette::muted()),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "h/l change  o or Esc close",
+            Style::default().fg(palette::muted()),
+        )),
+    ];
+    let inner = block.inner(popup);
+    f.render_widget(
+        Block::default().style(Style::default().bg(palette::bg()).fg(palette::text())),
+        popup,
+    );
+    f.render_widget(block, popup);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Center a rect of `width_pct`% of `area`'s width and `height` rows, vertically
+/// and horizontally. Used for overlay popups.
+fn centered_rect(area: Rect, width_pct: u16, height: u16) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(LayoutDir::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(height),
+            Constraint::Fill(1),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(LayoutDir::Horizontal)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Percentage(width_pct),
+            Constraint::Fill(1),
+        ])
+        .split(popup_layout[1])[1]
 }
 
 fn draw_status_bar(f: &mut ratatui::Frame, area: Rect, state: &mut AppState, mode: LayoutMode) {
@@ -1816,7 +1965,7 @@ fn draw_status_bar(f: &mut ratatui::Frame, area: Rect, state: &mut AppState, mod
             (None, None) => "Esc:back  q:quit".to_string(),
         };
         f.render_widget(
-            Paragraph::new(format!(" {hint} ")).style(Style::default().fg(COLOR_MUTED)),
+            Paragraph::new(format!(" {hint} ")).style(Style::default().fg(palette::muted())),
             area,
         );
         if let Some(detail) = state.process_detail.as_mut() {
@@ -1829,6 +1978,7 @@ fn draw_status_bar(f: &mut ratatui::Frame, area: Rect, state: &mut AppState, mod
     push_hint(&mut spans, "i", "interface");
     push_hint(&mut spans, "1-5", "page");
     push_hint(&mut spans, "h/l", "switch");
+    push_hint(&mut spans, "o", ":settings");
     if state.page == Page::Ips {
         push_hint(&mut spans, "Tab", "panel");
     }
@@ -1853,10 +2003,10 @@ fn draw_status_bar(f: &mut ratatui::Frame, area: Rect, state: &mut AppState, mod
             Span::styled(
                 "q",
                 Style::default()
-                    .fg(COLOR_CORAL)
+                    .fg(palette::coral())
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(":quit ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(":quit ", Style::default().fg(palette::muted())),
         ]))
         .alignment(Alignment::Right),
         chunks[1],
@@ -1872,13 +2022,13 @@ fn push_hint(spans: &mut Vec<Span<'static>>, key: &str, action: &str) {
     spans.push(Span::styled(
         key.to_string(),
         Style::default()
-            .fg(COLOR_ACCENT)
+            .fg(palette::accent())
             .add_modifier(Modifier::BOLD),
     ));
     let separator = if action.starts_with(':') { "" } else { " " };
     spans.push(Span::styled(
         format!("{separator}{action}"),
-        Style::default().fg(COLOR_MUTED),
+        Style::default().fg(palette::muted()),
     ));
 }
 
@@ -3702,5 +3852,188 @@ mod tests {
         assert!(rendered.contains("PID: -"));
         assert!(rendered.contains("Path: -"));
         assert_unattributed_style(&terminal);
+    }
+
+    // --- settings overlay ---
+
+    fn send_key(state: &mut AppState, key: KeyCode) -> KeyOutcome {
+        handle_tui_key(
+            state,
+            KeyEvent::new(key, KeyModifiers::NONE),
+            &mut Arc::new(TrafficSnapshot::default()),
+            &interfaces(),
+            Some("eth0"),
+            |_| unreachable!(),
+        )
+    }
+
+    #[test]
+    fn o_key_opens_and_closes_the_settings_overlay() {
+        let mut state = AppState::new();
+        assert!(!state.settings_open);
+
+        assert_eq!(send_key(&mut state, KeyCode::Char('o')), KeyOutcome::Changed);
+        assert!(state.settings_open);
+
+        // 'o' toggles back off.
+        assert_eq!(send_key(&mut state, KeyCode::Char('o')), KeyOutcome::Changed);
+        assert!(!state.settings_open);
+
+        // Open again, then Esc closes.
+        send_key(&mut state, KeyCode::Char('o'));
+        assert!(state.settings_open);
+        assert_eq!(send_key(&mut state, KeyCode::Esc), KeyOutcome::Changed);
+        assert!(!state.settings_open);
+    }
+
+    #[test]
+    fn settings_overlay_renders_palette_row_and_hint() {
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::new();
+        state.settings_open = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("Settings"));
+        assert!(rendered.contains("Palette:"));
+        assert!(rendered.contains("h/l change  o or Esc close"));
+    }
+
+    #[test]
+    fn settings_overlay_is_not_rendered_when_closed() {
+        let snapshot = TrafficSnapshot::default();
+        let mut state = AppState::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(!rendered.contains("Settings"));
+    }
+
+    #[test]
+    fn overlay_h_and_l_cycle_palette_choice_in_opposite_directions() {
+        let mut state = AppState::new();
+        // Pin detected_tier to Truecolor so resolve(Auto, Truecolor) stays at
+        // Truecolor; the one-step cycle exercised here (Auto -> Truecolor)
+        // therefore leaves the global ACTIVE tier unchanged, avoiding
+        // interference with parallel tests. The full 4-step cycle (including
+        // SixteenColor/Monochrome) is covered by the pure-function test
+        // next_palette_choice_cycles_through_all_four_with_wraparound.
+        state.detected_tier = palette::ColorTier::Truecolor;
+        state.palette_choice = palette::PaletteChoice::Auto;
+
+        // Open the overlay; the default choice is Auto.
+        send_key(&mut state, KeyCode::Char('o'));
+        assert!(state.settings_open);
+
+        // 'l' advances Auto -> Truecolor (no tier change since detected=Truecolor).
+        assert_eq!(send_key(&mut state, KeyCode::Char('l')), KeyOutcome::Changed);
+        assert_eq!(state.palette_choice, palette::PaletteChoice::Truecolor);
+
+        // 'h' cycles backward. Start from Truecolor so the step stays
+        // side-effect-free: prev(Truecolor) == Auto and resolve(Auto,
+        // Truecolor) == Truecolor leaves the global ACTIVE tier untouched.
+        state.palette_choice = palette::PaletteChoice::Truecolor;
+        assert_eq!(send_key(&mut state, KeyCode::Char('h')), KeyOutcome::Changed);
+        assert_eq!(state.palette_choice, palette::PaletteChoice::Auto);
+
+        // Enter advances too (Auto -> Truecolor, still side-effect-free).
+        state.palette_choice = palette::PaletteChoice::Auto;
+        assert_eq!(send_key(&mut state, KeyCode::Enter), KeyOutcome::Changed);
+        assert_eq!(state.palette_choice, palette::PaletteChoice::Truecolor);
+    }
+
+    #[test]
+    fn overlay_swallows_page_keys_but_q_still_quits() {
+        let mut state = AppState::new();
+        send_key(&mut state, KeyCode::Char('o'));
+        assert!(state.settings_open);
+
+        // Tab/1-5/hjkl get swallowed by the overlay.
+        assert_eq!(
+            send_key(&mut state, KeyCode::Tab),
+            KeyOutcome::Ignored,
+        );
+        assert_eq!(
+            send_key(&mut state, KeyCode::Char('1')),
+            KeyOutcome::Ignored,
+        );
+        assert_eq!(state.page, Page::Overview);
+
+        // q still quits globally even with the overlay open.
+        assert_eq!(send_key(&mut state, KeyCode::Char('q')), KeyOutcome::Quit);
+    }
+
+    #[test]
+    fn palette_choice_and_tier_labels_match_the_adr_wording() {
+        assert_eq!(palette_choice_label(palette::PaletteChoice::Auto), "Auto");
+        assert_eq!(
+            palette_choice_label(palette::PaletteChoice::Truecolor),
+            "truecolor",
+        );
+        assert_eq!(
+            palette_choice_label(palette::PaletteChoice::SixteenColor),
+            "16-color",
+        );
+        assert_eq!(
+            palette_choice_label(palette::PaletteChoice::Monochrome),
+            "monochrome",
+        );
+
+        assert_eq!(color_tier_label(palette::ColorTier::Truecolor), "truecolor");
+        assert_eq!(color_tier_label(palette::ColorTier::Sixteen), "16-color");
+        assert_eq!(
+            color_tier_label(palette::ColorTier::Monochrome),
+            "monochrome",
+        );
+    }
+
+    #[test]
+    fn next_palette_choice_cycles_through_all_four_with_wraparound() {
+        use palette::PaletteChoice;
+        assert_eq!(
+            next_palette_choice(PaletteChoice::Auto),
+            PaletteChoice::Truecolor,
+        );
+        assert_eq!(
+            next_palette_choice(PaletteChoice::Truecolor),
+            PaletteChoice::SixteenColor,
+        );
+        assert_eq!(
+            next_palette_choice(PaletteChoice::SixteenColor),
+            PaletteChoice::Monochrome,
+        );
+        assert_eq!(
+            next_palette_choice(PaletteChoice::Monochrome),
+            PaletteChoice::Auto,
+        );
+    }
+
+    #[test]
+    fn prev_palette_choice_cycles_backward_through_all_four_with_wraparound() {
+        use palette::PaletteChoice;
+        assert_eq!(
+            prev_palette_choice(PaletteChoice::Auto),
+            PaletteChoice::Monochrome,
+        );
+        assert_eq!(
+            prev_palette_choice(PaletteChoice::Truecolor),
+            PaletteChoice::Auto,
+        );
+        assert_eq!(
+            prev_palette_choice(PaletteChoice::SixteenColor),
+            PaletteChoice::Truecolor,
+        );
+        assert_eq!(
+            prev_palette_choice(PaletteChoice::Monochrome),
+            PaletteChoice::SixteenColor,
+        );
     }
 }

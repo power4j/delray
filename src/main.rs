@@ -5,6 +5,7 @@ mod domain_parse_composite;
 mod domain_parse_http;
 mod domain_parse_tls;
 mod flow_table;
+mod palette;
 mod pipeline;
 mod proc_table;
 mod report;
