@@ -13,11 +13,9 @@
 //!   自然落到失败分支返回 `None`，匹配"只解析请求，匹配出站方向"。
 //! - 非 HTTP 字节、空 payload、解析错误统一返回 `None`。
 //!
-//! 04 票起由 [`CompositeDomainParser`] 在非 TLS 分支调用；生产路径不再使用
-//! [`NoopDomainParser`]。
+//! 04 票起由 [`CompositeDomainParser`] 在非 TLS 分支调用。
 //!
 //! [`CompositeDomainParser`]: crate::domain_parse_composite::CompositeDomainParser
-//! [`NoopDomainParser`]: crate::domain_parse::NoopDomainParser
 //! [`Status::Complete`]: httparse::Status::Complete
 //! [`Status::Partial`]: httparse::Status::Partial
 

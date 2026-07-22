@@ -6,25 +6,11 @@ use std::sync::Arc;
 /// capture 层只对出站方向且有 payload 的包调用此接口；解析结果通过
 /// [`crate::capture::Flow::domain`] 透传到聚合层，原始 payload 不出 capture 层。
 ///
-/// 具体的 TLS（02）/ HTTP（03）实现后续接入；本 trait 为它们预留稳定接口。
+/// 生产路径使用 [`CompositeDomainParser`]（04 票）；测试可注入实现此 trait 的
+/// 自定义桩（如 `capture::tests::RecordingParser`）控制解析行为。
+///
+/// [`CompositeDomainParser`]: crate::domain_parse_composite::CompositeDomainParser
 pub trait DomainParser: Send + Sync {
     /// 从 TCP payload 字节中解析目标域名；解析失败返回 `None`。
     fn parse_domain(&self, tcp_payload: &[u8]) -> Option<Arc<str>>;
-}
-
-/// 默认空实现：不做任何解析，总是返回 `None`。
-///
-/// 04 票起 production 路径改用 [`CompositeDomainParser`] + [`FlowTable`]，
-/// [`NoopDomainParser`] 保留为测试桩（例如验证"无解析时聚合层行为"）。
-///
-/// [`CompositeDomainParser`]: crate::domain_parse_composite::CompositeDomainParser
-/// [`FlowTable`]: crate::flow_table::FlowTable
-/// [`CaptureSource`]: crate::capture::CaptureSource
-#[allow(dead_code)]
-pub struct NoopDomainParser;
-
-impl DomainParser for NoopDomainParser {
-    fn parse_domain(&self, _tcp_payload: &[u8]) -> Option<Arc<str>> {
-        None
-    }
 }

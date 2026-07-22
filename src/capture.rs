@@ -213,7 +213,7 @@ impl CaptureSource {
 
     /// 与 [`open`](Self::open) 相同，但允许注入自定义 parser 与流表。
     ///
-    /// 用于测试：注入 [`crate::domain_parse::NoopDomainParser`] 可禁用解析；
+    /// 用于测试：注入自定义 [`DomainParser`]（如 `RecordingParser`）控制解析行为；
     /// 注入自定义流表可隔离测试状态。
     pub fn open_with_domain_parser(
         selector: &str,
