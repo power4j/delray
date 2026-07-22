@@ -852,15 +852,15 @@ fn draw_interface_selector(
                         Cell::from(format!("{}.", index + 1)),
                         Cell::from(format!(
                             "{}\n{}  {}",
-                            interface.description, interface.name, marker
+                            interface.name, interface.description, marker
                         )),
                     ])
                     .height(2)
                 } else {
                     Row::new(vec![
                         Cell::from(format!("{}.", index + 1)),
-                        Cell::from(interface.description.clone()),
                         Cell::from(interface.name.clone()),
+                        Cell::from(interface.description.clone()),
                         Cell::from(marker),
                     ])
                 }
@@ -877,8 +877,8 @@ fn draw_interface_selector(
             rows,
             [
                 Constraint::Length(3),
-                Constraint::Min(18),
                 Constraint::Min(50),
+                Constraint::Min(18),
                 Constraint::Length(24),
             ],
         )
@@ -1289,7 +1289,7 @@ fn process_table(
                 Constraint::Length(12),
             ],
         )
-        .header(Row::new(vec!["Process", "Sent", "Total"]).style(header_style))
+        .header(Row::new(vec!["Process", "Sent", "Recv"]).style(header_style))
     } else {
         Table::new(
             rows,
@@ -1336,8 +1336,7 @@ fn process_rows(snapshot: &TrafficSnapshot, compact: bool) -> Vec<Row<'static>> 
                     name,
                     Cell::from(human_bytes(process.sent))
                         .style(Style::default().fg(COLOR_OUTBOUND)),
-                    Cell::from(human_bytes(process.total()))
-                        .style(Style::default().fg(COLOR_STRONG)),
+                    Cell::from(human_bytes(process.recv)).style(Style::default().fg(COLOR_INBOUND)),
                 ])
             } else {
                 Row::new(vec![
@@ -2339,11 +2338,11 @@ mod tests {
 
         let rendered = rendered_lines(&terminal).join("\n");
         assert!(rendered.contains(pcap_name));
-        assert!(rendered.find("Npcap Adapter").unwrap() < rendered.find(pcap_name).unwrap());
+        assert!(rendered.find(pcap_name).unwrap() < rendered.find("Npcap Adapter").unwrap());
     }
 
     #[test]
-    fn selector_renders_friendly_name_before_pcap_name() {
+    fn selector_renders_pcap_name_before_friendly_name() {
         let pcap_name = r"\Device\NPF_{12345678-1234-1234-1234-123456789ABC}";
         let interfaces = vec![crate::capture::InterfaceInfo {
             name: pcap_name.to_string(),
@@ -2370,7 +2369,7 @@ mod tests {
 
         let rendered = rendered_lines(&terminal).join("\n");
         assert!(
-            rendered.find("Intel Ethernet Controller").unwrap() < rendered.find(pcap_name).unwrap()
+            rendered.find(pcap_name).unwrap() < rendered.find("Intel Ethernet Controller").unwrap()
         );
     }
 
