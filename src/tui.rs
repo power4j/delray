@@ -945,7 +945,7 @@ fn draw_interface_selector(
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette::violet_border()));
+        .border_style(Style::default().fg(palette::border()));
     let table = if compact {
         Table::new(rows, [Constraint::Length(3), Constraint::Min(1)])
     } else {
@@ -1201,7 +1201,7 @@ fn draw_traffic(f: &mut ratatui::Frame, area: Rect, snapshot: &TrafficSnapshot) 
         "Traffic",
         None,
         palette::violet(),
-        palette::violet_border(),
+        palette::border(),
         None,
     );
     let inner = block.inner(area);
@@ -1335,7 +1335,7 @@ fn draw_process_preview(
         "Top Processes",
         Some(snapshot.processes.len()),
         palette::coral(),
-        palette::coral(),
+        palette::border(),
         Some(footer),
     );
     let table = process_table(snapshot, mode, block)
@@ -1469,7 +1469,7 @@ fn draw_processes(
         "Processes",
         Some(snapshot.processes.len()),
         palette::coral(),
-        palette::coral(),
+        palette::border(),
         Some(footer),
     );
     let table = process_table(snapshot, mode, block)
@@ -1530,7 +1530,7 @@ fn draw_process_detail(
         "Process Details",
         None,
         palette::coral(),
-        palette::coral(),
+        palette::border(),
         None,
     );
     let paragraph = Paragraph::new(lines)
@@ -1561,24 +1561,24 @@ fn draw_ip_preview(f: &mut ratatui::Frame, area: Rect, snapshot: &TrafficSnapsho
     } else {
         snapshot.outbound_ips.as_ref()
     };
-    let (prefix, title, color, border) = ip_theme(inbound);
+    let (prefix, title, color) = ip_theme(inbound);
     let block = panel_block(
         prefix,
         title,
         Some(entries.len()),
         color,
-        border,
+        palette::border(),
         Some(preview_position(entries.len(), area.height)),
     );
     let table = ip_table(entries, color, block);
     f.render_widget(table, area);
 }
 
-fn ip_theme(inbound: bool) -> (&'static str, &'static str, Color, Color) {
+fn ip_theme(inbound: bool) -> (&'static str, &'static str, Color) {
     if inbound {
-        ("in", "Inbound IPs", palette::inbound(), palette::inbound_border())
+        ("in", "Inbound IPs", palette::inbound())
     } else {
-        ("out", "Outbound IPs", palette::outbound(), palette::outbound_border())
+        ("out", "Outbound IPs", palette::outbound())
     }
 }
 
@@ -1666,13 +1666,13 @@ fn draw_ip_table(
     focused: bool,
     selected: usize,
 ) {
-    let (prefix, title, color, border) = ip_theme(inbound);
+    let (prefix, title, color) = ip_theme(inbound);
     let block = panel_block(
         prefix,
         title,
         Some(entries.len()),
         color,
-        if focused { palette::coral() } else { border },
+        palette::border(),
         Some(selected_position(selected, entries.len())),
     );
     let table = ip_table(entries, color, block)
@@ -1704,7 +1704,7 @@ fn draw_domain_preview(
         "Top Domains",
         Some(snapshot.outbound_domains.len()),
         palette::violet(),
-        palette::violet_border(),
+        palette::border(),
         Some(footer),
     );
     let table = domain_table(snapshot, mode, block, now);
@@ -1731,7 +1731,7 @@ fn draw_domains(
         "Domains",
         Some(snapshot.outbound_domains.len()),
         palette::violet(),
-        palette::violet_border(),
+        palette::border(),
         Some(footer),
     );
     let table = domain_table(snapshot, mode, block, now)
