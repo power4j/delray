@@ -105,9 +105,6 @@ struct Palette {
     outbound: Color,
     violet: Color,
     coral: Color,
-    inbound_border: Color,
-    outbound_border: Color,
-    violet_border: Color,
     overview_highlight: Color,
     warn: Color,
 }
@@ -125,9 +122,6 @@ const TRUECOLOR: Palette = Palette {
     outbound: Color::Rgb(41, 197, 246),
     violet: Color::Rgb(167, 139, 250),
     coral: Color::Rgb(251, 113, 133),
-    inbound_border: Color::Rgb(102, 80, 30),
-    outbound_border: Color::Rgb(29, 86, 108),
-    violet_border: Color::Rgb(76, 65, 111),
     overview_highlight: Color::Rgb(43, 37, 15),
     warn: Color::Yellow,
 };
@@ -139,16 +133,13 @@ const SIXTEEN: Palette = Palette {
     text: Color::Reset,
     strong: Color::Reset,
     muted: Color::DarkGray,
-    border: Color::DarkGray,
+    border: Color::Gray,
     accent: Color::Yellow,
     accent_dim: Color::DarkGray,
     inbound: Color::Yellow,
     outbound: Color::Cyan,
     violet: Color::Magenta,
     coral: Color::Red,
-    inbound_border: Color::DarkGray,
-    outbound_border: Color::DarkGray,
-    violet_border: Color::DarkGray,
     overview_highlight: Color::DarkGray,
     warn: Color::Yellow,
 };
@@ -168,9 +159,6 @@ const MONOCHROME: Palette = Palette {
     outbound: Color::Reset,
     violet: Color::Reset,
     coral: Color::Reset,
-    inbound_border: Color::Reset,
-    outbound_border: Color::Reset,
-    violet_border: Color::Reset,
     overview_highlight: Color::Reset,
     warn: Color::Reset,
 };
@@ -238,15 +226,6 @@ pub(crate) fn violet() -> Color {
 }
 pub(crate) fn coral() -> Color {
     active().coral
-}
-pub(crate) fn inbound_border() -> Color {
-    active().inbound_border
-}
-pub(crate) fn outbound_border() -> Color {
-    active().outbound_border
-}
-pub(crate) fn violet_border() -> Color {
-    active().violet_border
 }
 pub(crate) fn overview_highlight() -> Color {
     active().overview_highlight
@@ -424,9 +403,6 @@ mod tests {
             MONOCHROME.outbound,
             MONOCHROME.violet,
             MONOCHROME.coral,
-            MONOCHROME.inbound_border,
-            MONOCHROME.outbound_border,
-            MONOCHROME.violet_border,
             MONOCHROME.overview_highlight,
             MONOCHROME.warn,
         ];
