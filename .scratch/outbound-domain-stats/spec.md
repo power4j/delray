@@ -40,18 +40,18 @@ delray 在 TCP 出站流量的连接级解析 TLS SNI（ClientHello）和明文 
 - **协议覆盖**：TCP 上的 TLS ClientHello SNI + 明文 HTTP/1.x 请求 Host 头。不做 QUIC/HTTP3（UDP）——QUIC Initial 加密，复杂度单独够一轮。
 - **ECH**：解析 ClientHello extensions 时检测 encrypted_server_name；ECH 流量标记 NoDomain、不进域名维度，避免掩护域名污染 top-N。
 - **独立维度**：出站域名是与进程、IP 并列的 top-N 维度，不绑定进程（域名×进程交叉留作后续增量）。
-- **连接级流表**：键为 5-tuple（本机 IP、本机端口、peer IP、peer端口、协议），值为域名。capture 层解析首包填表，后续包按连接查表累计。
+- **连接级流表**：键为 4 字段 FlowKey（local_ip / local_port / peer_ip / peer_port）+ TCP 隐含过滤（仅 TCP 流进表，协议固定 TCP，等价 5-tuple），值为域名。capture 层解析首包填表，后续包按连接查表累计。
 - **双向统计**：已识别连接的双向流量（in + out）都归该域名。
 - **不设未归属域名**：未识别流量不进出站域名维度；用户对照接口流量看识别比例。流表淘汰的连接后续流量同样不进维度。
 - **解析位置**：capture 层对流表未命中连接的**首个有 payload 出站包**解析一次；Flow 扩展带 `domain: Option<Arc<str>>`，不传 raw payload（性能：避免每包传 2KB）。
 - **解析失败**：TCP 顺序保证首包即应用层首包；首包解析失败则标记该连接 NoDomain，后续包不再试。
-- **流表项状态**：Pending（首包未到）/ Resolved(域名) / NoDomain（首包解析失败或 ECH）。
+- **流表项状态**：Resolved(域名) / NoDomain（首包解析失败或 ECH）。无 Pending 状态——表中无项即表示"未解析过"，调用方同步执行首包解析后直接写入 Resolved/NoDomain，简化状态机。
 - **流表边界**：默认上限 65536 条（~6MB）；新增 `--flow-table <N>` CLI 参数可调；空闲超时 5 分钟 + 表满 LRU 兜底；不做 TCP 状态追踪（FIN/RST），接受低概率 5-tuple 复用误归属。
 - **缓存库**：用 `moka 0.12`（`default-features = false, features = ["sync"]`），原生提供 `max_capacity` + `time_to_idle`（对应空闲 5 分钟淘汰），sync 模式不引入 tokio/async runtime；不手写淘汰逻辑。
 - **解析库**：TLS 用 `tls-parser 0.12`（唯一同时暴露 SNI 解析 `parse_tls_extension_sni` 和 ECH 检测 `parse_tls_extension_encrypted_server_name` 的现成库；rustls 不暴露原始 extensions 且引入 aws-lc-rs C 依赖，不选；etherparse 不解析 TLS 层）；HTTP/1.x 用 `httparse 1.10`（零依赖、原生处理 `Status::Partial`）；etherparse（已有）负责切到 TCP payload。
 - **TUI 输出**：新增 Domains 页（第 4 页，About 顺延第 5）；复用 `--top-n`；列 `Host / In / Out / Total / Last seen`；无未归属行。
 - **Overview 布局**：重排为行式——Wide/Standard 模式 `Traffic / [Process | Domain] / [Inbound IP | Outbound IP]`（两列等宽），Compact 模式 `Traffic / Process / Domain / Inbound IP`（单列堆叠）；新增 domain preview（Top Domains，按高度裁剪）。
-- **plain/JSON 输出**：加 `top_hosts` 段，字段 `host / in_bytes / out_bytes / total_bytes / last_seen`；last_seen 在 JSON 用 RFC 3339、plain 用 ISO 8601、TUI 用相对时间（与进程/IP 维度一致）。
+- **plain/JSON 输出**：加 `top_hosts` 段，字段 `host / in_bytes / out_bytes / total_bytes / last_seen`；last_seen 在 plain 与 JSON 都用 RFC 3339（chrono `to_rfc3339`，RFC 3339 是 ISO 8601 子集，与进程/IP 维度一致）、TUI 用相对时间。
 - **默认开启**：域名解析默认开启，不加开关参数。
 - **术语**：CONTEXT.md 已定义"出站域名（Outbound Domain）"。
 
