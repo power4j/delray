@@ -64,12 +64,13 @@ impl DomainParser for CompositeDomainParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain_parse_tls::test_fixtures::*;
 
     // ── 路由分支 ─────────────────────────────────────────────────────
 
     #[test]
     fn routes_tls_payload_to_tls_parser() {
-        let record = tls_record_with_sni("example.com");
+        let record = tls_client_hello_with_sni("example.com");
 
         let domain = CompositeDomainParser::new()
             .parse_domain(&record)
@@ -100,7 +101,7 @@ mod tests {
     fn returns_none_for_ech_tls_payload() {
         // ECH extension 的 TLS ClientHello 由 TLS 分支处理并返回 None
         // （tls-parser 已识别 ECH 并丢弃外层 SNI，见 02 票测试）。
-        let record = tls_record_with_ech();
+        let record = tls_client_hello_with_ech();
 
         assert!(CompositeDomainParser::new().parse_domain(&record).is_none());
     }
@@ -123,87 +124,5 @@ mod tests {
         // httparse 对响应行格式解析失败 → None。
         let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
         assert!(CompositeDomainParser::new().parse_domain(resp).is_none());
-    }
-
-    // ── Fixture（与 domain_parse_tls.rs 同样的 wire 格式构造法） ──────
-
-    fn tls_record_with_sni(name: &str) -> Vec<u8> {
-        let body = client_hello_body(Some(name), &[]);
-        wrap_handshake_record(&body)
-    }
-
-    fn tls_record_with_ech() -> Vec<u8> {
-        let ech_ext = raw_extension(0xFE0D, &[0xDE, 0xAD, 0xBE, 0xEF]);
-        let body = client_hello_body(Some("cover.example"), &[ech_ext]);
-        wrap_handshake_record(&body)
-    }
-
-    fn tls_record(content_type: u8, payload: &[u8]) -> Vec<u8> {
-        let mut record = Vec::with_capacity(5 + payload.len());
-        record.push(content_type);
-        record.extend_from_slice(&[0x03, 0x01]);
-        record.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        record.extend_from_slice(payload);
-        record
-    }
-
-    fn wrap_handshake_record(handshake_msg: &[u8]) -> Vec<u8> {
-        tls_record(0x16, handshake_msg)
-    }
-
-    fn handshake_msg(msg_type: u8, body: &[u8]) -> Vec<u8> {
-        let len = body.len() as u32;
-        let mut msg = Vec::with_capacity(4 + body.len());
-        msg.push(msg_type);
-        msg.push((len >> 16) as u8);
-        msg.push((len >> 8) as u8);
-        msg.push(len as u8);
-        msg.extend_from_slice(body);
-        msg
-    }
-
-    fn client_hello_body(sni: Option<&str>, extra_extensions: &[Vec<u8>]) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(&[0x03, 0x03]); // version TLS 1.2
-        body.extend_from_slice(&[0u8; 32]); // random
-        body.push(0x00); // session_id
-        body.extend_from_slice(&[0x00, 0x02, 0x00, 0x2F]); // cipher_suites
-        body.push(0x01); // compression_methods length
-        body.push(0x00); // null
-
-        let mut ext_buf = Vec::new();
-        if let Some(name) = sni {
-            ext_buf.extend_from_slice(&sni_extension(name));
-        }
-        for ext in extra_extensions {
-            ext_buf.extend_from_slice(ext);
-        }
-        if !ext_buf.is_empty() {
-            body.extend_from_slice(&(ext_buf.len() as u16).to_be_bytes());
-            body.extend_from_slice(&ext_buf);
-        }
-        handshake_msg(0x01, &body)
-    }
-
-    fn sni_extension(name: &str) -> Vec<u8> {
-        let name_bytes = name.as_bytes();
-        let list_len = 1 + 2 + name_bytes.len();
-        let ext_data_len = 2 + list_len;
-        let mut ext = Vec::new();
-        ext.extend_from_slice(&[0x00, 0x00]); // type: server_name
-        ext.extend_from_slice(&(ext_data_len as u16).to_be_bytes());
-        ext.extend_from_slice(&(list_len as u16).to_be_bytes());
-        ext.push(0x00); // host_name
-        ext.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
-        ext.extend_from_slice(name_bytes);
-        ext
-    }
-
-    fn raw_extension(ext_type: u16, data: &[u8]) -> Vec<u8> {
-        let mut ext = Vec::with_capacity(4 + data.len());
-        ext.extend_from_slice(&ext_type.to_be_bytes());
-        ext.extend_from_slice(&(data.len() as u16).to_be_bytes());
-        ext.extend_from_slice(data);
-        ext
     }
 }

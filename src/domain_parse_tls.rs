@@ -101,8 +101,136 @@ fn extract_sni(extensions: &[TlsExtension<'_>]) -> Option<Arc<str>> {
     None
 }
 
+/// 共享的 TLS ClientHello wire 构造器（测试 fixture）。
+///
+/// 手工构造 TLS 记录字节，避免依赖外部 pcap 文件；所有 fixture 使用 TLS 1.2
+/// ClientHello 骨架（TLS 1.3 的 SNI/ECH 字段位置一致）。供本模块 tests、
+/// `domain_parse_composite::tests`、`capture::tests::perf_benches` 共用——
+/// 任何 TLS wire 构造需求都通过此模块统一，避免 3 处复制。
+#[cfg(test)]
+pub mod test_fixtures {
+    /// 构造 TLS record：`content_type(1) | version(2) | length(2) | payload`。
+    pub fn tls_record(content_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut record = Vec::with_capacity(5 + payload.len());
+        record.push(content_type);
+        record.extend_from_slice(&[0x03, 0x01]); // record version: TLS 1.0
+        record.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        record.extend_from_slice(payload);
+        record
+    }
+
+    /// 构造 ContentType=Handshake(0x16) 的 TLS record，payload 为 handshake msg。
+    pub fn tls_record_handshake(handshake_msg: &[u8]) -> Vec<u8> {
+        tls_record(0x16, handshake_msg)
+    }
+
+    /// 构造 handshake 消息：`msg_type(1) | length(3) | body`。
+    pub fn handshake_msg(msg_type: u8, body: &[u8]) -> Vec<u8> {
+        let len = body.len() as u32;
+        let mut msg = Vec::with_capacity(4 + body.len());
+        msg.push(msg_type);
+        msg.push((len >> 16) as u8);
+        msg.push((len >> 8) as u8);
+        msg.push(len as u8);
+        msg.extend_from_slice(body);
+        msg
+    }
+
+    /// 构造 ClientHello body（handshake type=0x01 的 payload），可选 SNI 和
+    /// 额外 extensions。
+    pub fn client_hello_body(sni: Option<&str>, extra_extensions: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = Vec::new();
+        // version: TLS 1.2
+        body.extend_from_slice(&[0x03, 0x03]);
+        // random: 32 个零
+        body.extend_from_slice(&[0u8; 32]);
+        // session_id: 空
+        body.push(0x00);
+        // cipher_suites: 一个套件
+        body.extend_from_slice(&[0x00, 0x02]); // length=2
+        body.extend_from_slice(&[0x00, 0x2F]); // TLS_RSA_WITH_AES_128_CBC_SHA
+        // compression_methods: null
+        body.push(0x01); // length=1
+        body.push(0x00); // null
+
+        // 组装 extensions
+        let mut extensions_buf = Vec::new();
+        if let Some(name) = sni {
+            extensions_buf.extend_from_slice(&sni_extension(name));
+        }
+        for ext in extra_extensions {
+            extensions_buf.extend_from_slice(ext);
+        }
+
+        if !extensions_buf.is_empty() {
+            body.extend_from_slice(&(extensions_buf.len() as u16).to_be_bytes());
+            body.extend_from_slice(&extensions_buf);
+        }
+
+        // 包装成 handshake msg (type=0x01)
+        handshake_msg(0x01, &body)
+    }
+
+    /// 构造 SNI extension（type=0x0000，单个 host_name 条目）。
+    pub fn sni_extension(hostname: &str) -> Vec<u8> {
+        let name = hostname.as_bytes();
+        let name_len = name.len();
+        let list_len = 1 + 2 + name_len; // name_type + name_length + name
+        let ext_data_len = 2 + list_len; // server_name_list_length + list
+
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&[0x00, 0x00]); // type: server_name
+        ext.extend_from_slice(&(ext_data_len as u16).to_be_bytes());
+        ext.extend_from_slice(&(list_len as u16).to_be_bytes()); // server_name_list_length
+        ext.push(0x00); // name_type: host_name
+        ext.extend_from_slice(&(name_len as u16).to_be_bytes());
+        ext.extend_from_slice(name);
+        ext
+    }
+
+    /// 构造任意 extension：`type(2) | length(2) | data`。
+    pub fn build_raw_extension(ext_type: u16, data: &[u8]) -> Vec<u8> {
+        let mut ext = Vec::with_capacity(4 + data.len());
+        ext.extend_from_slice(&ext_type.to_be_bytes());
+        ext.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        ext.extend_from_slice(data);
+        ext
+    }
+
+    /// 构造合法的 draft-ietf-tls-esni EncryptedServerName 数据。
+    ///
+    /// 字段顺序（来自 tls-parser 源码 parse_tls_extension_encrypted_server_name）：
+    /// ciphersuite(2) | group(2) | key_share<2+> | record_digest<2+> | encrypted_sni<2+>
+    pub fn valid_draft_ech_data() -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x01]); // ciphersuite
+        data.extend_from_slice(&[0x00, 0x17]); // group: x25519
+        data.extend_from_slice(&[0x00, 0x01, 0xAA]); // key_share: len=1
+        data.extend_from_slice(&[0x00, 0x01, 0xBB]); // record_digest: len=1
+        data.extend_from_slice(&[0x00, 0x01, 0xCC]); // encrypted_sni: len=1
+        data
+    }
+
+    /// 构造含 SNI 的完整 TLS ClientHello handshake record（便捷封装）。
+    pub fn tls_client_hello_with_sni(name: &str) -> Vec<u8> {
+        let body = client_hello_body(Some(name), &[]);
+        tls_record_handshake(&body)
+    }
+
+    /// 构造含 ECH extension（RFC 9849 0xFE0D）的完整 TLS ClientHello handshake record。
+    ///
+    /// 用于测试 ECH 路径——外层 SNI 用掩护域名 "cover.example"。需要 draft
+    /// (0xFFCE) 或自定义字节时直接组合 `client_hello_body` + `build_raw_extension`。
+    pub fn tls_client_hello_with_ech() -> Vec<u8> {
+        let ech_ext = build_raw_extension(0xFE0D, &[0xDE, 0xAD, 0xBE, 0xEF]);
+        let body = client_hello_body(Some("cover.example"), &[ech_ext]);
+        tls_record_handshake(&body)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_fixtures::*;
     use super::*;
 
     // ── 成功路径 ────────────────────────────────────────────────────────
@@ -232,112 +360,5 @@ mod tests {
         let record = tls_record(0x17, &payload);
 
         assert!(TlsDomainParser::new().parse_domain(&record).is_none());
-    }
-
-    // ── Fixture 构造 ───────────────────────────────────────────────────
-    //
-    // 手工构造 TLS 记录字节，避免依赖外部 pcap 文件。所有 fixture 使用 TLS 1.2
-    // ClientHello 骨架（TLS 1.3 的 SNI/ECH 字段位置一致）。
-
-    /// 构造 TLS record：`content_type(1) | version(2) | length(2) | payload`。
-    fn tls_record(content_type: u8, payload: &[u8]) -> Vec<u8> {
-        let mut record = Vec::with_capacity(5 + payload.len());
-        record.push(content_type);
-        record.extend_from_slice(&[0x03, 0x01]); // record version: TLS 1.0
-        record.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        record.extend_from_slice(payload);
-        record
-    }
-
-    /// 构造 ContentType=Handshake(0x16) 的 TLS record，payload 为 handshake msg。
-    fn tls_record_handshake(handshake_msg: &[u8]) -> Vec<u8> {
-        tls_record(0x16, handshake_msg)
-    }
-
-    /// 构造 handshake 消息：`msg_type(1) | length(3) | body`。
-    fn handshake_msg(msg_type: u8, body: &[u8]) -> Vec<u8> {
-        let len = body.len() as u32;
-        let mut msg = Vec::with_capacity(4 + body.len());
-        msg.push(msg_type);
-        msg.push((len >> 16) as u8);
-        msg.push((len >> 8) as u8);
-        msg.push(len as u8);
-        msg.extend_from_slice(body);
-        msg
-    }
-
-    /// 构造 ClientHello body（handshake type=0x01 的 payload），可选 SNI 和
-    /// 额外 extensions。
-    fn client_hello_body(sni: Option<&str>, extra_extensions: &[Vec<u8>]) -> Vec<u8> {
-        let mut body = Vec::new();
-        // version: TLS 1.2
-        body.extend_from_slice(&[0x03, 0x03]);
-        // random: 32 个零
-        body.extend_from_slice(&[0u8; 32]);
-        // session_id: 空
-        body.push(0x00);
-        // cipher_suites: 一个套件
-        body.extend_from_slice(&[0x00, 0x02]); // length=2
-        body.extend_from_slice(&[0x00, 0x2F]); // TLS_RSA_WITH_AES_128_CBC_SHA
-        // compression_methods: null
-        body.push(0x01); // length=1
-        body.push(0x00); // null
-
-        // 组装 extensions
-        let mut extensions_buf = Vec::new();
-        if let Some(name) = sni {
-            extensions_buf.extend_from_slice(&sni_extension(name));
-        }
-        for ext in extra_extensions {
-            extensions_buf.extend_from_slice(ext);
-        }
-
-        if !extensions_buf.is_empty() {
-            body.extend_from_slice(&(extensions_buf.len() as u16).to_be_bytes());
-            body.extend_from_slice(&extensions_buf);
-        }
-
-        // 包装成 handshake msg (type=0x01)
-        handshake_msg(0x01, &body)
-    }
-
-    /// 构造 SNI extension（type=0x0000，单个 host_name 条目）。
-    fn sni_extension(hostname: &str) -> Vec<u8> {
-        let name = hostname.as_bytes();
-        let name_len = name.len();
-        let list_len = 1 + 2 + name_len; // name_type + name_length + name
-        let ext_data_len = 2 + list_len; // server_name_list_length + list
-
-        let mut ext = Vec::new();
-        ext.extend_from_slice(&[0x00, 0x00]); // type: server_name
-        ext.extend_from_slice(&(ext_data_len as u16).to_be_bytes());
-        ext.extend_from_slice(&(list_len as u16).to_be_bytes()); // server_name_list_length
-        ext.push(0x00); // name_type: host_name
-        ext.extend_from_slice(&(name_len as u16).to_be_bytes());
-        ext.extend_from_slice(name);
-        ext
-    }
-
-    /// 构造任意 extension：`type(2) | length(2) | data`。
-    fn build_raw_extension(ext_type: u16, data: &[u8]) -> Vec<u8> {
-        let mut ext = Vec::with_capacity(4 + data.len());
-        ext.extend_from_slice(&ext_type.to_be_bytes());
-        ext.extend_from_slice(&(data.len() as u16).to_be_bytes());
-        ext.extend_from_slice(data);
-        ext
-    }
-
-    /// 构造合法的 draft-ietf-tls-esni EncryptedServerName 数据。
-    ///
-    /// 字段顺序（来自 tls-parser 源码 parse_tls_extension_encrypted_server_name）：
-    /// ciphersuite(2) | group(2) | key_share<2+> | record_digest<2+> | encrypted_sni<2+>
-    fn valid_draft_ech_data() -> Vec<u8> {
-        let mut data = Vec::new();
-        data.extend_from_slice(&[0x00, 0x01]); // ciphersuite
-        data.extend_from_slice(&[0x00, 0x17]); // group: x25519
-        data.extend_from_slice(&[0x00, 0x01, 0xAA]); // key_share: len=1
-        data.extend_from_slice(&[0x00, 0x01, 0xBB]); // record_digest: len=1
-        data.extend_from_slice(&[0x00, 0x01, 0xCC]); // encrypted_sni: len=1
-        data
     }
 }

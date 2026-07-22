@@ -1759,6 +1759,7 @@ mod tests {
 
         use super::*;
         use crate::domain_parse_composite::CompositeDomainParser;
+        use crate::domain_parse_tls::test_fixtures;
         use crate::flow_table::{FlowEntry, FlowKey, FlowTable};
 
         /// 场景 1：每包热路径——单连接后续包命中 Resolved 流表项。
@@ -1831,7 +1832,9 @@ mod tests {
             let parser = CompositeDomainParser::new();
             let local_ips = HashSet::from([IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]);
             // 用真实的 TLS ClientHello（含 SNI）payload，包在出站 TCP 帧里。
-            let packet = outbound_tcp_ethernet_frame(&tls_client_hello_with_sni(b"example.com"));
+            let packet = outbound_tcp_ethernet_frame(&test_fixtures::tls_client_hello_with_sni(
+                "example.com",
+            ));
 
             const N: usize = 10_000;
             let start = Instant::now();
@@ -1922,61 +1925,6 @@ mod tests {
                 lookups_per_sec > 100_000.0,
                 "大表查表吞吐 {lookups_per_sec:.0} lookups/sec 应大于 100k"
             );
-        }
-
-        // ── TLS ClientHello wire 构造（与 domain_parse_tls.rs fixture 类似） ──
-
-        fn tls_client_hello_with_sni(name: &[u8]) -> Vec<u8> {
-            let body = client_hello_body(name);
-            wrap_handshake_record(&body)
-        }
-
-        fn client_hello_body(sni_name: &[u8]) -> Vec<u8> {
-            let mut body = Vec::new();
-            body.extend_from_slice(&[0x03, 0x03]); // version TLS 1.2
-            body.extend_from_slice(&[0u8; 32]); // random
-            body.push(0x00); // session_id length
-            body.extend_from_slice(&[0x00, 0x02, 0x00, 0x2F]); // cipher_suites
-            body.push(0x01); // compression_methods length
-            body.push(0x00); // null
-            // extensions: SNI
-            let sni = sni_extension(sni_name);
-            body.extend_from_slice(&(sni.len() as u16).to_be_bytes());
-            body.extend_from_slice(&sni);
-            handshake_msg(0x01, &body)
-        }
-
-        fn sni_extension(name: &[u8]) -> Vec<u8> {
-            let list_len = 1 + 2 + name.len();
-            let ext_data_len = 2 + list_len;
-            let mut ext = Vec::new();
-            ext.extend_from_slice(&[0x00, 0x00]); // type: server_name
-            ext.extend_from_slice(&(ext_data_len as u16).to_be_bytes());
-            ext.extend_from_slice(&(list_len as u16).to_be_bytes());
-            ext.push(0x00); // host_name
-            ext.extend_from_slice(&(name.len() as u16).to_be_bytes());
-            ext.extend_from_slice(name);
-            ext
-        }
-
-        fn handshake_msg(msg_type: u8, body: &[u8]) -> Vec<u8> {
-            let len = body.len() as u32;
-            let mut msg = Vec::with_capacity(4 + body.len());
-            msg.push(msg_type);
-            msg.push((len >> 16) as u8);
-            msg.push((len >> 8) as u8);
-            msg.push(len as u8);
-            msg.extend_from_slice(body);
-            msg
-        }
-
-        fn wrap_handshake_record(handshake_msg: &[u8]) -> Vec<u8> {
-            let mut record = Vec::with_capacity(5 + handshake_msg.len());
-            record.push(0x16); // ContentType: Handshake
-            record.extend_from_slice(&[0x03, 0x01]); // version TLS 1.0
-            record.extend_from_slice(&(handshake_msg.len() as u16).to_be_bytes());
-            record.extend_from_slice(handshake_msg);
-            record
         }
     }
 }
