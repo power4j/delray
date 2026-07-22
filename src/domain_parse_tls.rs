@@ -8,10 +8,6 @@
 //!
 //! [`CompositeDomainParser`]: crate::domain_parse_composite::CompositeDomainParser
 
-// 04 票起 TlsDomainParser 经 CompositeDomainParser 接入 CaptureSource；本模块的
-// 类型与函数仍可能仅在复合 parser 路径中可见，保留 dead_code 允许。
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use tls_parser::{

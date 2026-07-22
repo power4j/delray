@@ -19,10 +19,6 @@
 //! [`Status::Complete`]: httparse::Status::Complete
 //! [`Status::Partial`]: httparse::Status::Partial
 
-// 04 票起 HttpDomainParser 经 CompositeDomainParser 接入 CaptureSource；本模块的
-// 类型与函数仍可能仅在复合 parser 路径中可见，保留 dead_code 允许。
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use httparse::{EMPTY_HEADER, Request, Status};
