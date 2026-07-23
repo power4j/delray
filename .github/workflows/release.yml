@@ -12,11 +12,6 @@ on:
           - patch
           - minor
           - major
-      test_mode:
-        description: Run the patch-only release test on gh-ci
-        required: true
-        type: boolean
-        default: false
 
 concurrency:
   group: delray-release
@@ -51,16 +46,8 @@ jobs:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
       - name: Ensure release branch is allowed
-        env:
-          BUMP: ${{ inputs.bump }}
-          TEST_MODE: ${{ inputs.test_mode }}
         run: |
-          if [[ "$TEST_MODE" == "true" ]]; then
-            test "$RELEASE_BRANCH" = "gh-ci"
-            test "$BUMP" = "patch"
-          else
-            test "$RELEASE_BRANCH" = "main"
-          fi
+          test "$RELEASE_BRANCH" = "main"
           git fetch origin "$RELEASE_BRANCH" --tags
           git checkout --detach "origin/$RELEASE_BRANCH"
           test -z "$(git status --porcelain)"
