@@ -1,0 +1,291 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump applied to the current Cargo version
+        required: true
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+concurrency:
+  group: delray-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: 1.88.0
+  CARGO_EDIT_VERSION: 0.13.13
+  CARGO_ZIGBUILD_VERSION: 0.23.0
+  ZIG_VERSION: 0.15.0
+  NPCAP_SDK_VERSION: 1.16
+  NPCAP_SDK_URL: https://npcap.com/dist/npcap-sdk-1.16.zip
+  NPCAP_SDK_SHA256: F0A8BE7778EE3AE1B99BBBECB27A3FF0F6C111A4093F1C78C5C5A099607184DB
+
+jobs:
+  prepare:
+    name: prepare-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      base_sha: ${{ steps.version.outputs.base_sha }}
+      base_version: ${{ steps.version.outputs.base_version }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Ensure release starts from main
+        run: |
+          test "${GITHUB_REF_NAME}" = "main"
+          git fetch origin main --tags
+          git checkout --detach origin/main
+          test -z "$(git status --porcelain)"
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Install cargo-edit
+        run: cargo install cargo-edit --version "$CARGO_EDIT_VERSION" --locked
+      - name: Calculate release version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          base_sha="$(git rev-parse HEAD)"
+          base_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "delray") | .version')"
+          cargo set-version --bump "$BUMP"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "delray") | .version')"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          lock_version="$(awk '/name = "delray"/ { getline; print $3; exit }' Cargo.lock | tr -d '"')"
+          test "$lock_version" = "$version"
+          cargo metadata --locked --no-deps --format-version 1 >/dev/null
+          {
+            echo "base_sha=$base_sha"
+            echo "base_version=$base_version"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    name: build-linux
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          fetch-depth: 0
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-rust-${{ env.RUST_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-rust-${{ env.RUST_VERSION }}-
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libpcap-dev
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install cargo-edit and cargo-zigbuild
+        run: |
+          cargo install cargo-edit --version "$CARGO_EDIT_VERSION" --locked
+          cargo install cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION" --locked
+      - name: Apply release version
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: cargo set-version "$RELEASE_VERSION"
+      - name: Build Linux distribution binary
+        run: cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.28
+      - name: Verify Linux binary baseline
+        run: |
+          binary=target/x86_64-unknown-linux-gnu/release/delray
+          test -x "$binary"
+          readelf -d "$binary" | grep -q 'libpcap.so'
+          max_glibc="$(readelf --version-info "$binary" | grep -oE 'GLIBC_[0-9.]+' | sed 's/GLIBC_//' | sort -V | tail -1)"
+          test "$(printf '%s\n' "$max_glibc" "2.28" | sort -V | tail -1)" = "2.28"
+      - name: Package Linux binary
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p dist
+          tar -C target/x86_64-unknown-linux-gnu/release \
+            -czf "dist/delray-v${RELEASE_VERSION}-linux-x86_64.tar.gz" delray
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: dist/delray-*.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: build-windows
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          fetch-depth: 0
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            target
+          key: ${{ runner.os }}-release-rust-${{ env.RUST_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-rust-${{ env.RUST_VERSION }}-
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\npcap-sdk-${{ env.NPCAP_SDK_VERSION }}.zip
+          key: ${{ runner.os }}-npcap-sdk-${{ env.NPCAP_SDK_VERSION }}-${{ env.NPCAP_SDK_SHA256 }}
+      - name: Prepare Npcap SDK
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "npcap-sdk-$env:NPCAP_SDK_VERSION.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "npcap-sdk-$env:NPCAP_SDK_VERSION"
+          if (-not (Test-Path $archive)) {
+            Invoke-WebRequest -UseBasicParsing -Uri $env:NPCAP_SDK_URL -OutFile $archive
+          }
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash
+          if ($actual -ne $env:NPCAP_SDK_SHA256) {
+            throw "Npcap SDK SHA-256 mismatch: expected $env:NPCAP_SDK_SHA256, got $actual"
+          }
+          if (Test-Path $extract) {
+            Remove-Item -LiteralPath $extract -Recurse -Force
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $extract
+          $libdir = Join-Path $extract 'Lib\x64'
+          if (-not (Test-Path (Join-Path $libdir 'wpcap.lib'))) { throw 'wpcap.lib is missing' }
+          if (-not (Test-Path (Join-Path $libdir 'Packet.lib'))) { throw 'Packet.lib is missing' }
+          "LIBPCAP_LIBDIR=$libdir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install cargo-edit
+        run: cargo install cargo-edit --version "$env:CARGO_EDIT_VERSION" --locked
+      - name: Apply release version
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: cargo set-version "$env:RELEASE_VERSION"
+      - name: Run Windows tests
+        run: cargo test --locked
+      - name: Build Windows distribution binary
+        run: cargo build --release --locked
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Verify Windows binary dependencies
+        shell: pwsh
+        run: |
+          $binary = 'target\release\delray.exe'
+          if (-not (Test-Path $binary)) { throw 'delray.exe is missing' }
+          $dependencies = (dumpbin /DEPENDENTS $binary | Out-String)
+          if ($dependencies -match 'VCRUNTIME140\.dll|MSVCP140\.dll|api-ms-win-crt') {
+            throw 'Windows binary still depends on the dynamic VC Runtime'
+          }
+          if ($dependencies -notmatch 'wpcap\.dll') {
+            throw 'Windows binary does not declare wpcap.dll' 
+          }
+      - name: Package Windows binary
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Compress-Archive -Path 'target\release\delray.exe' -DestinationPath "dist\delray-v$env:RELEASE_VERSION-windows-x86_64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist/delray-*.zip
+          if-no-files-found: error
+
+  commit:
+    name: commit-release-metadata
+    needs: [prepare, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.commit.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Verify main has not changed
+        env:
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+        run: |
+          git fetch origin main --tags
+          git checkout --detach origin/main
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          test -z "$(git status --porcelain)"
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Install cargo-edit
+        run: cargo install cargo-edit --version "$CARGO_EDIT_VERSION" --locked
+      - name: Commit version and tag
+        id: commit
+        env:
+          BUMP: ${{ inputs.bump }}
+          EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
+          BASE_VERSION: ${{ needs.prepare.outputs.base_version }}
+        run: |
+          current_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "delray") | .version')"
+          test "$current_version" = "$BASE_VERSION"
+          cargo set-version --bump "$BUMP"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "delray") | .version')"
+          test "$version" = "$EXPECTED_VERSION"
+          lock_version="$(awk '/name = "delray"/ { getline; print $3; exit }' Cargo.lock | tr -d '"')"
+          test "$lock_version" = "$version"
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): v$version"
+          git tag -a "v$version" -m "Release v$version"
+          git push origin HEAD:main
+          git push origin "v$version"
+          {
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+  draft-release:
+    name: create-draft-release
+    needs: commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Create checksums
+        run: |
+          cd release-assets
+          sha256sum delray-*.tar.gz delray-*.zip > SHA256SUMS
+      - name: Create Draft Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: v${{ needs.commit.outputs.version }}
+          name: v${{ needs.commit.outputs.version }}
+          generate_release_notes: true
+          files: release-assets/*
