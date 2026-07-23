@@ -125,7 +125,7 @@ jobs:
           mkdir -p dist
           tar -C target/x86_64-unknown-linux-gnu/release \
             -czf "dist/delray-v${RELEASE_VERSION}-linux-x86_64.tar.gz" delray
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-linux
           path: dist/delray-*.tar.gz
@@ -209,7 +209,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path dist -Force | Out-Null
           Compress-Archive -Path 'target\release\delray.exe' -DestinationPath "dist\delray-v$env:RELEASE_VERSION-windows-x86_64.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-windows
           path: dist/delray-*.zip
