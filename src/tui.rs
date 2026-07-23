@@ -1337,14 +1337,8 @@ fn draw_process_preview(
         palette::border(),
         Some(footer),
     );
-    let table = process_table(snapshot, mode, block)
-        .row_highlight_style(
-            Style::default()
-                .patch(palette::selection_style())
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("> ");
-    f.render_stateful_widget(table, area, &mut ratatui_state(snapshot.processes.len(), 0));
+    // The overview preview is informational, so it must not select a row.
+    f.render_widget(process_table(snapshot, mode, block), area);
 }
 
 fn process_table(
@@ -3061,6 +3055,35 @@ mod tests {
         assert!(rendered.contains("Top Domains"));
         assert!(rendered.contains("example.com"));
         assert!(!rendered.contains("/usr/bin/curl"));
+    }
+
+    #[test]
+    fn process_preview_has_no_selection_cursor() {
+        let snapshot = TrafficSnapshot {
+            processes: vec![ProcessSnapshot::attributed(
+                7,
+                Some(Arc::from("curl")),
+                Some(Arc::from("/usr/bin/curl")),
+                chrono::Utc::now(),
+                40,
+                60,
+            )]
+            .into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_process_preview(frame, frame.area(), &snapshot, LayoutMode::Standard);
+            })
+            .unwrap();
+
+        let process_line = rendered_lines(&terminal)
+            .into_iter()
+            .find(|line| line.contains("curl"))
+            .expect("process row");
+        assert!(!process_line.contains("> "));
     }
 
     #[test]
