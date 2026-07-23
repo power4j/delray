@@ -17,7 +17,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction as LayoutDir, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
 use crate::capture::InterfaceInfo;
 use crate::palette;
@@ -1927,10 +1927,8 @@ fn draw_settings(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         )),
     ];
     let inner = block.inner(popup);
-    f.render_widget(
-        Block::default().style(Style::default().bg(palette::bg()).fg(palette::text())),
-        popup,
-    );
+    f.render_widget(Clear, popup);
+    f.render_widget(Block::default().style(Style::default().bg(palette::bg())), popup);
     f.render_widget(block, popup);
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -3917,6 +3915,29 @@ mod tests {
         assert!(rendered.contains("Settings"));
         assert!(rendered.contains("Palette:"));
         assert!(rendered.contains("h/l change  o or Esc close"));
+    }
+
+    #[test]
+    fn settings_overlay_clears_underlying_cells() {
+        let state = AppState::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new("underlay"),
+                    Rect {
+                        x: 20,
+                        y: 10,
+                        width: 8,
+                        height: 1,
+                    },
+                );
+                draw_settings(frame, frame.area(), &state);
+            })
+            .unwrap();
+
+        assert_eq!(terminal.backend().buffer()[(20, 10)].symbol(), " ");
     }
 
     #[test]
