@@ -1095,7 +1095,10 @@ fn runtime_line(
 ) -> Line<'static> {
     let mut spans = vec![
         Span::styled(" ", Style::default()),
-        Span::styled(interface.to_string(), Style::default().fg(palette::strong())),
+        Span::styled(
+            interface.to_string(),
+            Style::default().fg(palette::strong()),
+        ),
     ];
     if mode == LayoutMode::Wide {
         spans.push(Span::styled("  ", Style::default()));
@@ -1405,7 +1408,8 @@ fn process_rows(snapshot: &TrafficSnapshot, compact: bool) -> Vec<Row<'static>> 
                     name,
                     Cell::from(human_bytes(process.sent))
                         .style(Style::default().fg(palette::outbound())),
-                    Cell::from(human_bytes(process.recv)).style(Style::default().fg(palette::inbound())),
+                    Cell::from(human_bytes(process.recv))
+                        .style(Style::default().fg(palette::inbound())),
                 ])
             } else {
                 Row::new(vec![
@@ -1416,7 +1420,8 @@ fn process_rows(snapshot: &TrafficSnapshot, compact: bool) -> Vec<Row<'static>> 
                             .map(|pid| pid.to_string())
                             .unwrap_or_else(|| "-".to_string()),
                     ),
-                    Cell::from(human_bytes(process.recv)).style(Style::default().fg(palette::inbound())),
+                    Cell::from(human_bytes(process.recv))
+                        .style(Style::default().fg(palette::inbound())),
                     Cell::from(human_bytes(process.sent))
                         .style(Style::default().fg(palette::outbound())),
                     Cell::from(human_bytes(process.total()))
@@ -1590,7 +1595,9 @@ fn ip_table(entries: &[IpSnapshot], color: Color, block: Block<'static>) -> Tabl
             .collect()
     };
     Table::new(rows, [Constraint::Min(20), Constraint::Length(14)])
-        .header(Row::new(vec!["Remote address", "Bytes"]).style(Style::default().fg(palette::muted())))
+        .header(
+            Row::new(vec!["Remote address", "Bytes"]).style(Style::default().fg(palette::muted())),
+        )
         .column_spacing(1)
         .block(block)
 }
@@ -1922,7 +1929,10 @@ fn draw_settings(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     ];
     let inner = block.inner(popup);
     f.render_widget(Clear, popup);
-    f.render_widget(Block::default().style(Style::default().bg(palette::bg())), popup);
+    f.render_widget(
+        Block::default().style(Style::default().bg(palette::bg())),
+        popup,
+    );
     f.render_widget(block, popup);
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -3909,11 +3919,17 @@ mod tests {
         let mut state = AppState::new();
         assert!(!state.settings_open);
 
-        assert_eq!(send_key(&mut state, KeyCode::Char('o')), KeyOutcome::Changed);
+        assert_eq!(
+            send_key(&mut state, KeyCode::Char('o')),
+            KeyOutcome::Changed
+        );
         assert!(state.settings_open);
 
         // 'o' toggles back off.
-        assert_eq!(send_key(&mut state, KeyCode::Char('o')), KeyOutcome::Changed);
+        assert_eq!(
+            send_key(&mut state, KeyCode::Char('o')),
+            KeyOutcome::Changed
+        );
         assert!(!state.settings_open);
 
         // Open again, then Esc closes.
@@ -3994,14 +4010,20 @@ mod tests {
         assert!(state.settings_open);
 
         // 'l' advances Auto -> Truecolor (no tier change since detected=Truecolor).
-        assert_eq!(send_key(&mut state, KeyCode::Char('l')), KeyOutcome::Changed);
+        assert_eq!(
+            send_key(&mut state, KeyCode::Char('l')),
+            KeyOutcome::Changed
+        );
         assert_eq!(state.palette_choice, palette::PaletteChoice::Truecolor);
 
         // 'h' cycles backward. Start from Truecolor so the step stays
         // side-effect-free: prev(Truecolor) == Auto and resolve(Auto,
         // Truecolor) == Truecolor leaves the global ACTIVE tier untouched.
         state.palette_choice = palette::PaletteChoice::Truecolor;
-        assert_eq!(send_key(&mut state, KeyCode::Char('h')), KeyOutcome::Changed);
+        assert_eq!(
+            send_key(&mut state, KeyCode::Char('h')),
+            KeyOutcome::Changed
+        );
         assert_eq!(state.palette_choice, palette::PaletteChoice::Auto);
 
         // Enter advances too (Auto -> Truecolor, still side-effect-free).
@@ -4017,10 +4039,7 @@ mod tests {
         assert!(state.settings_open);
 
         // Tab/1-5/hjkl get swallowed by the overlay.
-        assert_eq!(
-            send_key(&mut state, KeyCode::Tab),
-            KeyOutcome::Ignored,
-        );
+        assert_eq!(send_key(&mut state, KeyCode::Tab), KeyOutcome::Ignored,);
         assert_eq!(
             send_key(&mut state, KeyCode::Char('1')),
             KeyOutcome::Ignored,
