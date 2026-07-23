@@ -6,7 +6,7 @@ This document covers source development and CI reproduction. User installation a
 
 - Rust `1.88.0` (`edition = "2024"` and the project MSRV).
 - Linux release builds: Zig `0.15.0` and `cargo-zigbuild` `0.23.0`.
-- Version bumps: `cargo-edit` `0.13.13`.
+- Version bumps: `cargo-edit` `0.13.10`.
 - Linux: libpcap development headers and libraries.
 - Windows: MSVC build tools and Npcap SDK `1.16`.
 
