@@ -22,10 +22,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_VERSION: 1.88.0
+  RELEASE_BRANCH: ${{ github.ref_name }}
+  RUST_VERSION: 1.96.0
   CARGO_EDIT_VERSION: 0.13.13
   CARGO_ZIGBUILD_VERSION: 0.23.0
-  ZIG_VERSION: 0.15.0
+  ZIG_VERSION: 0.16.0
   NPCAP_SDK_VERSION: 1.16
   NPCAP_SDK_URL: https://npcap.com/dist/npcap-sdk-1.16.zip
   NPCAP_SDK_SHA256: F0A8BE7778EE3AE1B99BBBECB27A3FF0F6C111A4093F1C78C5C5A099607184DB
@@ -42,13 +43,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.ref_name }}
           fetch-depth: 0
-      - name: Ensure release starts from main
+      - name: Ensure release branch is allowed
         run: |
-          test "${GITHUB_REF_NAME}" = "main"
-          git fetch origin main --tags
-          git checkout --detach origin/main
+          test "$RELEASE_BRANCH" = "main"
+          git fetch origin "$RELEASE_BRANCH" --tags
+          git checkout --detach "origin/$RELEASE_BRANCH"
           test -z "$(git status --porcelain)"
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -225,14 +226,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.ref_name }}
           fetch-depth: 0
-      - name: Verify main has not changed
+      - name: Verify release branch has not changed
         env:
           BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
         run: |
-          git fetch origin main --tags
-          git checkout --detach origin/main
+          git fetch origin "$RELEASE_BRANCH" --tags
+          git checkout --detach "origin/$RELEASE_BRANCH"
           test "$(git rev-parse HEAD)" = "$BASE_SHA"
           test -z "$(git status --porcelain)"
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -260,7 +261,7 @@ jobs:
           git add Cargo.toml Cargo.lock
           git commit -m "chore(release): v$version"
           git tag -a "v$version" -m "Release v$version"
-          git push origin HEAD:main
+          git push origin "HEAD:$RELEASE_BRANCH"
           git push origin "v$version"
           {
             echo "version=$version"

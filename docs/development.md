@@ -4,8 +4,8 @@ This document covers source development and CI reproduction. User installation a
 
 ## Toolchain
 
-- Rust `1.88.0` (`edition = "2024"` and the project MSRV).
-- Linux release builds: Zig `0.15.0` and `cargo-zigbuild` `0.23.0`.
+- Rust `1.96.0` (`edition = "2024"` and the current stable application baseline).
+- Linux release builds: Zig `0.16.0` and `cargo-zigbuild` `0.23.0`.
 - Version bumps: `cargo-edit` `0.13.13`.
 - Linux: libpcap development headers and libraries.
 - Windows: MSVC build tools and Npcap SDK `1.16`.
@@ -15,10 +15,10 @@ Npcap SDK is a Windows build dependency only. The SDK provides `wpcap.lib` and `
 ## Local checks
 
 ```bash
-cargo +1.88.0 fmt --all -- --check
-cargo +1.88.0 check --locked
-cargo +1.88.0 test --locked
-cargo +1.88.0 clippy --locked --all-targets --all-features -- -D warnings
+cargo +1.96.0 fmt --all -- --check
+cargo +1.96.0 check --locked
+cargo +1.96.0 test --locked
+cargo +1.96.0 clippy --locked --all-targets --all-features -- -D warnings
 ```
 
 ## Linux distribution build
@@ -52,8 +52,8 @@ Set `LIBPCAP_LIBDIR` to the x64 `Lib` directory from Npcap SDK `1.16`:
 $env:LIBPCAP_LIBDIR = 'path-to-npcap-sdk\Lib\x64'
 $env:RUSTFLAGS = '-C target-feature=+crt-static'
 
-cargo +1.88.0 test --locked
-cargo +1.88.0 build --release --locked
+cargo +1.96.0 test --locked
+cargo +1.96.0 build --release --locked
 ```
 
 The release binary is `target\release\delray.exe`. The Windows Release workflow verifies that the executable does not depend on the dynamic VC Runtime and still declares the external `wpcap.dll` dependency.
