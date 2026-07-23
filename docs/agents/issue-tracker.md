@@ -18,6 +18,12 @@ Create a new file under `.scratch/<feature-slug>/` (creating the directory if ne
 
 Read the file at the referenced path. The user will normally pass the path or the issue number directly.
 
+## Lifecycle
+
+`.scratch/<feature>/` is for active work only. When a feature is `merged`, `done`, or `wontfix`, extract durable decisions and user-facing facts into `CONTEXT.md`, an ADR, or a stable document, then remove the completed process directory. Do not create a long-lived archive by default; retain history only when it has been deliberately rewritten into a document with an ongoing audience and owner.
+
+Completed implementation plans under `docs/superpowers/plans/` follow the same rule: delete them after their useful outcomes are captured in durable documentation. Active issue and spec files must carry an explicit lifecycle status.
+
 ## Wayfinding operations
 
 Used by `/wayfinder`. The **map** is a file with one **child** file per ticket.
