@@ -87,7 +87,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -146,7 +146,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~\.cargo\registry
@@ -155,7 +155,7 @@ jobs:
           key: ${{ runner.os }}-release-rust-${{ env.RUST_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-release-rust-${{ env.RUST_VERSION }}-
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}\npcap-sdk-${{ env.NPCAP_SDK_VERSION }}.zip
           key: ${{ runner.os }}-npcap-sdk-${{ env.NPCAP_SDK_VERSION }}-${{ env.NPCAP_SDK_SHA256 }}
