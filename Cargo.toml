@@ -2,7 +2,7 @@
 name = "delray"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.96"
 description = "A command-line network traffic analyzer with process and IP attribution"
 license = "Apache-2.0"
 repository = "https://github.com/power4j/delray"
