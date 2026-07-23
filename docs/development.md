@@ -5,7 +5,7 @@ This document covers source development and CI reproduction. User installation a
 ## Toolchain
 
 - Rust `1.96.0` (`edition = "2024"` and the current stable application baseline).
-- Linux release builds: Zig `0.15.0` and `cargo-zigbuild` `0.23.0`.
+- Linux release builds: Zig `0.16.0` and `cargo-zigbuild` `0.23.0`.
 - Version bumps: `cargo-edit` `0.13.13`.
 - Linux: libpcap development headers and libraries.
 - Windows: MSVC build tools and Npcap SDK `1.16`.
