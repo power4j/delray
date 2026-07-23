@@ -40,7 +40,7 @@ jobs:
       base_version: ${{ steps.version.outputs.base_version }}
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0
@@ -80,14 +80,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.base_sha }}
           fetch-depth: 0
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -125,7 +125,7 @@ jobs:
           mkdir -p dist
           tar -C target/x86_64-unknown-linux-gnu/release \
             -czf "dist/delray-v${RELEASE_VERSION}-linux-x86_64.tar.gz" delray
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-linux
           path: dist/delray-*.tar.gz
@@ -139,14 +139,14 @@ jobs:
     env:
       RUSTFLAGS: -C target-feature=+crt-static
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.base_sha }}
           fetch-depth: 0
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~\.cargo\registry
@@ -155,7 +155,7 @@ jobs:
           key: ${{ runner.os }}-release-rust-${{ env.RUST_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-release-rust-${{ env.RUST_VERSION }}-
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}\npcap-sdk-${{ env.NPCAP_SDK_VERSION }}.zip
           key: ${{ runner.os }}-npcap-sdk-${{ env.NPCAP_SDK_VERSION }}-${{ env.NPCAP_SDK_SHA256 }}
@@ -209,7 +209,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path dist -Force | Out-Null
           Compress-Archive -Path 'target\release\delray.exe' -DestinationPath "dist\delray-v$env:RELEASE_VERSION-windows-x86_64.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-windows
           path: dist/delray-*.zip
@@ -223,7 +223,7 @@ jobs:
     outputs:
       version: ${{ steps.commit.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0
@@ -282,7 +282,7 @@ jobs:
           cd release-assets
           sha256sum delray-*.tar.gz delray-*.zip > SHA256SUMS
       - name: Create Draft Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           draft: true
           tag_name: v${{ needs.commit.outputs.version }}
