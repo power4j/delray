@@ -12,6 +12,11 @@ on:
           - patch
           - minor
           - major
+      test_mode:
+        description: Run the patch-only release test on gh-ci
+        required: true
+        type: boolean
+        default: false
 
 concurrency:
   group: delray-release
@@ -22,6 +27,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_BRANCH: ${{ github.ref_name }}
   RUST_VERSION: 1.88.0
   CARGO_EDIT_VERSION: 0.13.13
   CARGO_ZIGBUILD_VERSION: 0.23.0
@@ -42,13 +48,21 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.ref_name }}
           fetch-depth: 0
-      - name: Ensure release starts from main
+      - name: Ensure release branch is allowed
+        env:
+          BUMP: ${{ inputs.bump }}
+          TEST_MODE: ${{ inputs.test_mode }}
         run: |
-          test "${GITHUB_REF_NAME}" = "main"
-          git fetch origin main --tags
-          git checkout --detach origin/main
+          if [[ "$TEST_MODE" == "true" ]]; then
+            test "$RELEASE_BRANCH" = "gh-ci"
+            test "$BUMP" = "patch"
+          else
+            test "$RELEASE_BRANCH" = "main"
+          fi
+          git fetch origin "$RELEASE_BRANCH" --tags
+          git checkout --detach "origin/$RELEASE_BRANCH"
           test -z "$(git status --porcelain)"
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -225,14 +239,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.ref_name }}
           fetch-depth: 0
-      - name: Verify main has not changed
+      - name: Verify release branch has not changed
         env:
           BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
         run: |
-          git fetch origin main --tags
-          git checkout --detach origin/main
+          git fetch origin "$RELEASE_BRANCH" --tags
+          git checkout --detach "origin/$RELEASE_BRANCH"
           test "$(git rev-parse HEAD)" = "$BASE_SHA"
           test -z "$(git status --porcelain)"
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -260,7 +274,7 @@ jobs:
           git add Cargo.toml Cargo.lock
           git commit -m "chore(release): v$version"
           git tag -a "v$version" -m "Release v$version"
-          git push origin HEAD:main
+          git push origin "HEAD:$RELEASE_BRANCH"
           git push origin "v$version"
           {
             echo "version=$version"
