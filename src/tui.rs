@@ -923,20 +923,19 @@ fn draw_interface_selector(
                 } else {
                     format!("[{}]", markers.join(", "))
                 };
+                let (primary, secondary) = interface.display_labels();
                 if compact {
+                    let secondary = secondary.unwrap_or("");
                     Row::new(vec![
                         Cell::from(format!("{}.", index + 1)),
-                        Cell::from(format!(
-                            "{}\n{}  {}",
-                            interface.name, interface.description, marker
-                        )),
+                        Cell::from(format!("{primary}\n{secondary}  {marker}")),
                     ])
                     .height(2)
                 } else {
                     Row::new(vec![
                         Cell::from(format!("{}.", index + 1)),
-                        Cell::from(interface.name.clone()),
-                        Cell::from(interface.description.clone()),
+                        Cell::from(primary),
+                        Cell::from(secondary.unwrap_or("")),
                         Cell::from(marker),
                     ])
                 }
@@ -953,8 +952,8 @@ fn draw_interface_selector(
             rows,
             [
                 Constraint::Length(3),
-                Constraint::Min(50),
                 Constraint::Min(18),
+                Constraint::Min(50),
                 Constraint::Length(24),
             ],
         )
@@ -2488,15 +2487,28 @@ mod tests {
 
         let rendered = rendered_lines(&terminal).join("\n");
         assert!(rendered.contains(pcap_name));
-        assert!(rendered.find(pcap_name).unwrap() < rendered.find("Npcap Adapter").unwrap());
+        let pcap_position = rendered.find(pcap_name).unwrap();
+        let description_position = rendered.find("Npcap Adapter").unwrap();
+        if cfg!(windows) {
+            assert!(description_position < pcap_position);
+        } else {
+            assert!(pcap_position < description_position);
+        }
     }
 
     #[test]
-    fn selector_renders_pcap_name_before_friendly_name() {
-        let pcap_name = r"\Device\NPF_{12345678-1234-1234-1234-123456789ABC}";
+    fn selector_renders_platform_primary_label_first() {
+        let (interface_name, description) = if cfg!(windows) {
+            (
+                r"\Device\NPF_{12345678-1234-1234-1234-123456789ABC}",
+                "Intel Ethernet Controller",
+            )
+        } else {
+            ("eth0", "Wired Ethernet")
+        };
         let interfaces = vec![crate::capture::InterfaceInfo {
-            name: pcap_name.to_string(),
-            description: "Intel Ethernet Controller".to_string(),
+            name: interface_name.to_string(),
+            description: description.to_string(),
             is_default_route: false,
         }];
         let snapshot = TrafficSnapshot::default();
@@ -2518,9 +2530,13 @@ mod tests {
             .unwrap();
 
         let rendered = rendered_lines(&terminal).join("\n");
-        assert!(
-            rendered.find(pcap_name).unwrap() < rendered.find("Intel Ethernet Controller").unwrap()
-        );
+        let interface_position = rendered.find(interface_name).unwrap();
+        let description_position = rendered.find(description).unwrap();
+        if cfg!(windows) {
+            assert!(description_position < interface_position);
+        } else {
+            assert!(interface_position < description_position);
+        }
     }
 
     #[test]

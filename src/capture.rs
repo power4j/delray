@@ -33,6 +33,35 @@ pub struct InterfaceInfo {
     pub is_default_route: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InterfaceLabelOrder {
+    NameFirst,
+    DescriptionFirst,
+}
+
+impl InterfaceInfo {
+    pub(crate) fn display_labels(&self) -> (&str, Option<&str>) {
+        let order = if cfg!(windows) {
+            InterfaceLabelOrder::DescriptionFirst
+        } else {
+            InterfaceLabelOrder::NameFirst
+        };
+        self.display_labels_for(order)
+    }
+
+    pub(crate) fn display_labels_for(&self, order: InterfaceLabelOrder) -> (&str, Option<&str>) {
+        let description = (!self.description.is_empty() && self.description != "No description")
+            .then_some(self.description.as_str());
+        match order {
+            InterfaceLabelOrder::NameFirst => (self.name.as_str(), description),
+            InterfaceLabelOrder::DescriptionFirst => description
+                .map_or((self.name.as_str(), None), |description| {
+                    (description, Some(self.name.as_str()))
+                }),
+        }
+    }
+}
+
 // rust-pcap exposes normalized LINKTYPE_RAW (101), while live Linux handles use DLT_RAW (12).
 const LINUX_DLT_RAW: pcap::Linktype = pcap::Linktype(12);
 
@@ -153,8 +182,12 @@ pub fn format_interface_list(interfaces: &[InterfaceInfo]) -> String {
         } else {
             ""
         };
-        writeln!(output, "  {}. {}{marker}", index + 1, interface.description).unwrap();
-        writeln!(output, "     Name: {}", interface.name).unwrap();
+        let (primary, secondary) = interface.display_labels();
+        writeln!(output, "  {}. {}{marker}", index + 1, primary).unwrap();
+        if let Some(secondary) = secondary {
+            let label = if cfg!(windows) { "Name" } else { "Description" };
+            writeln!(output, "     {label}: {secondary}").unwrap();
+        }
     }
     output.push_str("\nUsage: delray <interface-or-number> [OPTIONS]\n");
     output.push_str("Run delray --help for full usage\n");
@@ -1427,18 +1460,26 @@ mod tests {
         let rendered =
             format_interface_list(&interface_catalog_from_devices(devices, Some("eth0")));
 
-        assert_eq!(
-            rendered,
+        let expected = if cfg!(windows) {
             concat!(
                 "Available interfaces:\n",
                 "  1. Wired Ethernet  [default route]\n",
                 "     Name: eth0\n",
-                "  2. No description\n",
-                "     Name: \\Device\\NPF_{1234}\n",
+                "  2. \\Device\\NPF_{1234}\n",
                 "\nUsage: delray <interface-or-number> [OPTIONS]\n",
                 "Run delray --help for full usage\n",
             )
-        );
+        } else {
+            concat!(
+                "Available interfaces:\n",
+                "  1. eth0  [default route]\n",
+                "     Description: Wired Ethernet\n",
+                "  2. \\Device\\NPF_{1234}\n",
+                "\nUsage: delray <interface-or-number> [OPTIONS]\n",
+                "Run delray --help for full usage\n",
+            )
+        };
+        assert_eq!(rendered, expected);
     }
 
     #[test]
@@ -1454,6 +1495,38 @@ mod tests {
         assert!(catalog[0].is_default_route);
         assert_eq!(catalog[1].description, "No description");
         assert!(!catalog[1].is_default_route);
+    }
+
+    #[test]
+    fn interface_labels_follow_platform_display_order() {
+        let interface = InterfaceInfo {
+            name: r"\Device\NPF_{1234}".to_string(),
+            description: "Intel Ethernet Controller".to_string(),
+            is_default_route: false,
+        };
+
+        assert_eq!(
+            interface.display_labels_for(InterfaceLabelOrder::NameFirst),
+            (r"\Device\NPF_{1234}", Some("Intel Ethernet Controller")),
+        );
+        assert_eq!(
+            interface.display_labels_for(InterfaceLabelOrder::DescriptionFirst),
+            ("Intel Ethernet Controller", Some(r"\Device\NPF_{1234}")),
+        );
+    }
+
+    #[test]
+    fn interface_labels_fall_back_to_name_without_description() {
+        let interface = InterfaceInfo {
+            name: "eth0".to_string(),
+            description: "No description".to_string(),
+            is_default_route: false,
+        };
+
+        assert_eq!(
+            interface.display_labels_for(InterfaceLabelOrder::DescriptionFirst),
+            ("eth0", None),
+        );
     }
 
     #[test]

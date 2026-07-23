@@ -70,13 +70,24 @@ pub(crate) fn tier_from_env(
             return ColorTier::Truecolor;
         }
     }
-    if term.to_ascii_lowercase().contains("256color") {
+    let term = term.trim().to_ascii_lowercase();
+    if term == "dumb" {
+        return ColorTier::Monochrome;
+    }
+    if term.contains("256color") {
         return ColorTier::Truecolor;
     }
-    // xterm, linux, vt*, screen, dumb and any unrecognized TERM conservatively
-    // get the 16-color palette. `dumb` is included by design: it is rare and the
-    // 16-color escapes degrade no worse than the alternatives.
-    ColorTier::Sixteen
+    if term == "ansi"
+        || term == "linux"
+        || term == "screen"
+        || term == "xterm"
+        || term.starts_with("vt")
+    {
+        return ColorTier::Sixteen;
+    }
+    // Missing and unknown TERM values are common on modern Windows terminals.
+    // Treat them as truecolor unless there is explicit evidence of a limitation.
+    ColorTier::Truecolor
 }
 
 /// Read the live environment once and resolve the detected tier.
@@ -115,7 +126,7 @@ const TRUECOLOR: Palette = Palette {
     text: Color::Rgb(216, 224, 232),
     strong: Color::Rgb(244, 247, 250),
     muted: Color::Rgb(116, 129, 145),
-    border: Color::Rgb(255, 140, 40),
+    border: Color::Rgb(37, 53, 68),
     accent: Color::Rgb(255, 183, 3),
     accent_dim: Color::Rgb(154, 111, 8),
     inbound: Color::Rgb(255, 191, 36),
@@ -321,12 +332,16 @@ mod tests {
     }
 
     #[test]
-    fn dumb_empty_and_unknown_terms_fallback_to_sixteen() {
-        assert_eq!(tier_from_env(None, "dumb", None), ColorTier::Sixteen);
-        assert_eq!(tier_from_env(None, "", None), ColorTier::Sixteen);
+    fn dumb_term_disables_color() {
+        assert_eq!(tier_from_env(None, "dumb", None), ColorTier::Monochrome);
+    }
+
+    #[test]
+    fn empty_and_unknown_terms_default_to_truecolor() {
+        assert_eq!(tier_from_env(None, "", None), ColorTier::Truecolor);
         assert_eq!(
             tier_from_env(None, "totally-unknown-term", None),
-            ColorTier::Sixteen,
+            ColorTier::Truecolor,
         );
     }
 
@@ -370,6 +385,7 @@ mod tests {
     fn truecolor_palette_keeps_original_rgb() {
         assert_eq!(TRUECOLOR.bg, Color::Rgb(9, 13, 20));
         assert_eq!(TRUECOLOR.text, Color::Rgb(216, 224, 232));
+        assert_eq!(TRUECOLOR.border, Color::Rgb(37, 53, 68));
         assert_eq!(TRUECOLOR.accent, Color::Rgb(255, 183, 3));
         assert_eq!(TRUECOLOR.inbound, Color::Rgb(255, 191, 36));
     }
