@@ -126,15 +126,25 @@ fn plain_snapshot(
     }
 
     out.push_str(&format!("\nTop Inbound IPs ({top_n})\n"));
-    out.push_str("IP\tBytes\n");
+    out.push_str("IP\tTotal\tLast Seen\n");
     for entry in snapshot.inbound_ips.iter() {
-        out.push_str(&format!("{}\t{}\n", entry.ip, human_bytes(entry.bytes)));
+        out.push_str(&format!(
+            "{}\t{}\t{}\n",
+            entry.ip,
+            human_bytes(entry.bytes),
+            entry.last_seen().to_rfc3339()
+        ));
     }
 
     out.push_str(&format!("\nTop Outbound IPs ({top_n})\n"));
-    out.push_str("IP\tBytes\n");
+    out.push_str("IP\tTotal\tLast Seen\n");
     for entry in snapshot.outbound_ips.iter() {
-        out.push_str(&format!("{}\t{}\n", entry.ip, human_bytes(entry.bytes)));
+        out.push_str(&format!(
+            "{}\t{}\t{}\n",
+            entry.ip,
+            human_bytes(entry.bytes),
+            entry.last_seen().to_rfc3339()
+        ));
     }
 
     out
@@ -177,6 +187,7 @@ struct JsonProc {
 struct JsonIp {
     ip: String,
     bytes: u64,
+    last_seen: String,
 }
 
 #[derive(Serialize)]
@@ -219,6 +230,7 @@ fn build_json_frame<'a>(
         .map(|entry| JsonIp {
             ip: entry.ip.to_string(),
             bytes: entry.bytes,
+            last_seen: entry.last_seen().to_rfc3339(),
         })
         .collect();
 
@@ -228,6 +240,7 @@ fn build_json_frame<'a>(
         .map(|entry| JsonIp {
             ip: entry.ip.to_string(),
             bytes: entry.bytes,
+            last_seen: entry.last_seen().to_rfc3339(),
         })
         .collect();
 
@@ -395,6 +408,36 @@ mod tests {
         assert_eq!(process["pid"], 7);
         assert!(process["name"].is_null());
         assert!(process["path"].is_null());
+    }
+
+    #[test]
+    fn plain_snapshot_renders_ip_total_and_last_seen() {
+        let mut stats = Stats::default();
+        let observed_at = "2026-07-15T08:04:00Z".parse().unwrap();
+        stats.record_flow_at(flow(Direction::Inbound, 40), None, observed_at);
+        stats.record_flow_at(flow(Direction::Outbound, 60), None, observed_at);
+
+        let rendered = plain_snapshot("eth0", &chrono::Local::now(), Instant::now(), &stats, 10);
+
+        assert!(rendered.contains("Top Inbound IPs (10)\nIP\tTotal\tLast Seen\n"));
+        assert!(rendered.contains("127.0.0.1\t40 B\t2026-07-15T08:04:00+00:00\n"));
+        assert!(rendered.contains("Top Outbound IPs (10)\nIP\tTotal\tLast Seen\n"));
+        assert!(rendered.contains("127.0.0.1\t60 B\t2026-07-15T08:04:00+00:00\n"));
+    }
+
+    #[test]
+    fn json_snapshot_renders_ip_last_seen_without_removing_bytes() {
+        let mut stats = Stats::default();
+        let observed_at = "2026-07-15T08:04:00Z".parse().unwrap();
+        stats.record_flow_at(flow(Direction::Inbound, 40), None, observed_at);
+
+        let frame = build_json_frame("eth0", &chrono::Local::now(), Instant::now(), &stats, 10);
+        let value = serde_json::to_value(frame).unwrap();
+        let entry = &value["top_inbound_ips"][0];
+
+        assert_eq!(entry["ip"], "127.0.0.1");
+        assert_eq!(entry["bytes"], 40);
+        assert_eq!(entry["last_seen"], "2026-07-15T08:04:00+00:00");
     }
 
     fn flow(direction: Direction, bytes: u64) -> Flow {

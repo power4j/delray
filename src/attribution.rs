@@ -75,7 +75,7 @@ impl PendingAttributor {
         observed_at: DateTime<Utc>,
     ) {
         self.advance(stats, proc_table, now);
-        stats.record_interface_flow(&flow);
+        stats.record_interface_flow(&flow, observed_at);
         stats.record_outbound_domain(
             flow.domain.as_ref(),
             flow.direction,

@@ -839,9 +839,9 @@ fn draw_with_interfaces_at(
         Page::Overview => draw_overview(f, body, snapshot, mode, now),
         Page::Processes => match state.process_detail.as_ref() {
             Some(detail) => draw_process_detail(f, body, detail, now),
-            None => draw_processes(f, body, state, snapshot, mode),
+            None => draw_processes(f, body, state, snapshot, mode, now),
         },
-        Page::Ips => draw_ips(f, body, state, snapshot, mode),
+        Page::Ips => draw_ips(f, body, state, snapshot, mode, now),
         Page::Domains => draw_domains(f, body, state, snapshot, mode, now),
         Page::About => draw_about(f, body),
     }
@@ -1129,13 +1129,13 @@ fn draw_overview(
     now: chrono::DateTime<chrono::Utc>,
 ) {
     // Row-based layout (ticket 07): every row is either a full-width panel or two
-    // equal 50/50 columns. Wide/Standard use three rows; Compact stacks four rows.
+    // equal 50/50 columns. Wide/Standard use three rows; Compact stacks five rows.
     //
     // Height allocation:
     //   * Wide/Standard — Traffic fixed at top; the Process|Domain row gets
     //     Fill(2) and the IP row gets Fill(1) so the previews of processes and
     //     domains (the primary diagnostic dimensions) take the larger share.
-    //   * Compact — Traffic fixed at top; the three preview panels split the
+    //   * Compact — Traffic fixed at top; the four preview panels split the
     //     remaining space evenly (Fill(1) each) since vertical space is scarce.
     match mode {
         LayoutMode::Wide | LayoutMode::Standard => {
@@ -1162,7 +1162,7 @@ fn draw_overview(
                     Constraint::Percentage(50),
                 ])
                 .split(rows[2]);
-            draw_process_preview(f, mid[0], snapshot, preview_mode);
+            draw_process_preview(f, mid[0], snapshot, preview_mode, now);
             draw_domain_preview(f, mid[2], snapshot, preview_mode, now);
 
             let bottom = Layout::default()
@@ -1173,8 +1173,8 @@ fn draw_overview(
                     Constraint::Percentage(50),
                 ])
                 .split(rows[4]);
-            draw_ip_preview(f, bottom[0], snapshot, true);
-            draw_ip_preview(f, bottom[2], snapshot, false);
+            draw_ip_preview(f, bottom[0], snapshot, true, now);
+            draw_ip_preview(f, bottom[2], snapshot, false, now);
         }
         LayoutMode::Compact => {
             let rows = Layout::default()
@@ -1187,12 +1187,15 @@ fn draw_overview(
                     Constraint::Fill(1),
                     Constraint::Length(1),
                     Constraint::Fill(1),
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
                 ])
                 .split(area);
             draw_traffic(f, rows[0], snapshot);
-            draw_process_preview(f, rows[2], snapshot, mode);
+            draw_process_preview(f, rows[2], snapshot, mode, now);
             draw_domain_preview(f, rows[4], snapshot, mode, now);
-            draw_ip_preview(f, rows[6], snapshot, true);
+            draw_ip_preview(f, rows[6], snapshot, true, now);
+            draw_ip_preview(f, rows[8], snapshot, false, now);
         }
     }
 }
@@ -1330,6 +1333,7 @@ fn draw_process_preview(
     area: Rect,
     snapshot: &TrafficSnapshot,
     mode: LayoutMode,
+    now: chrono::DateTime<chrono::Utc>,
 ) {
     let footer = preview_position(snapshot.processes.len(), area.height);
     let block = panel_block(
@@ -1341,16 +1345,17 @@ fn draw_process_preview(
         Some(footer),
     );
     // The overview preview is informational, so it must not select a row.
-    f.render_widget(process_table(snapshot, mode, block), area);
+    f.render_widget(process_table(snapshot, mode, block, now), area);
 }
 
 fn process_table(
     snapshot: &TrafficSnapshot,
     mode: LayoutMode,
     block: Block<'static>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Table<'static> {
     let compact = mode == LayoutMode::Compact;
-    let rows = process_rows(snapshot, compact);
+    let rows = process_rows(snapshot, compact, now);
     let header_style = Style::default().fg(palette::muted());
     let table = if compact {
         Table::new(
@@ -1361,24 +1366,32 @@ fn process_table(
                 Constraint::Length(12),
             ],
         )
-        .header(Row::new(vec!["Process", "Sent", "Recv"]).style(header_style))
+        .header(Row::new(vec!["Process", "Total", "Last seen"]).style(header_style))
     } else {
         Table::new(
             rows,
             [
-                Constraint::Min(20),
+                Constraint::Min(22),
+                Constraint::Length(8),
+                Constraint::Length(9),
+                Constraint::Length(9),
                 Constraint::Length(10),
-                Constraint::Length(12),
-                Constraint::Length(12),
-                Constraint::Length(12),
+                Constraint::Length(11),
             ],
         )
-        .header(Row::new(vec!["Process", "PID", "Recv", "Sent", "Total"]).style(header_style))
+        .header(
+            Row::new(vec!["Process", "PID", "Recv", "Sent", "Total", "Last seen"])
+                .style(header_style),
+        )
     };
     table.column_spacing(1).block(block)
 }
 
-fn process_rows(snapshot: &TrafficSnapshot, compact: bool) -> Vec<Row<'static>> {
+fn process_rows(
+    snapshot: &TrafficSnapshot,
+    compact: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<Row<'static>> {
     if snapshot.processes.is_empty() {
         let cells = if compact {
             vec![
@@ -1389,6 +1402,7 @@ fn process_rows(snapshot: &TrafficSnapshot, compact: bool) -> Vec<Row<'static>> 
         } else {
             vec![
                 Cell::from("No traffic observed"),
+                Cell::from(""),
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(""),
@@ -1406,10 +1420,9 @@ fn process_rows(snapshot: &TrafficSnapshot, compact: bool) -> Vec<Row<'static>> 
             if compact {
                 Row::new(vec![
                     name,
-                    Cell::from(human_bytes(process.sent))
-                        .style(Style::default().fg(palette::outbound())),
-                    Cell::from(human_bytes(process.recv))
-                        .style(Style::default().fg(palette::inbound())),
+                    Cell::from(human_bytes(process.total()))
+                        .style(Style::default().fg(palette::strong())),
+                    Cell::from(relative_last_seen(process.last_seen(), now)),
                 ])
             } else {
                 Row::new(vec![
@@ -1426,6 +1439,7 @@ fn process_rows(snapshot: &TrafficSnapshot, compact: bool) -> Vec<Row<'static>> 
                         .style(Style::default().fg(palette::outbound())),
                     Cell::from(human_bytes(process.total()))
                         .style(Style::default().fg(palette::strong())),
+                    Cell::from(relative_last_seen(process.last_seen(), now)),
                 ])
             }
         })
@@ -1454,6 +1468,7 @@ fn draw_processes(
     state: &mut AppState,
     snapshot: &TrafficSnapshot,
     mode: LayoutMode,
+    now: chrono::DateTime<chrono::Utc>,
 ) {
     let view_h = area.height.saturating_sub(3) as usize;
     state.proc_view_height = view_h.max(1);
@@ -1470,7 +1485,7 @@ fn draw_processes(
         palette::border(),
         Some(footer),
     );
-    let table = process_table(snapshot, mode, block)
+    let table = process_table(snapshot, mode, block, now)
         .row_highlight_style(
             Style::default()
                 .patch(palette::selection_style())
@@ -1553,7 +1568,13 @@ fn relative_last_seen(
     }
 }
 
-fn draw_ip_preview(f: &mut ratatui::Frame, area: Rect, snapshot: &TrafficSnapshot, inbound: bool) {
+fn draw_ip_preview(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    snapshot: &TrafficSnapshot,
+    inbound: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) {
     let entries = if inbound {
         snapshot.inbound_ips.as_ref()
     } else {
@@ -1568,7 +1589,7 @@ fn draw_ip_preview(f: &mut ratatui::Frame, area: Rect, snapshot: &TrafficSnapsho
         palette::border(),
         Some(preview_position(entries.len(), area.height)),
     );
-    let table = ip_table(entries, color, block);
+    let table = ip_table(entries, color, block, now);
     f.render_widget(table, area);
 }
 
@@ -1580,9 +1601,17 @@ fn ip_theme(inbound: bool) -> (&'static str, &'static str, Color) {
     }
 }
 
-fn ip_table(entries: &[IpSnapshot], color: Color, block: Block<'static>) -> Table<'static> {
+fn ip_table(
+    entries: &[IpSnapshot],
+    color: Color,
+    block: Block<'static>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Table<'static> {
     let rows = if entries.is_empty() {
-        vec![Row::new(vec!["No traffic observed", ""]).style(Style::default().fg(palette::muted()))]
+        vec![
+            Row::new(vec!["No traffic observed", "", ""])
+                .style(Style::default().fg(palette::muted())),
+        ]
     } else {
         entries
             .iter()
@@ -1590,16 +1619,25 @@ fn ip_table(entries: &[IpSnapshot], color: Color, block: Block<'static>) -> Tabl
                 Row::new(vec![
                     Cell::from(entry.ip.to_string()),
                     Cell::from(human_bytes(entry.bytes)).style(Style::default().fg(color)),
+                    Cell::from(relative_last_seen(entry.last_seen(), now)),
                 ])
             })
             .collect()
     };
-    Table::new(rows, [Constraint::Min(20), Constraint::Length(14)])
-        .header(
-            Row::new(vec!["Remote address", "Bytes"]).style(Style::default().fg(palette::muted())),
-        )
-        .column_spacing(1)
-        .block(block)
+    Table::new(
+        rows,
+        [
+            Constraint::Min(14),
+            Constraint::Length(10),
+            Constraint::Length(10),
+        ],
+    )
+    .header(
+        Row::new(vec!["Remote address", "Total", "Last seen"])
+            .style(Style::default().fg(palette::muted())),
+    )
+    .column_spacing(1)
+    .block(block)
 }
 
 fn draw_ips(
@@ -1608,6 +1646,7 @@ fn draw_ips(
     state: &mut AppState,
     snapshot: &TrafficSnapshot,
     mode: LayoutMode,
+    now: chrono::DateTime<chrono::Utc>,
 ) {
     let panes = if mode == LayoutMode::Compact {
         Layout::default()
@@ -1647,6 +1686,7 @@ fn draw_ips(
         true,
         state.ip_focus == IpFocus::Inbound,
         state.ip_in_scroll,
+        now,
     );
     draw_ip_table(
         f,
@@ -1655,6 +1695,7 @@ fn draw_ips(
         false,
         state.ip_focus == IpFocus::Outbound,
         state.ip_out_scroll,
+        now,
     );
 }
 
@@ -1665,6 +1706,7 @@ fn draw_ip_table(
     inbound: bool,
     focused: bool,
     selected: usize,
+    now: chrono::DateTime<chrono::Utc>,
 ) {
     let (prefix, title, color) = ip_theme(inbound);
     let block = panel_block(
@@ -1675,7 +1717,7 @@ fn draw_ip_table(
         palette::border(),
         Some(selected_position(selected, entries.len())),
     );
-    let table = ip_table(entries, color, block)
+    let table = ip_table(entries, color, block, now)
         .row_highlight_style(if focused {
             Style::default()
                 .fg(palette::strong())
@@ -2696,9 +2738,9 @@ mod tests {
     }
 
     #[test]
-    fn compact_overview_stacks_four_rows_without_side_by_side_panels() {
+    fn compact_overview_stacks_five_rows_without_side_by_side_panels() {
         // <80 columns triggers Compact mode. Overview stacks Traffic / Process
-        // / Domain / Inbound IP vertically — no side-by-side panels.
+        // / Domain / Inbound / Outbound IP vertically — no side-by-side panels.
         let snapshot = TrafficSnapshot::default();
         let mut state = AppState::new();
         let mut terminal = Terminal::new(TestBackend::new(72, 30)).unwrap();
@@ -2722,14 +2764,13 @@ mod tests {
         let processes = position("Top Processes");
         let domains = position("Top Domains");
         let inbound = position("Inbound IPs");
+        let outbound = position("Outbound IPs");
 
-        // Vertical order: Traffic < Process < Domain < Inbound IP.
+        // Vertical order: Traffic < Process < Domain < Inbound IP < Outbound IP.
         assert!(traffic.1 < processes.1);
         assert!(processes.1 < domains.1);
         assert!(domains.1 < inbound.1);
-
-        // Compact Overview omits Outbound IPs.
-        assert!(!lines.iter().any(|line| line.contains("Outbound IPs")));
+        assert!(inbound.1 < outbound.1);
     }
 
     #[test]
@@ -2911,6 +2952,7 @@ mod tests {
 
     #[test]
     fn processes_page_renders_from_snapshot() {
+        let observed_at = "2026-07-15T08:00:00Z".parse().unwrap();
         let snapshot = TrafficSnapshot {
             in_bytes: 40,
             out_bytes: 60,
@@ -2918,7 +2960,7 @@ mod tests {
                 7,
                 Some(Arc::from("curl --silent")),
                 None,
-                chrono::Utc::now(),
+                observed_at,
                 40,
                 60,
             )]
@@ -2931,7 +2973,15 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now());
+                draw_at(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    "eth0",
+                    "host",
+                    Instant::now(),
+                    "2026-07-15T08:02:00Z".parse().unwrap(),
+                );
             })
             .unwrap();
 
@@ -2944,6 +2994,8 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("curl --silent"));
         assert!(rendered.contains("100 B"));
+        assert!(rendered.contains("Last seen"));
+        assert!(rendered.contains("2m ago"));
     }
 
     #[test]
@@ -2983,7 +3035,17 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
         terminal
-            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .draw(|frame| {
+                draw_at(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    "eth0",
+                    "host",
+                    Instant::now(),
+                    "2026-07-15T08:02:00Z".parse().unwrap(),
+                )
+            })
             .unwrap();
 
         let rendered = rendered_lines(&terminal).join("\n");
@@ -2993,6 +3055,7 @@ mod tests {
         assert!(rendered.contains("Recv"));
         assert!(rendered.contains("Sent"));
         assert!(rendered.contains("Total"));
+        assert!(rendered.contains("Last seen"));
         assert!(rendered.contains("Enter:details"));
         assert!(rendered.contains("q:quit"));
         assert!(!rendered.contains("/usr/bin/ssh"));
@@ -3031,15 +3094,17 @@ mod tests {
                 2048,
             )]
             .into(),
-            inbound_ips: vec![IpSnapshot {
-                ip: "192.0.2.10".parse().unwrap(),
-                bytes: 1024,
-            }]
+            inbound_ips: vec![IpSnapshot::new(
+                "192.0.2.10".parse().unwrap(),
+                1024,
+                "2026-07-15T08:00:00Z".parse().unwrap(),
+            )]
             .into(),
-            outbound_ips: vec![IpSnapshot {
-                ip: "198.51.100.20".parse().unwrap(),
-                bytes: 2048,
-            }]
+            outbound_ips: vec![IpSnapshot::new(
+                "198.51.100.20".parse().unwrap(),
+                2048,
+                "2026-07-15T08:00:00Z".parse().unwrap(),
+            )]
             .into(),
             outbound_domains: vec![OutboundDomainSnapshot::new(
                 Arc::from("example.com"),
@@ -3085,7 +3150,13 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                draw_process_preview(frame, frame.area(), &snapshot, LayoutMode::Standard);
+                draw_process_preview(
+                    frame,
+                    frame.area(),
+                    &snapshot,
+                    LayoutMode::Standard,
+                    chrono::Utc::now(),
+                );
             })
             .unwrap();
 
@@ -3119,15 +3190,17 @@ mod tests {
     #[test]
     fn ips_page_renders_from_snapshot() {
         let snapshot = TrafficSnapshot {
-            inbound_ips: vec![IpSnapshot {
-                ip: "192.0.2.10".parse().unwrap(),
-                bytes: 1024,
-            }]
+            inbound_ips: vec![IpSnapshot::new(
+                "192.0.2.10".parse().unwrap(),
+                1024,
+                "2026-07-15T08:00:00Z".parse().unwrap(),
+            )]
             .into(),
-            outbound_ips: vec![IpSnapshot {
-                ip: "198.51.100.20".parse().unwrap(),
-                bytes: 2048,
-            }]
+            outbound_ips: vec![IpSnapshot::new(
+                "198.51.100.20".parse().unwrap(),
+                2048,
+                "2026-07-15T08:00:00Z".parse().unwrap(),
+            )]
             .into(),
             ..TrafficSnapshot::default()
         };
@@ -3136,7 +3209,17 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
         terminal
-            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .draw(|frame| {
+                draw_at(
+                    frame,
+                    &mut state,
+                    &snapshot,
+                    "eth0",
+                    "host",
+                    Instant::now(),
+                    "2026-07-15T08:02:00Z".parse().unwrap(),
+                )
+            })
             .unwrap();
 
         let rendered = rendered_lines(&terminal).join("\n");
@@ -3144,6 +3227,9 @@ mod tests {
         assert!(rendered.contains("1.00 KB"));
         assert!(rendered.contains("198.51.100.20"));
         assert!(rendered.contains("2.00 KB"));
+        assert!(rendered.contains("Total"));
+        assert!(rendered.contains("Last seen"));
+        assert!(rendered.contains("2m ago"));
     }
 
     #[test]

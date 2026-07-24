@@ -154,6 +154,21 @@ impl ProcessSnapshot {
 pub struct IpSnapshot {
     pub ip: IpAddr,
     pub bytes: u64,
+    last_seen: DateTime<Utc>,
+}
+
+impl IpSnapshot {
+    pub(crate) fn new(ip: IpAddr, bytes: u64, last_seen: DateTime<Utc>) -> Self {
+        Self {
+            ip,
+            bytes,
+            last_seen,
+        }
+    }
+
+    pub(crate) fn last_seen(&self) -> DateTime<Utc> {
+        self.last_seen
+    }
 }
 
 /// 出站域名维度的快照项，对齐 ProcessSnapshot 的封装风格。
@@ -209,6 +224,8 @@ pub struct Stats {
     pub out_bytes: u64,
     in_by_ip: HashMap<IpAddr, u64>,
     out_by_ip: HashMap<IpAddr, u64>,
+    in_ip_last_seen: HashMap<IpAddr, DateTime<Utc>>,
+    out_ip_last_seen: HashMap<IpAddr, DateTime<Utc>>,
     by_proc: HashMap<ProcessKey, ProcTraffic>,
     proc_last_seen: HashMap<ProcessKey, DateTime<Utc>>,
     unattributed: ProcTraffic,
@@ -228,14 +245,16 @@ struct DomainTraffic {
 }
 
 impl Stats {
-    fn add_in(&mut self, source: IpAddr, bytes: u64) {
+    fn add_in(&mut self, source: IpAddr, bytes: u64, observed_at: DateTime<Utc>) {
         self.in_bytes += bytes;
         *self.in_by_ip.entry(source).or_default() += bytes;
+        self.in_ip_last_seen.insert(source, observed_at);
     }
 
-    fn add_out(&mut self, destination: IpAddr, bytes: u64) {
+    fn add_out(&mut self, destination: IpAddr, bytes: u64, observed_at: DateTime<Utc>) {
         self.out_bytes += bytes;
         *self.out_by_ip.entry(destination).or_default() += bytes;
+        self.out_ip_last_seen.insert(destination, observed_at);
     }
 
     fn add_proc(
@@ -283,7 +302,7 @@ impl Stats {
         peer_process: Option<ObservedProcess>,
         observed_at: DateTime<Utc>,
     ) {
-        self.record_interface_flow(&flow);
+        self.record_interface_flow(&flow, observed_at);
         self.record_outbound_domain(
             flow.domain.as_ref(),
             flow.direction,
@@ -299,21 +318,22 @@ impl Stats {
         self.record_process(process, flow.direction, flow.bytes, observed_at);
     }
 
-    pub(crate) fn record_interface_flow(&mut self, flow: &Flow) {
+    pub(crate) fn record_interface_flow(&mut self, flow: &Flow, observed_at: DateTime<Utc>) {
         if flow.peer_local_socket.is_some() {
-            self.add_out(flow.peer, flow.bytes);
+            self.add_out(flow.peer, flow.bytes, observed_at);
             self.add_in(
                 flow.local_socket
                     .map(|socket| socket.ip)
                     .unwrap_or(flow.peer),
                 flow.bytes,
+                observed_at,
             );
             return;
         }
 
         match flow.direction {
-            Direction::Inbound => self.add_in(flow.peer, flow.bytes),
-            Direction::Outbound => self.add_out(flow.peer, flow.bytes),
+            Direction::Inbound => self.add_in(flow.peer, flow.bytes, observed_at),
+            Direction::Outbound => self.add_out(flow.peer, flow.bytes, observed_at),
         }
     }
 
@@ -400,13 +420,13 @@ impl Stats {
         let inbound_ips = self
             .top_in(top_n)
             .into_iter()
-            .map(|(ip, bytes)| IpSnapshot { ip, bytes })
+            .map(|(ip, bytes)| IpSnapshot::new(ip, bytes, self.in_ip_last_seen[&ip]))
             .collect::<Vec<_>>()
             .into();
         let outbound_ips = self
             .top_out(top_n)
             .into_iter()
-            .map(|(ip, bytes)| IpSnapshot { ip, bytes })
+            .map(|(ip, bytes)| IpSnapshot::new(ip, bytes, self.out_ip_last_seen[&ip]))
             .collect::<Vec<_>>()
             .into();
         let outbound_domains = self
@@ -733,6 +753,33 @@ mod tests {
             },
             &name
         ));
+    }
+
+    #[test]
+    fn ip_last_seen_is_direction_specific_and_snapshot_does_not_refresh() {
+        let mut stats = Stats::default();
+        let first: DateTime<Utc> = "2026-07-15T08:00:00Z".parse().unwrap();
+        let second: DateTime<Utc> = "2026-07-15T08:01:00Z".parse().unwrap();
+        let third: DateTime<Utc> = "2026-07-15T08:02:00Z".parse().unwrap();
+
+        stats.record_flow_at(flow(Direction::Inbound, [192, 0, 2, 10], 40), None, first);
+        stats.record_flow_at(flow(Direction::Outbound, [192, 0, 2, 10], 60), None, second);
+
+        let snapshot = stats.snapshot(10);
+        assert_eq!(snapshot.inbound_ips[0].bytes, 40);
+        assert_eq!(snapshot.inbound_ips[0].last_seen(), first);
+        assert_eq!(snapshot.outbound_ips[0].bytes, 60);
+        assert_eq!(snapshot.outbound_ips[0].last_seen(), second);
+
+        let unchanged = stats.snapshot(10);
+        assert_eq!(unchanged.inbound_ips[0].last_seen(), first);
+        assert_eq!(unchanged.outbound_ips[0].last_seen(), second);
+
+        stats.record_flow_at(flow(Direction::Inbound, [192, 0, 2, 10], 20), None, third);
+        let updated = stats.snapshot(10);
+        assert_eq!(updated.inbound_ips[0].bytes, 60);
+        assert_eq!(updated.inbound_ips[0].last_seen(), third);
+        assert_eq!(updated.outbound_ips[0].last_seen(), second);
     }
 
     // ── 出站域名维度（05 票） ──────────────────────────────────────────
