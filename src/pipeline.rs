@@ -111,6 +111,7 @@ fn aggregate_loop(
     let mut stats = Stats::default();
     let mut attributor = PendingAttributor::default();
     let mut next_snapshot = Instant::now() + snapshot_interval;
+    let mut last_published_pending_nonempty = false;
 
     loop {
         if stop.load(Ordering::Acquire) {
@@ -119,9 +120,26 @@ fn aggregate_loop(
 
         let now = Instant::now();
         attributor.advance(&mut stats, &proc_table, now);
+        let pending_bytes = attributor.snapshot().bytes;
+        let has_pending = pending_bytes > 0;
+        if has_pending != last_published_pending_nonempty {
+            let snapshot = snapshot_for_publish(&stats, &proc_table, top_n, pending_bytes);
+            let published = match snapshot_tx.try_send(Arc::new(snapshot)) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => false,
+                Err(TrySendError::Disconnected(_)) => {
+                    if !stop.load(Ordering::Acquire) {
+                        let _ = failure.set(PipelineError::WorkerStopped("snapshot consumer"));
+                    }
+                    return;
+                }
+            };
+            if published {
+                last_published_pending_nonempty = has_pending;
+            }
+        }
         if now >= next_snapshot {
-            let mut snapshot = stats.snapshot(top_n);
-            snapshot.process_data_fresh = proc_table.read().is_ok_and(|table| table.is_fresh());
+            let snapshot = snapshot_for_publish(&stats, &proc_table, top_n, pending_bytes);
             let snapshot = Arc::new(snapshot);
             match snapshot_tx.try_send(snapshot) {
                 Ok(()) | Err(TrySendError::Full(_)) => {}
@@ -158,6 +176,18 @@ fn aggregate_loop(
             }
         }
     }
+}
+
+fn snapshot_for_publish(
+    stats: &Stats,
+    proc_table: &SharedProcTable,
+    top_n: usize,
+    pending_attribution_bytes: u64,
+) -> TrafficSnapshot {
+    let mut snapshot = stats.snapshot(top_n);
+    snapshot.pending_attribution_bytes = pending_attribution_bytes;
+    snapshot.process_data_fresh = proc_table.read().is_ok_and(|table| table.is_fresh());
+    snapshot
 }
 
 pub struct TrafficPipeline {
@@ -649,6 +679,59 @@ mod tests {
             .unwrap();
 
         assert!(!snapshot.process_data_fresh);
+        stop.store(true, Ordering::Release);
+        drop(flow_tx);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn aggregate_loop_publishes_pending_state_transitions_without_waiting_for_regular_snapshot() {
+        let local_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let proc_table = Arc::new(RwLock::new(ProcTable::default()));
+        let (flow_tx, flow_rx) = sync_channel(1);
+        let (snapshot_tx, snapshot_rx) = sync_channel(2);
+        let stop = Arc::new(AtomicBool::new(false));
+        let failure = Arc::new(OnceLock::new());
+        let worker_stop = stop.clone();
+        let worker_failure = failure.clone();
+        let worker = thread::spawn(move || {
+            aggregate_loop(
+                flow_rx,
+                snapshot_tx,
+                proc_table,
+                10,
+                Duration::from_secs(5),
+                worker_stop,
+                worker_failure,
+            );
+        });
+
+        flow_tx
+            .send(Flow {
+                direction: Direction::Outbound,
+                peer: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5)),
+                peer_port: Some(443),
+                bytes: 120,
+                local_socket: Some(crate::capture::LocalSocket {
+                    ip: local_ip,
+                    port: 49_152,
+                    protocol: crate::capture::TransportProtocol::Tcp,
+                }),
+                peer_local_socket: None,
+                domain: None,
+            })
+            .unwrap();
+
+        let pending = snapshot_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("pending transition should publish immediately");
+        assert_eq!(pending.pending_attribution_bytes, 120);
+
+        let finalized = snapshot_rx
+            .recv_timeout(crate::attribution::PENDING_ATTRIBUTION_WINDOW * 2)
+            .expect("pending completion should publish immediately");
+        assert_eq!(finalized.pending_attribution_bytes, 0);
+
         stop.store(true, Ordering::Release);
         drop(flow_tx);
         worker.join().unwrap();

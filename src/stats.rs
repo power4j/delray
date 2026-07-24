@@ -39,6 +39,7 @@ pub struct TrafficSnapshot {
     pub in_bytes: u64,
     pub out_bytes: u64,
     pub process_data_fresh: bool,
+    pub pending_attribution_bytes: u64,
     pub processes: Arc<[ProcessSnapshot]>,
     pub inbound_ips: Arc<[IpSnapshot]>,
     pub outbound_ips: Arc<[IpSnapshot]>,
@@ -443,6 +444,7 @@ impl Stats {
             in_bytes: self.in_bytes,
             out_bytes: self.out_bytes,
             process_data_fresh: false,
+            pending_attribution_bytes: 0,
             processes: processes.into(),
             inbound_ips,
             outbound_ips,
@@ -542,6 +544,13 @@ mod tests {
         let snapshot = Stats::default().snapshot(10);
 
         assert!(snapshot.processes.is_empty());
+    }
+
+    #[test]
+    fn snapshot_defaults_to_no_pending_attribution() {
+        let snapshot = Stats::default().snapshot(10);
+
+        assert_eq!(snapshot.pending_attribution_bytes, 0);
     }
 
     #[test]
