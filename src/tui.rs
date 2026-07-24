@@ -3759,7 +3759,7 @@ mod tests {
                     .map(|_| ())
             },
             || {
-                Ok::<_, io::Error>(Some(Arc::new(TrafficSnapshot {
+                Ok::<_, std::convert::Infallible>(Some(Arc::new(TrafficSnapshot {
                     process_data_fresh: true,
                     ..TrafficSnapshot::default()
                 })))
@@ -3784,7 +3784,7 @@ mod tests {
                     .map(|_| ())
             },
             || {
-                Ok::<_, io::Error>(Some(Arc::new(TrafficSnapshot {
+                Ok::<_, std::convert::Infallible>(Some(Arc::new(TrafficSnapshot {
                     process_data_fresh: true,
                     ..TrafficSnapshot::default()
                 })))
@@ -3851,7 +3851,7 @@ mod tests {
                     .map(|_| ())
             },
             || {
-                Ok::<_, io::Error>(Some(Arc::new(TrafficSnapshot {
+                Ok::<_, std::convert::Infallible>(Some(Arc::new(TrafficSnapshot {
                     process_data_fresh: false,
                     processes: vec![stale_process.clone()].into(),
                     ..TrafficSnapshot::default()
