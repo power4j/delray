@@ -69,6 +69,18 @@ The required CI checks run on Linux and Windows for pull requests and pushes to 
 
 CI does not run real network capture, long-running traffic tests, or performance benchmarks. Those checks are manual release-readiness activities because they depend on host permissions, adapters, traffic generators, Npcap behavior, and system load.
 
+## On-demand test builds
+
+The `Build Test` workflow creates distribution-shaped binaries for manual testing without changing the Cargo version, creating a tag, or creating a Release. Select a branch or commit and choose `all`, `linux`, or `windows` in the GitHub Actions page. Artifacts are retained for 14 days and include a short commit identifier in their names.
+
+The workflow can also be started with GitHub CLI:
+
+```bash
+gh workflow run build-test.yml --ref <branch> -f platform=all
+```
+
+The Linux artifact uses the glibc `2.28` baseline. The Windows artifact uses static VC Runtime linking and still requires Npcap Runtime on the test machine.
+
 ## Release development
 
 The Release workflow uses `cargo-edit` for `major`, `minor`, and `patch` bumps. It builds and validates both platform artifacts before pushing the version commit and annotated tag. The maintainer checklist is in [`release-checklist.md`](release-checklist.md).
