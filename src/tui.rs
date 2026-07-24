@@ -90,6 +90,7 @@ impl LayoutMode {
 
 const MIN_TERMINAL_WIDTH: u16 = 60;
 const MIN_TERMINAL_HEIGHT: u16 = 16;
+const PENDING_STATUS_SLOT_WIDTH: usize = 11;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TrackingPause {
@@ -1484,7 +1485,11 @@ fn draw_processes(
         palette::coral(),
         palette::border(),
         Some(footer),
-    );
+    )
+    .title(pending_status_title(
+        snapshot.pending_attribution_bytes,
+        area.width,
+    ));
     let table = process_table(snapshot, mode, block, now)
         .row_highlight_style(
             Style::default()
@@ -1498,6 +1503,30 @@ fn draw_processes(
         area,
         &mut ratatui_state(snapshot.processes.len(), state.proc_scroll),
     );
+}
+
+fn pending_status_title(bytes: u64, area_width: u16) -> Line<'static> {
+    let slot_width = if area_width < 44 {
+        1
+    } else {
+        PENDING_STATUS_SLOT_WIDTH
+    };
+    let label = if bytes == 0 {
+        String::new()
+    } else {
+        let full = format!("? {}", human_bytes(bytes));
+        if full.chars().count() <= slot_width {
+            full
+        } else {
+            "?".to_string()
+        }
+    };
+    let padding = slot_width.saturating_sub(label.chars().count());
+    Line::from(Span::styled(
+        format!("{}{}", " ".repeat(padding), label),
+        Style::default().fg(palette::warn()),
+    ))
+    .alignment(Alignment::Right)
 }
 
 fn draw_process_detail(
@@ -2999,6 +3028,63 @@ mod tests {
     }
 
     #[test]
+    fn processes_page_shows_pending_attribution_in_the_border() {
+        let snapshot = TrafficSnapshot {
+            pending_attribution_bytes: 1536,
+            processes: vec![ProcessSnapshot::attributed(
+                7,
+                Some(Arc::from("curl")),
+                None,
+                chrono::Utc::now(),
+                40,
+                60,
+            )]
+            .into(),
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        state.page = Page::Processes;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(rendered.contains("proc Processes 1"));
+        assert!(rendered.contains("? 1.50 KB"));
+    }
+
+    #[test]
+    fn overview_does_not_show_pending_attribution_indicator() {
+        let snapshot = TrafficSnapshot {
+            pending_attribution_bytes: 1536,
+            ..TrafficSnapshot::default()
+        };
+        let mut state = AppState::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &snapshot, "eth0", "host", Instant::now()))
+            .unwrap();
+
+        let rendered = rendered_lines(&terminal).join("\n");
+        assert!(!rendered.contains("? 1.50 KB"));
+    }
+
+    #[test]
+    fn pending_status_title_keeps_a_fixed_slot_and_degrades_when_narrow() {
+        let full = pending_status_title(1536, 80);
+        let empty = pending_status_title(0, 80);
+        let narrow = pending_status_title(1536, 40);
+
+        assert_eq!(full.width(), PENDING_STATUS_SLOT_WIDTH);
+        assert_eq!(empty.width(), PENDING_STATUS_SLOT_WIDTH);
+        assert_eq!(narrow.width(), 1);
+        assert_eq!(narrow.to_string(), "?");
+    }
+
+    #[test]
     fn processes_page_marks_the_selected_row() {
         let snapshot = TrafficSnapshot {
             processes: vec![
@@ -3085,6 +3171,7 @@ mod tests {
         let snapshot = TrafficSnapshot {
             in_bytes: 1024,
             out_bytes: 2048,
+            pending_attribution_bytes: 0,
             processes: vec![ProcessSnapshot::attributed(
                 7,
                 Some(Arc::from("curl --silent")),
